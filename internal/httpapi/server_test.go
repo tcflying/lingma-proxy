@@ -279,6 +279,11 @@ func TestAnthropicReasoningEffortPrefersNamedTier(t *testing.T) {
 			want: "high",
 		},
 		{
+			name: "large budget fallback",
+			req:  anthropicRequest{Thinking: map[string]any{"type": "enabled", "budget_tokens": 32000}},
+			want: "xhigh",
+		},
+		{
 			name: "thinking disabled",
 			req:  anthropicRequest{Thinking: map[string]any{"type": "disabled"}},
 			want: "",

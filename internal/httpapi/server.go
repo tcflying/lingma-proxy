@@ -2199,6 +2199,8 @@ func inferAnthropicThinkingEffort(thinking any) string {
 	}
 	budget := parseReasoningBudget(m["budget_tokens"])
 	switch {
+	case budget >= 16384:
+		return "xhigh"
 	case budget >= 4096:
 		return "high"
 	case budget > 0 && budget < 1024:
