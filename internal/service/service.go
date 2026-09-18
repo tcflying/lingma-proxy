@@ -533,7 +533,14 @@ func (s *Service) generateRemoteInternal(
 	}
 	req.Model = normalizeModelForBackend(s.backend(), req.Model)
 	if s.backend() == BackendQoderCLI {
-		req.Model = s.resolveCLIModel(ctx, req.Model)
+		base, effort := splitCLIModelEffort(req.Model)
+		// The suffix is the operator's configured choice and wins over the
+		// request-level effort, which Anthropic clients often fill in from a
+		// heuristic thinking budget rather than from a deliberate selection.
+		if effort != "" {
+			req.ReasoningEffort = effort
+		}
+		req.Model = s.resolveCLIModel(ctx, base)
 	}
 	prompt, err := buildLingmaPrompt(req, SessionModeFresh, emulateTools)
 	if err != nil {
@@ -909,6 +916,40 @@ var cliModelAliases = map[string]string{
 	"dashscope_qwen_plus_20250428_thinking": "Qwen3.7-Plus",
 	"org_auto":                              "Auto",
 	"auto":                                  "Auto",
+}
+
+// cliEffortSuffixes let clients that cannot send reasoning_effort pick a thinking
+// tier straight from the model id, e.g. "Qwen3.8-Flash-xhigh" or "Qwen3.8-Flash-极高".
+var cliEffortSuffixes = map[string]string{
+	"low":     "low",
+	"medium":  "medium",
+	"high":    "high",
+	"xhigh":   "xhigh",
+	"minimal": "low",
+	"低":       "low",
+	"中":       "medium",
+	"高":       "high",
+	"极高":      "xhigh",
+	"最高":      "xhigh",
+}
+
+// splitCLIModelEffort separates an effort suffix from the real model name. Some
+// clients namespace the id with their provider key ("lingma-proxy/Qwen3.8-Flash-xhigh"),
+// so the namespace is dropped before the suffix is read.
+func splitCLIModelEffort(model string) (string, string) {
+	trimmed := strings.TrimSpace(model)
+	if i := strings.LastIndexByte(trimmed, '/'); i >= 0 {
+		trimmed = strings.TrimSpace(trimmed[i+1:])
+	}
+	i := strings.LastIndexAny(trimmed, "-_")
+	if i <= 0 {
+		return trimmed, ""
+	}
+	base, suffix := strings.TrimSpace(trimmed[:i]), strings.ToLower(strings.TrimSpace(trimmed[i+1:]))
+	if effort, ok := cliEffortSuffixes[suffix]; ok && base != "" {
+		return base, effort
+	}
+	return trimmed, ""
 }
 
 // resolveCLIModel maps whatever the client asked for onto a model the signed-in

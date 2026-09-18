@@ -388,3 +388,25 @@ func TestBuildLingmaPromptInjectsToolingForImageContextRemoteFallback(t *testing
 		t.Fatalf("image-context remote fallback prompt should include tool emulation, got %q", prompt)
 	}
 }
+
+func TestSplitCLIModelEffort(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantName string
+		wantEff  string
+	}{
+		{"Qwen3.8-Flash-xhigh", "Qwen3.8-Flash", "xhigh"},
+		{"Qwen3.8-Flash-极高", "Qwen3.8-Flash", "xhigh"},
+		{"lingma-proxy/Qwen3.8-Flash-xhigh", "Qwen3.8-Flash", "xhigh"},
+		{"Qwen3.8-Flash", "Qwen3.8-Flash", ""},
+		{"MiniMax-M2.7", "MiniMax-M2.7", ""},
+		{"Kimi-K2.8-Preview", "Kimi-K2.8-Preview", ""},
+		{"Auto", "Auto", ""},
+	}
+	for _, tc := range cases {
+		name, effort := splitCLIModelEffort(tc.in)
+		if name != tc.wantName || effort != tc.wantEff {
+			t.Fatalf("splitCLIModelEffort(%q) = %q,%q want %q,%q", tc.in, name, effort, tc.wantName, tc.wantEff)
+		}
+	}
+}

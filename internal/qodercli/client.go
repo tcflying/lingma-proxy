@@ -92,6 +92,9 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 	if strings.TrimSpace(request.Model) != "" {
 		args = append(args, "--model", strings.TrimSpace(request.Model))
 	}
+	if effort := normalizeReasoningEffort(request.ReasoningEffort); effort != "" {
+		args = append(args, "--reasoning-effort", effort)
+	}
 	// Native tool calling would fight the proxy's own action-block protocol, and
 	// leaving it on makes the CLI load its full agent toolchain per request.
 	args = append(args, "--tools", "")
@@ -325,6 +328,41 @@ func firstNonEmpty(values ...string) string {
 		if strings.TrimSpace(value) != "" {
 			return value
 		}
+	}
+	return ""
+}
+
+// reasoningEffortAliases maps client-side effort words (including the Qoder CN
+// UI's Chinese labels) onto the levels --reasoning-effort accepts.
+var reasoningEffortAliases = map[string]string{
+	"minimal": "low",
+	"low":     "low",
+	"medium":  "medium",
+	"auto":    "medium",
+	"high":    "high",
+	"xhigh":   "xhigh",
+	"ultra":   "xhigh",
+	"highest": "xhigh",
+	"max":     "xhigh",
+	"低":       "low",
+	"中":       "medium",
+	"高":       "high",
+	"极高":      "xhigh",
+	"最高":      "xhigh",
+}
+
+// normalizeReasoningEffort returns the CLI level for a client-supplied effort,
+// or "" when the client asked for no thinking.
+func normalizeReasoningEffort(effort string) string {
+	key := strings.ToLower(strings.TrimSpace(effort))
+	switch key {
+	case "":
+		return ""
+	case "none", "disabled", "off":
+		return ""
+	}
+	if level, ok := reasoningEffortAliases[key]; ok {
+		return level
 	}
 	return ""
 }
