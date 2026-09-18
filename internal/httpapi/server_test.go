@@ -250,6 +250,50 @@ func TestNormalizeAnthropicRequestAdaptiveThinkingEnablesReasoning(t *testing.T)
 	}
 }
 
+// A named tier is a deliberate selection, so it must outrank the budget heuristic
+// no matter which field the client puts it in.
+func TestAnthropicReasoningEffortPrefersNamedTier(t *testing.T) {
+	tests := []struct {
+		name string
+		req  anthropicRequest
+		want string
+	}{
+		{
+			name: "thinking.effort",
+			req:  anthropicRequest{Thinking: map[string]any{"type": "enabled", "effort": "xhigh", "budget_tokens": 2048}},
+			want: "xhigh",
+		},
+		{
+			name: "output_config.effort",
+			req:  anthropicRequest{Thinking: map[string]any{"type": "adaptive"}, OutputConfig: map[string]any{"effort": "xhigh"}},
+			want: "xhigh",
+		},
+		{
+			name: "reasoning_effort",
+			req:  anthropicRequest{ReasoningEff: "high", Thinking: map[string]any{"type": "enabled", "budget_tokens": 512}},
+			want: "high",
+		},
+		{
+			name: "budget fallback",
+			req:  anthropicRequest{Thinking: map[string]any{"type": "enabled", "budget_tokens": 8192}},
+			want: "high",
+		},
+		{
+			name: "thinking disabled",
+			req:  anthropicRequest{Thinking: map[string]any{"type": "disabled"}},
+			want: "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := anthropicReasoningEffort(tc.req); got != tc.want {
+				t.Fatalf("reasoning effort = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestOpenAIResponsesMethodNotAllowed(t *testing.T) {
 	server := NewServer("", service.New(service.Config{
 		Model:   "Qwen3-Coder",

@@ -534,9 +534,9 @@ func (s *Service) generateRemoteInternal(
 	req.Model = normalizeModelForBackend(s.backend(), req.Model)
 	if s.backend() == BackendQoderCLI {
 		base, effort := splitCLIModelEffort(req.Model)
-		// The suffix is the operator's configured choice and wins over the
-		// request-level effort, which Anthropic clients often fill in from a
-		// heuristic thinking budget rather than from a deliberate selection.
+		// A suffixed tier is a deliberate pick from the client's model list, so it
+		// outranks the request body; an unsuffixed id leaves the client's own
+		// reasoning_effort / thinking selection in charge.
 		if effort != "" {
 			req.ReasoningEffort = effort
 		}

@@ -54,6 +54,9 @@ type anthropicRequest struct {
 	StopSequences []string       `json:"stop_sequences,omitempty"`
 	Metadata      map[string]any `json:"metadata,omitempty"`
 	Thinking      any            `json:"thinking,omitempty"`
+	OutputConfig  map[string]any `json:"output_config,omitempty"`
+	Reasoning     any            `json:"reasoning,omitempty"`
+	ReasoningEff  any            `json:"reasoning_effort,omitempty"`
 }
 
 type openAIChatRequest struct {
@@ -1872,7 +1875,7 @@ func normalizeAnthropicRequest(req anthropicRequest) (service.ChatRequest, error
 		TopK:            req.TopK,
 		Stop:            req.StopSequences,
 		MaxTokens:       req.MaxTokens,
-		ReasoningEffort: extractAnthropicReasoningEffort(req.Thinking),
+		ReasoningEffort: anthropicReasoningEffort(req),
 	}, nil
 }
 
@@ -2151,13 +2154,41 @@ func extractReasoningEffort(reasoning any) string {
 	return stringFromAny(m["effort"])
 }
 
-func extractAnthropicReasoningEffort(thinking any) string {
+// anthropicReasoningEffort resolves the tier a client deliberately picked. Clients
+// that expose a thinking-level selector disagree on where to put it on the
+// Anthropic wire ("thinking.effort", "output_config.effort", a borrowed
+// "reasoning_effort"), so every named tier is checked before the budget heuristic
+// is allowed to infer one from "thinking.budget_tokens".
+func anthropicReasoningEffort(req anthropicRequest) string {
+	for _, candidate := range []string{
+		strings.TrimSpace(stringFromAny(req.ReasoningEff)),
+		anthropicThinkingEffort(req.Thinking),
+		strings.TrimSpace(stringFromAny(req.OutputConfig["effort"])),
+		strings.TrimSpace(stringFromAny(req.Reasoning)),
+		strings.TrimSpace(extractReasoningEffort(req.Reasoning)),
+	} {
+		if candidate != "" {
+			return candidate
+		}
+	}
+	return inferAnthropicThinkingEffort(req.Thinking)
+}
+
+func anthropicThinkingEffort(thinking any) string {
 	m, ok := thinking.(map[string]any)
 	if !ok || len(m) == 0 {
 		return ""
 	}
-	if effort := strings.TrimSpace(stringFromAny(m["effort"])); effort != "" {
-		return effort
+	return strings.TrimSpace(stringFromAny(m["effort"]))
+}
+
+// inferAnthropicThinkingEffort guesses a tier from the thinking budget. It is a
+// last resort: clients that pick a budget on their own (rather than from a
+// deliberate selection) land here, so the result is coarse on purpose.
+func inferAnthropicThinkingEffort(thinking any) string {
+	m, ok := thinking.(map[string]any)
+	if !ok || len(m) == 0 {
+		return ""
 	}
 	mode := strings.ToLower(strings.TrimSpace(stringFromAny(m["type"])))
 	switch mode {
