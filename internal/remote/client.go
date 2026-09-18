@@ -62,8 +62,12 @@ type Model struct {
 }
 
 type ChatRequest struct {
-	Model           string
-	Prompt          string
+	Model  string
+	Prompt string
+	// System carries instructions meant for the backend's own system slot. The
+	// CLI backend forwards it as --append-system-prompt because the Qoder CN
+	// gateway reroutes user turns that assert another product's identity.
+	System          string
 	Messages        []Message
 	Images          []Image
 	Stream          bool

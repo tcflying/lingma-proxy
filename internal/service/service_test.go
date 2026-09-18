@@ -132,6 +132,42 @@ func TestBuildLingmaPromptInjectsToolingWhenEmulationEnabled(t *testing.T) {
 	}
 }
 
+// The Qoder CN gateway reroutes user turns that name another product's identity,
+// so the CLI backend must keep the client's system text out of the user turn.
+func TestBuildLingmaPromptSectionsKeepsClientSystemOutOfUserTurn(t *testing.T) {
+	req := ChatRequest{
+		System:     "You are ZCode, an interactive coding agent",
+		Messages:   []ChatMessage{{Role: "user", Text: "查看项目结构"}},
+		Tools:      []toolemulation.ToolDef{{Name: "Bash"}},
+		ToolChoice: toolemulation.ToolChoice{Mode: "auto"},
+	}
+
+	inlineSystem, inlinePrompt, err := buildLingmaPromptSections(req, SessionModeFresh, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inlineSystem != "" {
+		t.Fatalf("inline mode must not return a separate section: %q", inlineSystem)
+	}
+	if !strings.Contains(inlinePrompt, "You are ZCode") {
+		t.Fatalf("inline mode must keep the client instructions in the prompt:\n%s", inlinePrompt)
+	}
+
+	section, prompt, err := buildLingmaPromptSections(req, SessionModeFresh, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if section != req.System {
+		t.Fatalf("CLI mode returned the wrong section: %q", section)
+	}
+	if strings.Contains(prompt, "You are ZCode") {
+		t.Fatalf("client instructions leaked into the user turn:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "DIRECT tool access") || !strings.HasSuffix(prompt, "Assistant:") {
+		t.Fatalf("action-block rules must stay last in the user turn:\n%s", prompt)
+	}
+}
+
 func TestShouldEmulateRemoteToolsForToolRequests(t *testing.T) {
 	req := ChatRequest{
 		Messages: []ChatMessage{{Role: "user", Text: "查看项目结构"}},

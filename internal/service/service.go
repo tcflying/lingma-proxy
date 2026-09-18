@@ -542,7 +542,11 @@ func (s *Service) generateRemoteInternal(
 		}
 		req.Model = s.resolveCLIModel(ctx, base)
 	}
-	prompt, err := buildLingmaPrompt(req, SessionModeFresh, emulateTools)
+	// The CLI backend keeps the instructions out of the user turn: the Qoder CN
+	// gateway reroutes user content that names another product's identity, so
+	// they travel as the session's system prompt instead.
+	systemInline := s.backend() != BackendQoderCLI
+	system, prompt, err := buildLingmaPromptSections(req, SessionModeFresh, emulateTools, systemInline)
 	if err != nil {
 		return nil, err
 	}
@@ -558,7 +562,7 @@ func (s *Service) generateRemoteInternal(
 	var lastErr error
 	for i, model := range models {
 		attemptCtx, cancel := contextWithOptionalTimeout(ctx, s.cfg.Timeout)
-		result, emitted, err := s.generateRemoteWithModel(attemptCtx, client, req, prompt, model, onDelta, emulateTools)
+		result, emitted, err := s.generateRemoteWithModel(attemptCtx, client, req, system, prompt, model, onDelta, emulateTools)
 		cancel()
 		if err == nil {
 			return result, nil
@@ -589,6 +593,7 @@ func (s *Service) generateRemoteWithModel(
 	ctx context.Context,
 	client chatClient,
 	req ChatRequest,
+	system string,
 	prompt string,
 	model string,
 	onDelta func(StreamEvent),
@@ -606,6 +611,7 @@ func (s *Service) generateRemoteWithModel(
 	remoteResult, err := client.Chat(ctx, remote.ChatRequest{
 		Model:           model,
 		Prompt:          prompt,
+		System:          system,
 		Messages:        remoteMessagesForChat(req, prompt, emulateTools),
 		Images:          remoteImagesFromRequest(req),
 		Stream:          onDelta != nil,
@@ -621,6 +627,7 @@ func (s *Service) generateRemoteWithModel(
 		retryResult, retryErr := client.Chat(ctx, remote.ChatRequest{
 			Model:           model,
 			Prompt:          prompt,
+			System:          system,
 			Messages:        remoteMessagesForChat(req, prompt, emulateTools),
 			Images:          remoteImagesFromRequest(req),
 			Stream:          false,
@@ -1706,6 +1713,16 @@ func imageExtension(mediaType string) string {
 }
 
 func buildLingmaPrompt(req ChatRequest, mode SessionMode, emulateTools bool) (string, error) {
+	_, prompt, err := buildLingmaPromptSections(req, mode, emulateTools, true)
+	return prompt, err
+}
+
+// buildLingmaPromptSections splits the assembled request into instructions and
+// the text of the user turn. systemInline keeps the prompt byte-identical for
+// the ipc and remote backends, which expect the tooling block immediately before
+// the "Assistant:" cue; the CLI backend asks for it separately so it can travel
+// in the model's system slot instead of inside the user turn.
+func buildLingmaPromptSections(req ChatRequest, mode SessionMode, emulateTools, systemInline bool) (string, string, error) {
 	messages := filteredMessages(req.Messages)
 	var lastUser string
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -1719,11 +1736,11 @@ func buildLingmaPrompt(req ChatRequest, mode SessionMode, emulateTools bool) (st
 			lastUser = imagePromptFallback(req, idx)
 			messages = append(messages, ChatMessage{Role: "user", Text: lastUser})
 		} else {
-			return "", errors.New("no user message found in request")
+			return "", "", errors.New("no user message found in request")
 		}
 	}
 	if mode == SessionModeReuse {
-		return lastUser, nil
+		return "", lastUser, nil
 	}
 
 	system := strings.TrimSpace(req.System)
@@ -1734,12 +1751,24 @@ func buildLingmaPrompt(req ChatRequest, mode SessionMode, emulateTools bool) (st
 			system = reasoningHint + "\n\n" + system
 		}
 	}
+	// With systemInline the client's instructions become part of the prompt text,
+	// exactly as the ipc and remote backends expect. The CLI backend returns them
+	// as a separate section and keeps only the action-block rules in the prompt,
+	// because those still have to be the last thing before the "Assistant:" cue.
+	section, embedded := "", system
+	if !systemInline {
+		section, embedded = system, ""
+	}
 	if emulateTools && len(req.Tools) > 0 && req.ToolChoice.Mode != "none" {
-		system = toolemulation.InjectTooling(system, req.Tools, req.ToolChoice, req.ParallelToolCalls)
+		if systemInline {
+			embedded = toolemulation.InjectTooling(system, req.Tools, req.ToolChoice, req.ParallelToolCalls)
+		} else {
+			embedded = toolemulation.InjectTooling("", req.Tools, req.ToolChoice, req.ParallelToolCalls)
+		}
 	}
 
-	if system == "" && len(messages) == 1 {
-		return lastUser, nil
+	if embedded == "" && len(messages) == 1 {
+		return section, lastUser, nil
 	}
 
 	if emulateTools && len(req.Tools) > 0 {
@@ -1751,18 +1780,18 @@ func buildLingmaPrompt(req ChatRequest, mode SessionMode, emulateTools bool) (st
 			}
 			parts = append(parts, fmt.Sprintf("%s: %s", role, message.Text))
 		}
-		if system != "" {
+		if embedded != "" {
 			// Append tool prompt right before the final "Assistant:" so it
 			// is the last thing the model sees before generating a reply.
-			parts = append(parts, system)
+			parts = append(parts, embedded)
 		}
 		parts = append(parts, "Assistant:")
-		return strings.Join(parts, "\n\n"), nil
+		return section, strings.Join(parts, "\n\n"), nil
 	}
 
 	parts := make([]string, 0, len(messages)+4)
-	if system != "" {
-		parts = append(parts, "System instructions:", system)
+	if embedded != "" {
+		parts = append(parts, "System instructions:", embedded)
 	}
 	parts = append(parts, "Conversation transcript:")
 	for _, message := range messages {
@@ -1773,7 +1802,7 @@ func buildLingmaPrompt(req ChatRequest, mode SessionMode, emulateTools bool) (st
 		parts = append(parts, fmt.Sprintf("%s: %s", role, message.Text))
 	}
 	parts = append(parts, "Reply as the assistant to the latest user message only. Follow the system instructions and prior transcript naturally.")
-	return strings.Join(parts, "\n\n"), nil
+	return section, strings.Join(parts, "\n\n"), nil
 }
 
 func latestImageMessageIndex(messages []ChatMessage) int {

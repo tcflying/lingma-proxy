@@ -24,6 +24,10 @@ type Client struct {
 	timeout time.Duration
 }
 
+// maxSystemPromptArgChars keeps the CLI command line below the ~32767 character
+// CreateProcess limit Windows enforces on the whole argv.
+const maxSystemPromptArgChars = 20000
+
 func NewClient(loc Location, timeout time.Duration) *Client {
 	return &Client{
 		loc:     loc,
@@ -94,6 +98,16 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 	}
 	if effort := normalizeReasoningEffort(request.ReasoningEffort); effort != "" {
 		args = append(args, "--reasoning-effort", effort)
+	}
+	// Client instructions go to the CLI's system slot: the Qoder CN gateway
+	// reroutes user turns that assert another product's identity, and the prompt
+	// text is a user turn here.
+	if system := strings.TrimSpace(request.System); system != "" {
+		if len(system) <= maxSystemPromptArgChars {
+			args = append(args, "--append-system-prompt", system)
+		} else {
+			prompt = "System instructions:\n" + system + "\n\n" + prompt
+		}
 	}
 	// Native tool calling would fight the proxy's own action-block protocol, and
 	// leaving it on makes the CLI load its full agent toolchain per request.
