@@ -29,6 +29,7 @@ let fastRefreshTick = 0
 const endpoint = computed(() => (status.value.addr ? `http://${status.value.addr}` : '未启动'))
 const isRunning = computed(() => Boolean(status.value.running))
 const transportLabel = computed(() => {
+  if (status.value.backend === 'qodercli' || config.value.Backend === 'qodercli') return 'Qoder CN 客户端'
   if (status.value.backend === 'remote' || config.value.Backend === 'remote') return 'Remote API'
   return config.value.Transport || 'auto'
 })

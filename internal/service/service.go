@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"lingma-ipc-proxy/internal/lingmaipc"
+	"lingma-ipc-proxy/internal/qodercli"
 	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/toolemulation"
 )
@@ -22,8 +24,12 @@ import (
 type BackendMode string
 
 const (
-	BackendIPC    BackendMode = "ipc"
+	BackendIPC BackendMode = "ipc"
+	// BackendRemote speaks the legacy signed Lingma/QoderCN gateway protocol.
 	BackendRemote BackendMode = "remote"
+	// BackendQoderCLI drives the Qoder CN desktop app's bundled CLI, which is
+	// the only client able to sign gateway requests since the protocol change.
+	BackendQoderCLI BackendMode = "qodercli"
 )
 
 type SessionMode string
@@ -153,6 +159,8 @@ type Service struct {
 	stickyModelID    string
 	modelMap         map[string]string // official name -> internal id
 	remoteClient     *remote.Client
+	cliClient        *qodercli.Client
+	cliModels        []string
 	remoteProbeCache map[string]remoteModelProbeEntry
 }
 
@@ -195,16 +203,33 @@ func New(cfg Config) *Service {
 	if cfg.Backend == "" {
 		cfg.Backend = BackendRemote
 	}
-	if cfg.Backend == BackendRemote {
-		if len(cfg.RemoteFallbackModels) == 0 {
-			cfg.RemoteFallbackModels = DefaultRemoteFallbackModels()
-		}
+	if cfg.Backend == BackendRemote && len(cfg.RemoteFallbackModels) == 0 {
+		cfg.RemoteFallbackModels = DefaultRemoteFallbackModels()
 	}
+	ResolveBackend(&cfg)
 	cfg.Model = normalizeModelForBackend(cfg.Backend, cfg.Model)
 	if cfg.SessionMode == "" {
 		cfg.SessionMode = SessionModeAuto
 	}
 	return &Service{cfg: cfg}
+}
+
+// ResolveBackend switches a remote-configured service onto the Qoder CN CLI when
+// the legacy gateway login cache is no longer present. It reports whether the
+// backend changed.
+func ResolveBackend(cfg *Config) bool {
+	if cfg.Backend != BackendRemote {
+		return false
+	}
+	backend, switched := resolveRemoteBackend(*cfg)
+	if !switched {
+		return false
+	}
+	cfg.Backend = backend
+	// The legacy default key only exists on the old gateway protocol; the CLI
+	// exposes human-readable names instead, so start from Auto.
+	cfg.Model = "Auto"
+	return true
 }
 
 func DefaultRemoteFallbackModels() []string {
@@ -215,6 +240,50 @@ func DefaultRemoteFallbackModels() []string {
 		"dashscope_qmodel",
 		"dashscope_qwen_max_latest",
 		"dashscope_qwen_plus_20250428_thinking",
+	}
+}
+
+// resolveRemoteBackend keeps the legacy gateway protocol when its login cache is
+// present, and otherwise falls through to the Qoder CN CLI, which is the only
+// client that can still sign inference requests.
+func resolveRemoteBackend(cfg Config) (BackendMode, bool) {
+	if strings.TrimSpace(cfg.RemoteAuthFile) != "" {
+		return cfg.Backend, false
+	}
+	if _, err := remote.LoadCredential(""); err == nil {
+		return cfg.Backend, false
+	}
+	if !qodercli.Available() {
+		return cfg.Backend, false
+	}
+	log.Printf("backend: legacy Remote API credentials are unavailable, using the Qoder CN CLI backend instead")
+	return BackendQoderCLI, true
+}
+
+func (s *Service) cliClientLocked() *qodercli.Client {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cliClient == nil {
+		loc, _ := qodercli.Detect()
+		s.cliClient = qodercli.NewClient(loc, s.cfg.Timeout)
+	}
+	return s.cliClient
+}
+
+// chatClient is the transport surface the shared generate path needs.
+type chatClient interface {
+	Chat(ctx context.Context, request remote.ChatRequest, onDelta func(string)) (*remote.ChatResult, error)
+	ListModels(ctx context.Context) ([]remote.Model, error)
+}
+
+func (s *Service) chatClient() (chatClient, error) {
+	switch s.backend() {
+	case BackendQoderCLI:
+		return s.cliClientLocked(), nil
+	case BackendRemote:
+		return s.remoteClientLocked(), nil
+	default:
+		return nil, fmt.Errorf("backend %q does not support direct chat", s.backend())
 	}
 }
 
@@ -231,11 +300,29 @@ func (s *Service) DefaultModel() string {
 }
 
 func (s *Service) Warmup(ctx context.Context) error {
-	if s.backend() == BackendRemote {
+	if s.usesRemoteTransport() {
+		if s.backend() == BackendQoderCLI {
+			if err := s.cliClientLocked().Warmup(ctx); err != nil {
+				return err
+			}
+			s.cachedCLIModels(ctx)
+			return nil
+		}
 		return s.remoteClientLocked().Warmup(ctx)
 	}
 	_, err := s.ensureConnected(ctx)
 	return err
+}
+
+// usesRemoteTransport reports whether requests go out over the network instead
+// of the local Lingma IPC pipe.
+func (s *Service) usesRemoteTransport() bool {
+	switch s.backend() {
+	case BackendRemote, BackendQoderCLI:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Service) Close() error {
@@ -265,11 +352,19 @@ func describeIPCSetupError(operation string, err error) error {
 func (s *Service) State() State {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cfg.Backend == BackendRemote {
+	if s.cfg.Backend == BackendRemote || s.cfg.Backend == BackendQoderCLI {
+		endpoint := remote.ResolveBaseURL(s.cfg.RemoteBaseURL)
+		transport := "remote"
+		connected := s.remoteClient != nil
+		if s.cfg.Backend == BackendQoderCLI {
+			endpoint = ""
+			transport = "qodercli"
+			connected = s.cliClient != nil
+		}
 		return State{
-			Endpoint:    remote.ResolveBaseURL(s.cfg.RemoteBaseURL),
-			Transport:   "remote",
-			Connected:   s.remoteClient != nil,
+			Endpoint:    endpoint,
+			Transport:   transport,
+			Connected:   connected,
 			SessionMode: s.cfg.SessionMode,
 		}
 	}
@@ -284,6 +379,33 @@ func (s *Service) State() State {
 }
 
 func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
+	if s.backend() == BackendQoderCLI {
+		models, err := s.cliClientLocked().ListModels(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]Model, 0, len(models))
+		ids := make([]string, 0, len(models))
+		seen := map[string]bool{}
+		for _, model := range models {
+			id := strings.TrimSpace(model.Key)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			name := strings.TrimSpace(model.DisplayName)
+			if name == "" {
+				name = id
+			}
+			out = append(out, Model{ID: id, Name: name})
+			ids = append(ids, id)
+		}
+		s.mu.Lock()
+		s.cliModels = ids
+		s.mu.Unlock()
+		return out, nil
+	}
+
 	if s.backend() == BackendRemote {
 		models, err := s.remoteClientLocked().ListModels(ctx)
 		if err != nil {
@@ -335,7 +457,7 @@ func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
 }
 
 func (s *Service) Generate(ctx context.Context, req ChatRequest) (*ChatResult, error) {
-	if s.backend() == BackendRemote {
+	if s.usesRemoteTransport() {
 		return s.generateRemote(ctx, req, nil)
 	}
 	return s.generateWithReconnect(ctx, req, nil)
@@ -347,7 +469,7 @@ func (s *Service) GenerateStream(ctx context.Context, req ChatRequest) (<-chan S
 
 	go func() {
 		generate := s.generateWithReconnect
-		if s.backend() == BackendRemote {
+		if s.usesRemoteTransport() {
 			generate = s.generateRemote
 		}
 		result, err := generate(ctx, req, func(event StreamEvent) {
@@ -398,6 +520,9 @@ func (s *Service) generateRemoteInternal(
 ) (*ChatResult, error) {
 	emulateTools = emulateTools || shouldEmulateRemoteTools(req)
 	if requestHasImages(req) {
+		if s.backend() == BackendQoderCLI {
+			return nil, errors.New("Qoder CN CLI 后端暂不支持图片输入，请改用 ipc 或 remote 后端")
+		}
 		if len(req.Tools) > 0 && req.ToolChoice.Mode != "none" {
 			return s.generateRemoteWithImageContext(ctx, req, onDelta)
 		}
@@ -406,7 +531,10 @@ func (s *Service) generateRemoteInternal(
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = s.DefaultModel()
 	}
-	req.Model = normalizeModelForBackend(BackendRemote, req.Model)
+	req.Model = normalizeModelForBackend(s.backend(), req.Model)
+	if s.backend() == BackendQoderCLI {
+		req.Model = s.resolveCLIModel(ctx, req.Model)
+	}
 	prompt, err := buildLingmaPrompt(req, SessionModeFresh, emulateTools)
 	if err != nil {
 		return nil, err
@@ -416,7 +544,10 @@ func (s *Service) generateRemoteInternal(
 	}
 
 	models := s.remoteAttemptModels(ctx, req.Model)
-	client := s.remoteClientLocked()
+	client, err := s.chatClient()
+	if err != nil {
+		return nil, err
+	}
 	var lastErr error
 	for i, model := range models {
 		attemptCtx, cancel := contextWithOptionalTimeout(ctx, s.cfg.Timeout)
@@ -449,7 +580,7 @@ func (s *Service) generateRemoteWithImageContext(
 
 func (s *Service) generateRemoteWithModel(
 	ctx context.Context,
-	client *remote.Client,
+	client chatClient,
 	req ChatRequest,
 	prompt string,
 	model string,
@@ -507,9 +638,12 @@ func (s *Service) generateRemoteWithModel(
 		FinishReason:     "stop",
 		StopReason:       "stop",
 		Endpoint:         remote.ResolveBaseURL(s.cfg.RemoteBaseURL),
-		Transport:        "remote",
+		Transport:        string(s.backend()),
 		EffectiveSession: SessionModeFresh,
 		ToolCalls:        remoteResult.ToolCalls,
+	}
+	if s.backend() == BackendQoderCLI {
+		result.Endpoint = ""
 	}
 	if emulateTools {
 		s.applyToolEmulation(ctx, req, prompt, result, onDelta, func(hintPrompt string) (string, int, error) {
@@ -724,6 +858,11 @@ func shouldRetryRemoteNativeTool(req ChatRequest, text string) bool {
 }
 
 func (s *Service) remoteAttemptModels(ctx context.Context, primary string) []string {
+	if s.backend() == BackendQoderCLI {
+		// Each CLI attempt spawns a signed-in subprocess, and the CLI already
+		// routes unavailable models itself, so there is nothing to fall back to.
+		return []string{primary}
+	}
 	primary = normalizeModelForBackend(BackendRemote, primary)
 	models := []string{primary}
 	if !s.cfg.RemoteFallbackEnabled {
@@ -757,6 +896,88 @@ func (s *Service) remoteAttemptModels(ctx context.Context, primary string) []str
 		models = append(models, model)
 	}
 	return models
+}
+
+// cliModelAliases maps the legacy gateway model keys onto the display names the
+// Qoder CN CLI accepts for --model.
+var cliModelAliases = map[string]string{
+	"kmodel":                                "Kimi-K3",
+	"mmodel":                                "MiniMax-M2.7",
+	"dashscope_qmodel":                      "Qwen3.8-Max",
+	"dashscope_qwen_max_latest":             "Qwen3.8-Max",
+	"dashscope_qwen3_coder":                 "Qwen3.8-Max",
+	"dashscope_qwen_plus_20250428_thinking": "Qwen3.7-Plus",
+	"org_auto":                              "Auto",
+	"auto":                                  "Auto",
+}
+
+// resolveCLIModel maps whatever the client asked for onto a model the signed-in
+// Qoder CN account actually exposes.
+func (s *Service) resolveCLIModel(ctx context.Context, model string) string {
+	wanted := strings.TrimSpace(model)
+	if alias, ok := cliModelAliases[strings.ToLower(wanted)]; ok {
+		wanted = alias
+	}
+	known := s.cachedCLIModels(ctx)
+	if len(known) == 0 {
+		if wanted == "" {
+			return "Auto"
+		}
+		return wanted
+	}
+	if wanted == "" {
+		wanted = "Auto"
+	}
+	for _, name := range known {
+		if strings.EqualFold(name, wanted) {
+			return name
+		}
+	}
+	family := cliModelFamily(wanted)
+	if family != "" {
+		for _, name := range known {
+			if cliModelFamily(name) == family {
+				return name
+			}
+		}
+	}
+	for _, name := range known {
+		if strings.EqualFold(name, "Auto") {
+			return name
+		}
+	}
+	return known[0]
+}
+
+func cliModelFamily(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return ""
+	}
+	if i := strings.IndexByte(model, '-'); i > 0 {
+		return model[:i]
+	}
+	return model
+}
+
+// cachedCLIModels returns the CLI model list, fetching it once on first use.
+func (s *Service) cachedCLIModels(ctx context.Context) []string {
+	s.mu.Lock()
+	cached := append([]string(nil), s.cliModels...)
+	s.mu.Unlock()
+	if len(cached) > 0 {
+		return cached
+	}
+	models, err := s.ListModels(ctx)
+	if err != nil {
+		log.Printf("backend: Qoder CN CLI model discovery failed: %v", err)
+		return nil
+	}
+	out := make([]string, 0, len(models))
+	for _, model := range models {
+		out = append(out, model.ID)
+	}
+	return out
 }
 
 func (s *Service) remoteFallbackModels() []string {

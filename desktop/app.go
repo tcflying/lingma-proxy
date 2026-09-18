@@ -468,6 +468,7 @@ func (a *App) UpdateConfig(cfg service.Config) error {
 	if cfg.WarmupTimeout <= 0 {
 		cfg.WarmupTimeout = proxyWarmupTimeout
 	}
+	service.ResolveBackend(&cfg)
 
 	a.mu.Lock()
 	wasRunning := a.running
@@ -2176,6 +2177,7 @@ func defaultConfig() service.Config {
 		}
 	}
 
+	service.ResolveBackend(&cfg)
 	return cfg
 }
 
@@ -2183,6 +2185,8 @@ func backendLabel(backend service.BackendMode) string {
 	switch backend {
 	case service.BackendRemote:
 		return "远端 API"
+	case service.BackendQoderCLI:
+		return "Qoder CN 客户端"
 	default:
 		return "IPC 插件"
 	}

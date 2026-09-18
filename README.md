@@ -15,9 +15,10 @@ Model availability is not the same for every Lingma user.
 - Actual model availability depends on the Lingma account type, enterprise tenant, remote API domain, region, product plan, and server-side entitlements.
 - Lingma Proxy does not normally invent these models and does not silently remove them from `/v1/models`; the list primarily reflects what the active Lingma backend actually returns.
 
-The proxy now supports two backend modes:
+The proxy now supports three backend modes:
 
 - **Remote API mode (default, recommended)**: imports the local Lingma / QoderCN login cache or an explicit credential file and calls the remote APIs directly. This behaves closest to a normal hosted API, avoids IDE/plugin session and environment limits, and is currently the best mode for Claude Code / Hermes style agents.
+- **Qoder CN client mode**: when the legacy Remote API login cache is no longer present, the proxy automatically drives the signed-in Qoder CN desktop app's bundled CLI as a subprocess instead. It reuses the app's own login state (device token → job token) and inherits request signing from the client, so no credential file or gateway domain is configured. Model IDs come from the account (`Auto`, `Qwen3.8-Max`, `Kimi-K3`, …) and image input is not supported on this path yet. Set `--backend qodercli` to force it.
 - **IPC mode**: connects to the local Lingma / QoderCN runtime over WebSocket / Named Pipe. This keeps behavior closest to the local IDE runtime, but it can inherit IDE session lifetime, local runtime state, and environment constraints, so it is mainly a compatibility fallback.
 
 ## Runtime Compatibility

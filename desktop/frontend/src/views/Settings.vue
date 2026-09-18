@@ -27,6 +27,7 @@ const selectOptions = {
   Backend: [
     { value: 'ipc', label: 'IPC 插件' },
     { value: 'remote', label: '远端 API' },
+    { value: 'qodercli', label: 'Qoder CN 客户端' },
   ],
   Transport: [
     { value: 'auto', label: '自动' },

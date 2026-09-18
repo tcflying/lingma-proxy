@@ -131,7 +131,7 @@ func loadConfig() (service.Config, string) {
 	host := flag.String("host", cfg.Host, "Listen host")
 	port := flag.Int("port", cfg.Port, "Listen port")
 	transport := flag.String("transport", string(cfg.Transport), "Lingma/QoderCN transport: auto, pipe, websocket")
-	backend := flag.String("backend", string(cfg.Backend), "Backend mode: ipc or remote")
+	backend := flag.String("backend", string(cfg.Backend), "Backend mode: ipc, remote or qodercli")
 	pipe := flag.String("pipe", cfg.Pipe, "Explicit Lingma/QoderCN IPC socket or named pipe path")
 	wsURL := flag.String("ws-url", cfg.WebSocketURL, "Explicit Lingma/QoderCN local websocket URL")
 	remoteBaseURL := flag.String("remote-base-url", cfg.RemoteBaseURL, "Remote Lingma/QoderCN API base URL")
@@ -189,6 +189,7 @@ func loadConfig() (service.Config, string) {
 		configPath = ""
 	}
 
+	service.ResolveBackend(&cfg)
 	return cfg, configPath
 }
 
@@ -416,8 +417,10 @@ func parseBackend(value string) service.BackendMode {
 		return service.BackendIPC
 	case service.BackendRemote:
 		return service.BackendRemote
+	case service.BackendQoderCLI:
+		return service.BackendQoderCLI
 	default:
-		log.Fatalf("invalid backend %q; expected ipc or remote", value)
+		log.Fatalf("invalid backend %q; expected ipc, remote or qodercli", value)
 		return service.BackendIPC
 	}
 }
