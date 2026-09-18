@@ -99,11 +99,22 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 	// leaving it on makes the CLI load its full agent toolchain per request.
 	args = append(args, "--tools", "")
 
-	stdout, err := c.runWithStdin(ctx, prompt, args...)
-	if err != nil {
-		return nil, err
+	stdout, runErr := c.runWithStdin(ctx, prompt, args...)
+	result, parseErr := parseResult(stdout, request.Model, onDelta)
+	if runErr == nil {
+		return result, parseErr
 	}
-	return parseResult(stdout, request.Model, onDelta)
+	// The CLI can exit non-zero after a completed turn (teardown races on
+	// Windows), so a usable answer or a real result-frame error both outrank
+	// whatever stderr happened to hold.
+	if parseErr == nil {
+		return result, nil
+	}
+	var cliErr *cliError
+	if errors.As(parseErr, &cliErr) {
+		return nil, parseErr
+	}
+	return nil, runErr
 }
 
 func (c *Client) Warmup(ctx context.Context) error {
@@ -154,14 +165,17 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, args ...str
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		message := strings.TrimSpace(stderr.String())
 		if runCtx.Err() != nil {
-			return "", fmt.Errorf("Qoder CN CLI timed out after %s", c.timeout)
+			if c.timeout > 0 {
+				return stdout.String(), fmt.Errorf("Qoder CN CLI timed out after %s", c.timeout)
+			}
+			return stdout.String(), fmt.Errorf("Qoder CN CLI was cancelled before it finished: %w", runCtx.Err())
 		}
-		if message != "" {
-			return "", fmt.Errorf("Qoder CN CLI failed: %s", errorLines(message, 6))
+		detail := errorLines(stderr.String(), 6)
+		if detail != "" {
+			return stdout.String(), fmt.Errorf("Qoder CN CLI failed: %s", detail)
 		}
-		return "", fmt.Errorf("Qoder CN CLI failed: %w", err)
+		return stdout.String(), fmt.Errorf("Qoder CN CLI failed: %w with no output", err)
 	}
 	return stdout.String(), nil
 }
@@ -203,6 +217,8 @@ type outputFrame struct {
 	Subtype   string          `json:"subtype"`
 	Message   *chatMessage    `json:"message"`
 	Result    string          `json:"result"`
+	Errors    []string        `json:"errors"`
+	ErrorCode int             `json:"error_code"`
 	IsError   bool            `json:"is_error"`
 	SessionID string          `json:"session_id"`
 	Usage     json.RawMessage `json:"usage"`
@@ -276,7 +292,7 @@ func parseResult(stdout, model string, onDelta func(string)) (*remote.ChatResult
 
 	if result != nil {
 		if result.IsError || result.Subtype != "" && result.Subtype != "success" {
-			return nil, fmt.Errorf("Qoder CN CLI error: %s", cliErrorText(*result, frames))
+			return nil, &cliError{text: cliErrorText(*result, frames)}
 		}
 		if strings.TrimSpace(result.Result) != "" {
 			text.Reset()
@@ -315,6 +331,13 @@ func cliErrorText(result outputFrame, frames []string) string {
 	if strings.TrimSpace(result.Result) != "" {
 		return truncate(result.Result, 400)
 	}
+	if len(result.Errors) > 0 {
+		text := strings.Join(result.Errors, "; ")
+		if result.ErrorCode != 0 {
+			text = fmt.Sprintf("%s (code %d)", text, result.ErrorCode)
+		}
+		return truncate(text, 400)
+	}
 	for i := len(frames) - 1; i >= 0; i-- {
 		if strings.Contains(frames[i], "error") {
 			return truncate(frames[i], 400)
@@ -322,6 +345,12 @@ func cliErrorText(result outputFrame, frames []string) string {
 	}
 	return "unknown error"
 }
+
+// cliError is a failure the CLI reported in its own result frame. Chat prefers it
+// over stderr, where the runtime prints per-run startup warnings regardless.
+type cliError struct{ text string }
+
+func (e *cliError) Error() string { return "Qoder CN CLI error: " + e.text }
 
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
@@ -382,7 +411,9 @@ var cliNoisePrefixes = []string{
 	"Warning:",
 }
 
-// errorLines keeps the tail of stderr but drops the per-run noise lines.
+// errorLines keeps the tail of stderr but drops the per-run noise lines. It
+// returns "" when nothing but noise was printed, so callers can say so instead
+// of quoting a startup warning as if it were the failure.
 func errorLines(text string, count int) string {
 	lines := strings.Split(strings.TrimSpace(text), "\n")
 	meaningful := make([]string, 0, len(lines))
@@ -392,9 +423,6 @@ func errorLines(text string, count int) string {
 			continue
 		}
 		meaningful = append(meaningful, trimmed)
-	}
-	if len(meaningful) == 0 {
-		return tailLines(text, count)
 	}
 	if len(meaningful) > count {
 		meaningful = meaningful[len(meaningful)-count:]
