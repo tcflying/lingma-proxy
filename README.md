@@ -896,7 +896,10 @@ Windows paths as `"C:\\Users\\you"`, not `"C:\Users\you"`.
 
 With a single site pinned, the model list drops the `intl/` prefix and contains
 exactly what that CLI reports, so an international-only instance serves plain names
-such as `Qwen3.8-Flash` and `MiniMax-M3`.
+such as `Qwen3.8-Flash` and `MiniMax-M3`. See
+[docs/qoder-international-handoff.md](docs/qoder-international-handoff.md) for the
+handover notes on both sites: credential chain, routing rules, verification
+methods and known limits.
 
 ## Concurrency
 
