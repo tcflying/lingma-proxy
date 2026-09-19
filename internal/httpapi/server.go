@@ -2192,6 +2192,8 @@ func inferAnthropicThinkingEffort(thinking any) string {
 	}
 	mode := strings.ToLower(strings.TrimSpace(stringFromAny(m["type"])))
 	switch mode {
+	case "disabled":
+		return "none"
 	case "", "enabled", "adaptive":
 		// treat adaptive as an enabled reasoning request with default effort
 	default:
@@ -2199,6 +2201,8 @@ func inferAnthropicThinkingEffort(thinking any) string {
 	}
 	budget := parseReasoningBudget(m["budget_tokens"])
 	switch {
+	case budget > 49152:
+		return "max"
 	case budget >= 16384:
 		return "xhigh"
 	case budget >= 4096:
