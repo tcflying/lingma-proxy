@@ -1,5 +1,6 @@
 # 交接说明：qodercli 后端（v1.6.12 + 8 个提交）
 
+
 面向接手这个仓库的人。所有结论都是 2026-09-19 在本机实测得到的，不是读代码猜的。
 
 > 本文写的是 **Qoder CN 单站点**时的后端。之后 `4a8e14d` 起后端同时服务 CN 与国际版两个站点
@@ -197,3 +198,40 @@ Get-CimInstance Win32_Process -Filter "Name='Qoder CN.exe'" |
 `~/.qoder-cn/projects/<项目slug>/<session-id>.jsonl` 里 `type=runtime-config` 那条的
 `reasoningEffort`，以及 assistant 消息里有没有 thinking 块（0 长度才是真的关掉了）。
 `scripts/tier_matrix.py` 就是按这个方法写的。
+
+---
+
+## 9. 三个可独立使用的 exe（同一份代码，零分支）
+
+**不要为站点分叉代码或历史。** `4a8e14d` 之后，一个二进制就能同时服务 CN 和国际版；
+"哪个站点" 只是配置。分三个 exe 靠的是 `desktop/instance.go` 已有的机制：
+**exe 旁边放一份 `lingma-proxy.json`** 就会被优先读取（`configSearchPaths()` 的第一项），
+其中的 `instance_name` / `instance_id` 让多份实例可以并排运行（否则 Wails 的单实例锁会把第二次启动
+折回第一个窗口，且两份会互相覆盖同一份共享设置）。
+
+三份配置的唯一差别就是 `qodercli_sites` 和端口：
+
+| 目录 | `qodercli_sites` | 端口 | `instance_id` | 实测模型数 |
+| --- | --- | --- | --- | --- |
+| `LingmaProxy-both` | `["cn","global"]` | 8095 | `lingma-proxy-both` | CN 14 + 国际 17（并集） |
+| `LingmaProxy-cn` | `["cn"]` | 8096 | `lingma-proxy-cn` | 14（无 Ultimate/Performance/Efficient/Sonus/Cantus） |
+| `LingmaProxy-intl` | `["global"]` | 9095 | `lingma-proxy-intl` | 17（含上述 5 个国际版独有） |
+
+`backend` 三份都写 `"qodercli"`。构建一次、复制三份、各配一份 JSON：
+
+```bash
+cd desktop/frontend && npm run build
+cd desktop          && go build -tags production -o LingmaProxy.exe .
+# 然后把 LingmaProxy.exe + 对应的 lingma-proxy.json 放进三个目录
+```
+
+已验证（2026-09-20 本机）：同时拉起 cn(8096) 与 intl(9095)，两边 `/v1/models` 返回**各自站点的目录**，
+cn 侧没有国际版独有模型，intl 侧有 `Ultimate` 等 5 个。注意 `Qwen3.8-Flash`、`GLM-5.3`、`Kimi-K3`
+这些名字**两边都有**（国际版本来也上架了它们），不是门控失效。
+
+两条使用注意：
+
+- `both` 用 8095 会和当前正在跑的桌面版冲突，替换前先停旧的；现有四家客户端都指向 8095，
+  所以 `both` 是无缝替代，`cn` / `intl` 想让客户端用就得改客户端里的 baseURL 端口。
+- 国际版登录态和 CN 登录态是两份独立文件（`com.qoder.app.stable` / `com.qodercn.app.stable`），
+  哪个站点没登录，对应实例的 `/v1/models` 会报「登录态不可用」。
