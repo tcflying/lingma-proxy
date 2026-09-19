@@ -203,35 +203,77 @@ Get-CimInstance Win32_Process -Filter "Name='Qoder CN.exe'" |
 
 ## 9. 三个可独立使用的 exe（同一份代码，零分支）
 
-**不要为站点分叉代码或历史。** `4a8e14d` 之后，一个二进制就能同时服务 CN 和国际版；
-"哪个站点" 只是配置。分三个 exe 靠的是 `desktop/instance.go` 已有的机制：
-**exe 旁边放一份 `lingma-proxy.json`** 就会被优先读取（`configSearchPaths()` 的第一项），
-其中的 `instance_name` / `instance_id` 让多份实例可以并排运行（否则 Wails 的单实例锁会把第二次启动
+**不要为站点分叉代码或历史。** `4a8e14d` 之后一个二进制就能同时服务 CN 与国际版；
+"服务哪个站点"只是配置。三份 exe 靠的是 `desktop/instance.go` 已有的机制：
+**exe 旁边放一份 `lingma-proxy.json`** 会被最优先读取（`configSearchPaths()` 的第一项），
+其中的 `instance_name` / `instance_id` 让多份实例并排运行（否则 Wails 的单实例锁会把第二次启动
 折回第一个窗口，且两份会互相覆盖同一份共享设置）。
 
-三份配置的唯一差别就是 `qodercli_sites` 和端口：
+### 三者的完整区别
 
-| 目录 | `qodercli_sites` | 端口 | `instance_id` | 实测模型数 |
-| --- | --- | --- | --- | --- |
-| `LingmaProxy-both` | `["cn","global"]` | 8095 | `lingma-proxy-both` | CN 14 + 国际 17（并集） |
-| `LingmaProxy-cn` | `["cn"]` | 8096 | `lingma-proxy-cn` | 14（无 Ultimate/Performance/Efficient/Sonus/Cantus） |
-| `LingmaProxy-intl` | `["global"]` | 9095 | `lingma-proxy-intl` | 17（含上述 5 个国际版独有） |
+| | `LingmaProxy-cn` | `LingmaProxy-intl` | `LingmaProxy-both` |
+| --- | --- | --- | --- |
+| 端口 | **8095** | **9095** | **10095** |
+| `qodercli_sites` | `["cn"]` | `["global"]` | `["cn","global"]` |
+| `instance_id` | `lingma-proxy-cn` | `lingma-proxy-intl` | `lingma-proxy-both` |
+| 窗口标题 | Lingma Proxy (CN only) | Lingma Proxy (Intl only) | Lingma Proxy (CN + Intl) |
+| `/v1/models` 数量 | 14 | 17 | 31 |
+| 模型 id 形态 | 裸名：`Qwen3.8-Flash` | 裸名：`Ultimate` | CN 裸名 + 国际版带前缀：`intl/Ultimate` |
+| 登录态文件 | `com.qodercn.app.stable` | `com.qoder.app.stable` | 两份都要，缺哪个站点该站点就报「登录态不可用」 |
+| 适用 | 只跑 CN，给现有客户端当默认服务 | 只跑国际版 | 两个站点同时要用 |
 
-`backend` 三份都写 `"qodercli"`。构建一次、复制三份、各配一份 JSON：
+三份 `backend` 都是 `"qodercli"`，`host` 都是 `127.0.0.1`。
+
+**⚠️ both 版必须用 `intl/` 前缀调国际版模型。** 两个站点有同名模型（`Auto`、`Qwen3.8-Flash`、
+`GLM-5.3`、`Kimi-K3` 等），both 版把国际版那一侧的 id 统一加上 `intl/` 前缀以避免撞名：
+CN 侧是 `Qwen3.8-Flash`，国际侧是 `intl/Qwen3.8-Flash`。单站点的 cn / intl 版**不带前缀**。
+从 both 换到 intl 或反过来，客户端里填的模型 id 要跟着改。
+
+实测（2026-09-20 本机）：intl 版起在 9095 返回 17 个、both 版起在 10095 返回 31 个
+（14 裸名 + 17 个 `intl/` 前缀）、改端口前的 cn 版起在 8096 返回 14 个且不含国际版独有模型。
+cn 版现在按用户要求占 8095。
+
+### 构建
 
 ```bash
-cd desktop/frontend && npm run build
+cd desktop/frontend && npm run build          # 已有 dist 可跳过
 cd desktop          && go build -tags production -o LingmaProxy.exe .
-# 然后把 LingmaProxy.exe + 对应的 lingma-proxy.json 放进三个目录
 ```
 
-已验证（2026-09-20 本机）：同时拉起 cn(8096) 与 intl(9095)，两边 `/v1/models` 返回**各自站点的目录**，
-cn 侧没有国际版独有模型，intl 侧有 `Ultimate` 等 5 个。注意 `Qwen3.8-Flash`、`GLM-5.3`、`Kimi-K3`
-这些名字**两边都有**（国际版本来也上架了它们），不是门控失效。
+然后同一个 `LingmaProxy.exe` 复制进三个目录，各放一份对应配置的 `lingma-proxy.json`：
 
-两条使用注意：
+```json
+{"host":"127.0.0.1","port":8095,"backend":"qodercli",
+ "qodercli_sites":["cn"],"instance_name":"Lingma Proxy (CN only)","instance_id":"lingma-proxy-cn"}
+```
 
-- `both` 用 8095 会和当前正在跑的桌面版冲突，替换前先停旧的；现有四家客户端都指向 8095，
-  所以 `both` 是无缝替代，`cn` / `intl` 想让客户端用就得改客户端里的 baseURL 端口。
-- 国际版登录态和 CN 登录态是两份独立文件（`com.qoder.app.stable` / `com.qodercn.app.stable`），
-  哪个站点没登录，对应实例的 `/v1/models` 会报「登录态不可用」。
+## 10. 使用教学（拿到 zip 之后怎么做）
+
+1. 解压到任意**固定**目录（exe 会在自己旁边读写 `lingma-proxy.json`，别只放桌面临时文件夹）。
+2. 双击 `LingmaProxy.exe`。窗口标题就是配置里的 `instance_name`，可据此确认起的是哪一份。
+3. 验证起来了：`curl http://127.0.0.1:<端口>/health` 返回 200；
+   `curl http://127.0.0.1:<端口>/v1/models` 出模型列表。
+4. 前提是本机对应站点的 Qoder 桌面版**登录过**（见第 3 节；不需要开着那个 app，也不需要网页登录）。
+5. 给客户端接入：把 baseURL 的端口改成这一份的端口。
+   - Anthropic 风格（ZCode / DSH 这类直连）：CN 版填 `http://127.0.0.1:8095`（**不带 `/v1`**），
+     MiniMax Code 这类走 `@ai-sdk/anthropic` 的要带 `/v1`。
+   - OpenAI 风格经 opencodex：改 `~/.opencodex/config.json` 里 `providers.lingma-proxy.baseUrl`
+     后必须 `ocx restart`（运行中的代理用启动时缓存的配置）。
+6. 端口占用：`both` 现在是 10095，不再和 8095 抢；`cn` 占 8095，所以起 `cn` 之前要先停掉
+   原来跑在 8095 的那份，否则它会报端口占用或起在别的端口上。
+7. 三份可以同时运行（`instance_id` 不同），只要端口互不冲突。
+8. 停止：关闭窗口即可；后台残留用 `taskkill /F /IM LingmaProxy.exe`。
+
+## 11. 发布位置
+
+GitHub Release（tag 故意不带 `v` 前缀，避开 `release.yml` 的 `on: push: tags ["v*"]`）：
+
+- 页面 https://github.com/tcflying/lingma-proxy/releases/tag/desktop-3site
+- `.../releases/download/desktop-3site/LingmaProxy-cn-win-x64.zip`
+- `.../releases/download/desktop-3site/LingmaProxy-intl-win-x64.zip`
+- `.../releases/download/desktop-3site/LingmaProxy-both-win-x64.zip`
+
+`gh` 的两个坑：建 tag 需要 `workflow` scope → 改用 `git tag` + `git push` 推 tag，再
+`gh release create --verify-tag`；而且**必须显式 `-R tcflying/lingma-proxy`**，
+否则 gh 会解析到 upstream `Lutiancheng1/lingma-proxy` 并报 tag 不存在。
+覆盖已有资产用 `gh release upload <tag> <files> --clobber`。
