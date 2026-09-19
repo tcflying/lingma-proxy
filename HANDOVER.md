@@ -2,6 +2,11 @@
 
 面向接手这个仓库的人。所有结论都是 2026-09-19 在本机实测得到的，不是读代码猜的。
 
+> 本文写的是 **Qoder CN 单站点**时的后端。之后 `4a8e14d` 起后端同时服务 CN 与国际版两个站点
+> （站点路由、`intl/` 前缀、国际版必需的 `--config-dir`、第二份桌面实例的配置），
+> 那部分增量见 [`docs/qoder-international-handoff.md`](docs/qoder-international-handoff.md)。
+> 其中的逐模型档位表 `scripts/tier_matrix.py` 测的是 CN 目录，国际版档位走透传。
+
 ---
 
 ## 1. 为什么要改：旧路子已经彻底不通

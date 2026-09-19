@@ -4,6 +4,9 @@
 桌面版预构建包：https://github.com/tcflying/lingma-proxy/releases/tag/intl-desktop-9095
 本文只描述代码与配置，不含任何账号凭据。
 
+范围划分：qodercli 后端的整体交接（为什么换、构建、档位表语义、四家客户端接入、复测手法）看根目录
+[`HANDOVER.md`](../HANDOVER.md)；本文只覆盖**双站点（CN + 国际版）**带来的改动与运行方式。
+
 ## 1. 现在能用什么
 
 qodercli 后端从「只认 Qoder CN」变成**同时服务两个 Qoder 部署**：
