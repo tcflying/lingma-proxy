@@ -18,7 +18,8 @@ Model availability is not the same for every Lingma user.
 The proxy now supports three backend modes:
 
 - **Remote API mode (default, recommended)**: imports the local Lingma / QoderCN login cache or an explicit credential file and calls the remote APIs directly. This behaves closest to a normal hosted API, avoids IDE/plugin session and environment limits, and is currently the best mode for Claude Code / Hermes style agents.
-- **Qoder CN client mode**: when the legacy Remote API login cache is no longer present, the proxy automatically drives the signed-in Qoder CN desktop app's bundled CLI as a subprocess instead. It reuses the app's own login state (device token → job token) and inherits request signing from the client, so no credential file or gateway domain is configured. Model IDs come from the account (`Auto`, `Qwen3.8-Max`, `Kimi-K3`, …) and image input is not supported on this path yet. Set `--backend qodercli` to force it. On this path the client's own system text is forwarded to the CLI's system slot (`--append-system-prompt`), because the Qoder CN gateway reroutes user turns that name another product's identity. The thinking tier follows whatever the client asks for (`reasoning_effort`, `reasoning.effort`, `thinking.effort`, `output_config.effort`), and falls back to `thinking.budget_tokens` when no tier is named. Clients with no tier selector at all can bake one into the model ID (`Qwen3.8-Flash-xhigh`, `Qwen3.8-Flash-极高`); a suffixed ID outranks the request body, so register one entry per tier to turn that client's model picker into a tier picker.
+- **Qoder client mode**: when the legacy Remote API login cache is no longer present, the proxy automatically drives the signed-in Qoder desktop app's bundled CLI as a subprocess instead. It reuses the app's own login state (device token → job token) and inherits request signing from the client, so no credential file or gateway domain is configured. Model IDs come from the account (`Auto`, `Qwen3.8-Max`, `Kimi-K3`, …) and image input is not supported on this path yet. Set `--backend qodercli` to force it. On this path the client's own system text is forwarded to the CLI's system slot (`--append-system-prompt`), because the Qoder CN gateway reroutes user turns that name another product's identity. The thinking tier follows whatever the client asks for (`reasoning_effort`, `reasoning.effort`, `thinking.effort`, `output_config.effort`), and falls back to `thinking.budget_tokens` when no tier is named. The CLI parses `none|low|medium|high|xhigh|max` (thinking budgets 0/1024/8192/24576/49152/65536), but each model applies only part of that ladder — Qwen3.8 offers off/low/medium/xhigh while GLM-5.3, Kimi-K3 and DeepSeek-Flash offer off/low/high/max — so the proxy resolves the requested tier against the model's own ladder instead of guessing. A client's "off" is forwarded as `none`; omitting the tier is not the same as turning thinking off. Clients with no tier selector at all can bake one into the model ID (`Qwen3.8-Flash-xhigh`, `Qwen3.8-Flash-极高`); a suffixed ID outranks the request body, so register one entry per tier to turn that client's model picker into a tier picker.
+  Both Qoder deployments are served at once when both are installed and signed in: the CN app (default, unmarked IDs) and the international app behind an `intl/` ID prefix, because the two catalogs share names such as `Qwen3.8-Flash`. International model IDs therefore look like `intl/Qwen3.8-Flash`, `intl/Kimi-K3`, `intl/MiniMax-M3`; the prefix is recognised in any path segment, so a client that namespaces IDs still routes correctly (`lingma-proxy/intl/Qwen3.8-Flash`). `global/`, `国际/` and `国际版/` are accepted as aliases on input. The two sites mint job tokens from their own gateways (`openapi.qoder.com.cn` and `openapi.qoder.sh`) under the same OAuth client id, so no extra configuration is needed beyond a signed-in desktop app. The international CLI is launched with a private `--config-dir` because sharing `~/.qoder` with the desktop app makes it answer every request with `token is not active`. Thinking tiers are passed through to the international CLI unclamped, since the measured ladder above is the CN catalog's. Set `LINGMA_QODERCLI_SITES=cn` to serve only the CN site (or `global` for only the international one); a site with no signed-in desktop app is skipped without affecting the other. With a single site enabled the prefix disappears and the list is exactly what that CLI reports, so `LINGMA_QODERCLI_SITES=global` plus `--port 8096` gives a standalone international-only proxy beside the CN one.
 - **IPC mode**: connects to the local Lingma / QoderCN runtime over WebSocket / Named Pipe. This keeps behavior closest to the local IDE runtime, but it can inherit IDE session lifetime, local runtime state, and environment constraints, so it is mainly a compatibility fallback.
 
 ## Runtime Compatibility
@@ -863,6 +864,39 @@ Priority order:
 3. environment variables
 4. command-line flags
 5. desktop Settings page updates
+
+### Running a second desktop instance beside the first
+
+The CLI backend accepts a `qodercli_sites` list, which pins the deployments one
+process serves:
+
+```json
+{
+  "port": 8096,
+  "backend": "qodercli",
+  "qodercli_sites": ["global"],
+  "instance_name": "Lingma Proxy · 国际版",
+  "instance_id": "lingma-proxy-desktop-intl"
+}
+```
+
+`instance_name` sets the window title and `instance_id` the Wails single-instance
+lock, so a second copy of the desktop app starts its own window instead of being
+folded into the first one. The app state (dashboard history, cached model list)
+is then stored per id in `~/.config/lingma-ipc-proxy/app-state-<instance_id>.json`,
+and settings are written back to the file they were read from, so each copy keeps
+its own configuration.
+
+Put that JSON next to the second executable as `lingma-proxy.json` — the executable
+directory is searched first. It must be valid JSON: a file that fails to parse is
+ignored (and logged) and the copy silently falls back to the shared
+`~/.config/lingma-proxy/config.json`, which reuses the first instance's port and
+single-instance id and makes the second launch exit immediately. In that case write
+Windows paths as `"C:\\Users\\you"`, not `"C:\Users\you"`.
+
+With a single site pinned, the model list drops the `intl/` prefix and contains
+exactly what that CLI reports, so an international-only instance serves plain names
+such as `Qwen3.8-Flash` and `MiniMax-M3`.
 
 ## Concurrency
 

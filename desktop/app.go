@@ -21,6 +21,7 @@ import (
 	"lingma-ipc-proxy/internal/deploy"
 	"lingma-ipc-proxy/internal/httpapi"
 	"lingma-ipc-proxy/internal/lingmaipc"
+	"lingma-ipc-proxy/internal/qodercli"
 	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/service"
 
@@ -492,17 +493,8 @@ func (a *App) UpdateConfig(cfg service.Config) error {
 }
 
 func (a *App) saveConfig(cfg service.Config) error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
-	}
-	dir := filepath.Join(home, ".config", "lingma-proxy")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
 	timeoutSec := int(cfg.Timeout.Seconds())
-	fileCfg := map[string]any{
+	settings := map[string]any{
 		"host":                    cfg.Host,
 		"port":                    cfg.Port,
 		"backend":                 string(cfg.Backend),
@@ -524,13 +516,37 @@ func (a *App) saveConfig(cfg service.Config) error {
 		"remote_fallback_enabled": cfg.RemoteFallbackEnabled,
 		"remote_fallback_models":  cfg.RemoteFallbackModels,
 	}
+	if len(cfg.QoderCLISites) > 0 {
+		settings["qodercli_sites"] = cfg.QoderCLISites
+	}
 
-	data, err := json.MarshalIndent(fileCfg, "", "  ")
+	path := instanceProfileValue().configPath
+	if path == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		path = filepath.Join(home, ".config", "lingma-proxy", "config.json")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+
+	// Keep keys this app does not own (instance_name, instance_id, anything a
+	// newer build added) so saving never strips a sidecar's identity.
+	merged := map[string]any{}
+	if existing, err := os.ReadFile(path); err == nil {
+		_ = json.Unmarshal(existing, &merged)
+	}
+	for key, value := range settings {
+		merged[key] = value
+	}
+
+	data, err := json.MarshalIndent(merged, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	path := filepath.Join(dir, "config.json")
 	return os.WriteFile(path, data, 0644)
 }
 
@@ -1372,6 +1388,9 @@ func appStatePath() (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if id := instanceProfileValue().singleID; id != "" && id != defaultSingleInstanceID {
+		return filepath.Join(home, ".config", "lingma-ipc-proxy", "app-state-"+id+".json"), nil
+	}
 	return filepath.Join(home, ".config", "lingma-ipc-proxy", "app-state.json"), nil
 }
 
@@ -2107,6 +2126,7 @@ func defaultConfig() service.Config {
 					WarmupTimeoutSeconds  int      `json:"warmup_timeout"`
 					RemoteFallbackEnabled *bool    `json:"remote_fallback_enabled"`
 					RemoteFallbackModels  []string `json:"remote_fallback_models"`
+					QoderCLISites         []string `json:"qodercli_sites"`
 				}
 				if err := json.Unmarshal(data, &fileCfg); err == nil {
 					if fileCfg.Host != "" {
@@ -2171,12 +2191,17 @@ func defaultConfig() service.Config {
 					if len(fileCfg.RemoteFallbackModels) > 0 {
 						cfg.RemoteFallbackModels = cleanConfigStrings(fileCfg.RemoteFallbackModels)
 					}
+					if len(fileCfg.QoderCLISites) > 0 {
+						cfg.QoderCLISites = cleanConfigStrings(fileCfg.QoderCLISites)
+					}
 				}
 				break // loaded successfully
 			}
 		}
 	}
 
+	// A pinned site set decides which backends count as available.
+	qodercli.SetEnabledSites(cfg.QoderCLISites)
 	service.ResolveBackend(&cfg)
 	return cfg
 }
@@ -2186,9 +2211,23 @@ func backendLabel(backend service.BackendMode) string {
 	case service.BackendRemote:
 		return "远端 API"
 	case service.BackendQoderCLI:
-		return "Qoder CN 客户端"
+		return cliBackendLabel()
 	default:
 		return "IPC 插件"
+	}
+}
+
+// cliBackendLabel names the deployment the CLI backend actually drives, since a
+// sidecar config can pin the instance to one site.
+func cliBackendLabel() string {
+	sites := qodercli.EnabledSites()
+	switch {
+	case len(sites) == 1 && sites[0] == qodercli.SiteGlobal:
+		return "Qoder 国际版客户端"
+	case len(sites) == 1:
+		return "Qoder CN 客户端"
+	default:
+		return "Qoder 客户端（CN + 国际版）"
 	}
 }
 

@@ -49,6 +49,7 @@ type fileConfig struct {
 	TimeoutSeconds        int      `json:"timeout"`
 	RemoteFallbackEnabled *bool    `json:"remote_fallback_enabled"`
 	RemoteFallbackModels  []string `json:"remote_fallback_models"`
+	QoderCLISites         []string `json:"qodercli_sites"`
 }
 
 func main() {
@@ -146,6 +147,7 @@ func loadConfig() (service.Config, string) {
 	timeoutSeconds := flag.Int("timeout", int(cfg.Timeout/time.Second), "Per-request timeout in seconds; 0 disables the proxy deadline")
 	remoteFallbackEnabled := flag.Bool("remote-fallback", cfg.RemoteFallbackEnabled, "Enable remote timeout/5xx fallback to the next available model")
 	remoteFallbackModels := flag.String("remote-fallback-models", strings.Join(cfg.RemoteFallbackModels, ","), "Comma-separated remote fallback model IDs")
+	qodercliSites := flag.String("qodercli-sites", strings.Join(cfg.QoderCLISites, ","), "Qoder sites the CLI backend serves: cn, global (empty serves both)")
 	exportRemoteAuth := flag.String("export-remote-auth", "", "Export portable Remote API credentials.json to the given path and exit")
 	exportServerBundle := flag.String("export-server-bundle", "", "Export a server deployment zip containing credentials.json, config, and docker-compose.yml, then exit")
 	remoteAuthPick := flag.String("remote-auth-pick", "auto", "Remote login cache pick policy for export: auto, newest, or longest")
@@ -176,6 +178,7 @@ func loadConfig() (service.Config, string) {
 	cfg.Timeout = time.Duration(*timeoutSeconds) * time.Second
 	cfg.RemoteFallbackEnabled = *remoteFallbackEnabled
 	cfg.RemoteFallbackModels = splitCSV(*remoteFallbackModels)
+	cfg.QoderCLISites = splitCSV(*qodercliSites)
 	utilityOptions.exportRemoteAuth = strings.TrimSpace(*exportRemoteAuth)
 	utilityOptions.exportServerBundle = strings.TrimSpace(*exportServerBundle)
 	utilityOptions.remoteAuthPick = strings.TrimSpace(*remoteAuthPick)
@@ -334,6 +337,9 @@ func overlayFileConfig(dst *service.Config, src fileConfig) {
 	}
 	if len(src.RemoteFallbackModels) > 0 {
 		dst.RemoteFallbackModels = cleanStringSlice(src.RemoteFallbackModels)
+	}
+	if len(src.QoderCLISites) > 0 {
+		dst.QoderCLISites = cleanStringSlice(src.QoderCLISites)
 	}
 }
 

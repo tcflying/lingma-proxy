@@ -20,11 +20,12 @@ var devtoolsBuild = "false"
 
 func main() {
 	app := NewApp()
+	instance := LoadInstanceProfile()
 	openInspectorOnStartup := os.Getenv("LINGMA_DESKTOP_DEBUG") == "1"
 	enableInspector := openInspectorOnStartup || devtoolsBuild == "true"
 
 	err := wails.Run(&options.App{
-		Title:             "Lingma Proxy",
+		Title:             instance.title,
 		Width:             1160,
 		Height:            defaultWindowHeight(),
 		MinWidth:          900,
@@ -38,12 +39,12 @@ func main() {
 			OpenInspectorOnStartup: openInspectorOnStartup,
 		},
 		BackgroundColour: &options.RGBA{R: 238, G: 243, B: 248, A: 255},
-		Menu:             appMenu(app),
+		Menu:             appMenu(app, instance.title),
 		OnStartup:        app.startup,
 		OnBeforeClose:    app.beforeClose,
 		OnDomReady:       app.onDomReady,
 		SingleInstanceLock: &options.SingleInstanceLock{
-			UniqueId:               "lingma-proxy-desktop",
+			UniqueId:               instance.singleID,
 			OnSecondInstanceLaunch: app.onSecondInstanceLaunch,
 		},
 		Bind: []interface{}{
@@ -79,7 +80,7 @@ func defaultWindowHeight() int {
 	return 743
 }
 
-func appMenu(app *App) *menu.Menu {
+func appMenu(app *App, title string) *menu.Menu {
 	quitAccelerator := keys.OptionOrAlt("f4")
 	closeWindowAccelerator := keys.CmdOrCtrl("w")
 	minimizeWindowAccelerator := keys.CmdOrCtrl("m")
@@ -97,12 +98,12 @@ func appMenu(app *App) *menu.Menu {
 		app.MinimizeWindow()
 	})
 	appMenu.AddSeparator()
-	appMenu.AddText("退出 Lingma Proxy", quitAccelerator, func(_ *menu.CallbackData) {
+	appMenu.AddText("退出 "+title, quitAccelerator, func(_ *menu.CallbackData) {
 		app.RequestQuitShortcut()
 	})
 
 	return menu.NewMenuFromItems(
-		menu.SubMenu("Lingma Proxy", appMenu),
+		menu.SubMenu(title, appMenu),
 		menu.EditMenu(),
 	)
 }

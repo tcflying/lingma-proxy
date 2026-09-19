@@ -28,14 +28,9 @@ type appCredential struct {
 func (c appCredential) valid() bool { return strings.TrimSpace(c.Token) != "" }
 
 // profileCandidates lists Electron userData directories that may hold the login.
-func profileCandidates() []string {
-	if explicit := strings.TrimSpace(os.Getenv("LINGMA_QODERCLI_PROFILE")); explicit != "" {
-		return []string{expandHome(explicit)}
-	}
-	names := []string{
-		"com.qodercn.app.stable",
-		"com.qodercn.app.canary",
-		"com.qoder.app.stable",
+func profileCandidates(site Site) []string {
+	if explicit := explicitProfileDir(site); explicit != "" {
+		return []string{explicit}
 	}
 	var roots []string
 	switch runtime.GOOS {
@@ -53,6 +48,7 @@ func profileCandidates() []string {
 			roots = append(roots, filepath.Join(home, ".config"))
 		}
 	}
+	names := site.profile().profileNames
 	out := make([]string, 0, len(names)*len(roots))
 	for _, root := range roots {
 		if root == "" {
@@ -65,8 +61,33 @@ func profileCandidates() []string {
 	return out
 }
 
-func detectProfileDir() string {
-	for _, dir := range profileCandidates() {
+// explicitProfileDir applies LINGMA_QODERCLI_PROFILE only where it names the
+// site being resolved, so one override cannot serve both credential chains.
+func explicitProfileDir(site Site) string {
+	explicit := strings.TrimSpace(os.Getenv("LINGMA_QODERCLI_PROFILE"))
+	if explicit == "" {
+		return ""
+	}
+	dir := expandHome(explicit)
+	if inferred := siteOfProfileDir(dir); inferred != "" && inferred != site.Normalized() {
+		return ""
+	}
+	return dir
+}
+
+func siteOfProfileDir(dir string) Site {
+	base := strings.ToLower(filepath.Base(dir))
+	switch {
+	case strings.Contains(base, "qodercn"):
+		return SiteCN
+	case strings.Contains(base, "qoder.app"):
+		return SiteGlobal
+	}
+	return ""
+}
+
+func detectProfileDir(site Site) string {
+	for _, dir := range profileCandidates(site) {
 		if hasAppCredential(dir) {
 			return dir
 		}

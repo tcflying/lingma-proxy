@@ -15,14 +15,14 @@ import (
 )
 
 const (
-	defaultOpenAPIBase = "https://openapi.qoder.com.cn"
-	// defaultClientID is the OAuth client id the Qoder CN desktop app uses.
+	// defaultClientID is the OAuth client id both Qoder desktop builds register
+	// with their gateway; the global site uses the same value as the CN one.
 	defaultClientID = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa"
 	// jobTokenLifetime is the refreshed-at safety margin.
 	renewMargin = 10 * time.Minute
 )
 
-// JobCredential is what the bundled CLI expects in its QODERCN_JOB_TOKEN
+// JobCredential is what the bundled CLI expects in its <SITE>_JOB_TOKEN
 // environment variable: the raw job token response from the OpenAPI service.
 type JobCredential struct {
 	Raw       json.RawMessage `json:"-"`
@@ -41,6 +41,7 @@ func (c JobCredential) expiresIn(margin time.Duration) bool {
 // that the bundled CLI accepts, refreshing them as they approach expiry.
 type TokenSource struct {
 	profileDir string
+	label      string
 	baseURL    string
 	clientID   string
 	http       *http.Client
@@ -51,10 +52,10 @@ type TokenSource struct {
 	deviceLoaded bool
 }
 
-func NewTokenSource(profileDir string) *TokenSource {
+func NewTokenSource(profileDir string, site Site) *TokenSource {
 	base := strings.TrimSpace(os.Getenv("LINGMA_QODER_OPENAPI_BASE_URL"))
 	if base == "" {
-		base = defaultOpenAPIBase
+		base = site.profile().openAPIBase
 	}
 	client := strings.TrimSpace(os.Getenv("LINGMA_QODER_CLIENT_ID"))
 	if client == "" {
@@ -62,6 +63,7 @@ func NewTokenSource(profileDir string) *TokenSource {
 	}
 	return &TokenSource{
 		profileDir: profileDir,
+		label:      site.Label(),
 		baseURL:    strings.TrimRight(base, "/"),
 		clientID:   client,
 		http:       &http.Client{Timeout: 30 * time.Second},
@@ -174,7 +176,7 @@ func (t *TokenSource) deviceCredential(ctx context.Context) (appCredential, erro
 		return t.device, nil
 	}
 	if t.profileDir == "" {
-		return appCredential{}, errors.New("Qoder CN app profile directory was not found")
+		return appCredential{}, fmt.Errorf("%s app profile directory was not found", t.label)
 	}
 	cred, err := loadAppCredential(t.profileDir)
 	if err != nil {

@@ -63,6 +63,9 @@ type Config struct {
 	WarmupTimeout         time.Duration
 	RemoteFallbackEnabled bool
 	RemoteFallbackModels  []string
+	// QoderCLISites pins which Qoder deployments the CLI backend serves
+	// ("cn", "global"). Empty defers to LINGMA_QODERCLI_SITES, then to both.
+	QoderCLISites []string
 }
 
 type Image struct {
@@ -159,8 +162,10 @@ type Service struct {
 	stickyModelID    string
 	modelMap         map[string]string // official name -> internal id
 	remoteClient     *remote.Client
-	cliClient        *qodercli.Client
-	cliModels        []string
+	cliClients       map[qodercli.Site]*qodercli.Client
+	cliModels        map[qodercli.Site][]string
+	detectedCLISites []qodercli.Site
+	cliSitesResolved bool
 	remoteProbeCache map[string]remoteModelProbeEntry
 }
 
@@ -206,6 +211,8 @@ func New(cfg Config) *Service {
 	if cfg.Backend == BackendRemote && len(cfg.RemoteFallbackModels) == 0 {
 		cfg.RemoteFallbackModels = DefaultRemoteFallbackModels()
 	}
+	// The pinned site set decides which backends are even considered available.
+	qodercli.SetEnabledSites(cfg.QoderCLISites)
 	ResolveBackend(&cfg)
 	cfg.Model = normalizeModelForBackend(cfg.Backend, cfg.Model)
 	if cfg.SessionMode == "" {
@@ -260,14 +267,63 @@ func resolveRemoteBackend(cfg Config) (BackendMode, bool) {
 	return BackendQoderCLI, true
 }
 
-func (s *Service) cliClientLocked() *qodercli.Client {
+// cliGlobalPrefix namespaces the international site's models in the merged list.
+// Both deployments expose a Qwen3.8-Flash, so an unprefixed id would be ambiguous.
+const cliGlobalPrefix = "intl/"
+
+// cliSites returns the sites this machine can serve, resolved once per process.
+func (s *Service) cliSites() []qodercli.Site {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cliClient == nil {
-		loc, _ := qodercli.Detect()
-		s.cliClient = qodercli.NewClient(loc, s.cfg.Timeout)
+	return s.cliSitesLocked()
+}
+
+func (s *Service) cliSitesLocked() []qodercli.Site {
+	if !s.cliSitesResolved {
+		s.detectedCLISites = qodercli.UsableSites()
+		s.cliSitesResolved = true
 	}
-	return s.cliClient
+	if len(s.detectedCLISites) == 0 {
+		// Nothing is installed or signed in. Reporting the enabled sites keeps the
+		// concrete per-site failure in play instead of an empty list.
+		return qodercli.EnabledSites()
+	}
+	return s.detectedCLISites
+}
+
+// cliClientFor returns the client that drives one site's installed CLI.
+func (s *Service) cliClientFor(site qodercli.Site) (*qodercli.Client, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cliClients == nil {
+		s.cliClients = map[qodercli.Site]*qodercli.Client{}
+	}
+	if client, ok := s.cliClients[site]; ok {
+		return client, nil
+	}
+	loc, ok := qodercli.DetectSite(site)
+	if !ok || loc.ProfileDir == "" {
+		return nil, fmt.Errorf("%s 桌面端未安装或未登录，无法使用它的 CLI 后端", site.Label())
+	}
+	client := qodercli.NewClient(loc, s.cfg.Timeout)
+	s.cliClients[site] = client
+	return client, nil
+}
+
+// resolveCLISite keeps a request on the site its model id named. Only an
+// unmarked request may move to the machine's other site, and only when the
+// default one is absent.
+func (s *Service) resolveCLISite(requested qodercli.Site, named bool) (qodercli.Site, error) {
+	sites := s.cliSites()
+	for _, site := range sites {
+		if site.Normalized() == requested.Normalized() {
+			return site, nil
+		}
+	}
+	if !named && len(sites) > 0 {
+		return sites[0], nil
+	}
+	return requested, fmt.Errorf("%s 桌面端未安装或未登录，无法使用它的 CLI 后端", requested.Label())
 }
 
 // chatClient is the transport surface the shared generate path needs.
@@ -276,10 +332,10 @@ type chatClient interface {
 	ListModels(ctx context.Context) ([]remote.Model, error)
 }
 
-func (s *Service) chatClient() (chatClient, error) {
+func (s *Service) chatClient(site qodercli.Site) (chatClient, error) {
 	switch s.backend() {
 	case BackendQoderCLI:
-		return s.cliClientLocked(), nil
+		return s.cliClientFor(site)
 	case BackendRemote:
 		return s.remoteClientLocked(), nil
 	default:
@@ -302,16 +358,39 @@ func (s *Service) DefaultModel() string {
 func (s *Service) Warmup(ctx context.Context) error {
 	if s.usesRemoteTransport() {
 		if s.backend() == BackendQoderCLI {
-			if err := s.cliClientLocked().Warmup(ctx); err != nil {
-				return err
-			}
-			s.cachedCLIModels(ctx)
-			return nil
+			return s.warmCLISites(ctx)
 		}
 		return s.remoteClientLocked().Warmup(ctx)
 	}
 	_, err := s.ensureConnected(ctx)
 	return err
+}
+
+// warmCLISites mints a job token for each served site and caches its model list.
+// A site that cannot authenticate is only fatal when no site can: a stale CN
+// login must not stop a working international one, and vice versa.
+func (s *Service) warmCLISites(ctx context.Context) error {
+	var firstErr error
+	warmed := false
+	for _, site := range s.cliSites() {
+		client, err := s.cliClientFor(site)
+		if err == nil {
+			err = client.Warmup(ctx)
+		}
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			log.Printf("backend: %s CLI warmup failed: %v", site.Label(), err)
+			continue
+		}
+		s.cachedCLIModels(ctx, site)
+		warmed = true
+	}
+	if !warmed {
+		return firstErr
+	}
+	return nil
 }
 
 // usesRemoteTransport reports whether requests go out over the network instead
@@ -359,7 +438,7 @@ func (s *Service) State() State {
 		if s.cfg.Backend == BackendQoderCLI {
 			endpoint = ""
 			transport = "qodercli"
-			connected = s.cliClient != nil
+			connected = len(s.cliClients) > 0
 		}
 		return State{
 			Endpoint:    endpoint,
@@ -378,32 +457,70 @@ func (s *Service) State() State {
 	}
 }
 
-func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
-	if s.backend() == BackendQoderCLI {
-		models, err := s.cliClientLocked().ListModels(ctx)
-		if err != nil {
-			return nil, err
+// listCLIMergedModels lists the models of every served site. The international
+// catalog is namespaced because both sites expose models under the same names.
+func (s *Service) listCLIMergedModels(ctx context.Context) ([]Model, error) {
+	var out []Model
+	var firstErr error
+	seen := map[string]bool{}
+	sites := s.cliSites()
+	// The prefix exists only to disambiguate the two catalogs; a single-site
+	// proxy serves plain CLI model names.
+	prefixGlobal := len(sites) > 1
+	for _, site := range sites {
+		client, err := s.cliClientFor(site)
+		var models []remote.Model
+		if err == nil {
+			models, err = client.ListModels(ctx)
 		}
-		out := make([]Model, 0, len(models))
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			log.Printf("backend: %s CLI model discovery failed: %v", site.Label(), err)
+			continue
+		}
 		ids := make([]string, 0, len(models))
-		seen := map[string]bool{}
 		for _, model := range models {
-			id := strings.TrimSpace(model.Key)
-			if id == "" || seen[id] {
+			name := strings.TrimSpace(model.Key)
+			if name == "" {
+				continue
+			}
+			id := name
+			if prefixGlobal && site.Normalized() == qodercli.SiteGlobal {
+				id = cliGlobalPrefix + name
+			}
+			if seen[id] {
 				continue
 			}
 			seen[id] = true
-			name := strings.TrimSpace(model.DisplayName)
-			if name == "" {
-				name = id
-			}
-			out = append(out, Model{ID: id, Name: name})
-			ids = append(ids, id)
+			out = append(out, Model{ID: id, Name: id})
+			// The cache keeps the bare name: that is what --model takes.
+			ids = append(ids, name)
 		}
-		s.mu.Lock()
-		s.cliModels = ids
-		s.mu.Unlock()
-		return out, nil
+		s.setCLIModels(site, ids)
+	}
+	if len(out) == 0 {
+		if firstErr != nil {
+			return nil, firstErr
+		}
+		return nil, errors.New("CLI 后端没有返回任何模型")
+	}
+	return out, nil
+}
+
+func (s *Service) setCLIModels(site qodercli.Site, ids []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cliModels == nil {
+		s.cliModels = map[qodercli.Site][]string{}
+	}
+	s.cliModels[site.Normalized()] = ids
+}
+
+func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
+	if s.backend() == BackendQoderCLI {
+		return s.listCLIMergedModels(ctx)
 	}
 
 	if s.backend() == BackendRemote {
@@ -532,7 +649,10 @@ func (s *Service) generateRemoteInternal(
 		req.Model = s.DefaultModel()
 	}
 	req.Model = normalizeModelForBackend(s.backend(), req.Model)
+	site := qodercli.SiteCN
+	namedSite := false
 	if s.backend() == BackendQoderCLI {
+		site, req.Model, namedSite = splitCLISite(req.Model)
 		base, effort := splitCLIModelEffort(req.Model)
 		// A suffixed tier is a deliberate pick from the client's model list, so it
 		// outranks the request body; an unsuffixed id leaves the client's own
@@ -540,11 +660,16 @@ func (s *Service) generateRemoteInternal(
 		if effort != "" {
 			req.ReasoningEffort = effort
 		}
-		req.Model = s.resolveCLIModel(ctx, base)
+		resolved, err := s.resolveCLISite(site, namedSite)
+		if err != nil {
+			return nil, err
+		}
+		site = resolved
+		req.Model = s.resolveCLIModel(ctx, base, site)
 	}
-	// The CLI backend keeps the instructions out of the user turn: the Qoder CN
-	// gateway reroutes user content that names another product's identity, so
-	// they travel as the session's system prompt instead.
+	// The CLI backend keeps the instructions out of the user turn: the gateway
+	// reroutes user content that names another product's identity, so they travel
+	// as the session's system prompt instead.
 	systemInline := s.backend() != BackendQoderCLI
 	system, prompt, err := buildLingmaPromptSections(req, SessionModeFresh, emulateTools, systemInline)
 	if err != nil {
@@ -555,7 +680,7 @@ func (s *Service) generateRemoteInternal(
 	}
 
 	models := s.remoteAttemptModels(ctx, req.Model)
-	client, err := s.chatClient()
+	client, err := s.chatClient(site)
 	if err != nil {
 		return nil, err
 	}
@@ -565,6 +690,10 @@ func (s *Service) generateRemoteInternal(
 		result, emitted, err := s.generateRemoteWithModel(attemptCtx, client, req, system, prompt, model, onDelta, emulateTools)
 		cancel()
 		if err == nil {
+			if result != nil && namedSite {
+				// Echo the id the client asked for, not the bare name --model took.
+				result.Model = cliGlobalPrefix + result.Model
+			}
 			return result, nil
 		}
 		lastErr = err
@@ -927,6 +1056,9 @@ var cliModelAliases = map[string]string{
 
 // cliEffortSuffixes let clients that cannot send reasoning_effort pick a thinking
 // tier straight from the model id, e.g. "Qwen3.8-Flash-xhigh" or "Qwen3.8-Flash-极高".
+// The bare "max" suffix is absent on purpose: it would shadow the real model
+// Qwen3.8-Max. 最高 still names the top rung, which the CLI backend clamps per
+// model because only some of them offer max.
 var cliEffortSuffixes = map[string]string{
 	"low":     "low",
 	"medium":  "medium",
@@ -937,7 +1069,7 @@ var cliEffortSuffixes = map[string]string{
 	"中":       "medium",
 	"高":       "high",
 	"极高":      "xhigh",
-	"最高":      "xhigh",
+	"最高":      "max",
 }
 
 // splitCLIModelEffort separates an effort suffix from the real model name. Some
@@ -959,14 +1091,32 @@ func splitCLIModelEffort(model string) (string, string) {
 	return trimmed, ""
 }
 
+// splitCLISite reads the site marker out of a model id. Clients namespace the id
+// with their own provider key ("lingma-proxy/intl/Qwen3.8-Flash"), so the marker
+// is looked for in every path segment rather than only the first.
+func splitCLISite(model string) (qodercli.Site, string, bool) {
+	trimmed := strings.TrimSpace(model)
+	segments := strings.Split(trimmed, "/")
+	for i, segment := range segments {
+		switch strings.ToLower(strings.TrimSpace(segment)) {
+		case "intl", "global", "国际", "国际版":
+			rest := strings.TrimSpace(strings.Join(segments[i+1:], "/"))
+			if rest != "" {
+				return qodercli.SiteGlobal, rest, true
+			}
+		}
+	}
+	return qodercli.SiteCN, trimmed, false
+}
+
 // resolveCLIModel maps whatever the client asked for onto a model the signed-in
-// Qoder CN account actually exposes.
-func (s *Service) resolveCLIModel(ctx context.Context, model string) string {
+// account of that site actually exposes.
+func (s *Service) resolveCLIModel(ctx context.Context, model string, site qodercli.Site) string {
 	wanted := strings.TrimSpace(model)
 	if alias, ok := cliModelAliases[strings.ToLower(wanted)]; ok {
 		wanted = alias
 	}
-	known := s.cachedCLIModels(ctx)
+	known := s.cachedCLIModels(ctx, site)
 	if len(known) == 0 {
 		if wanted == "" {
 			return "Auto"
@@ -1008,24 +1158,21 @@ func cliModelFamily(model string) string {
 	return model
 }
 
-// cachedCLIModels returns the CLI model list, fetching it once on first use.
-func (s *Service) cachedCLIModels(ctx context.Context) []string {
-	s.mu.Lock()
-	cached := append([]string(nil), s.cliModels...)
-	s.mu.Unlock()
-	if len(cached) > 0 {
+// cachedCLIModels returns one site's model list, discovering it on first use.
+// The names are bare, as the CLI wants them.
+func (s *Service) cachedCLIModels(ctx context.Context, site qodercli.Site) []string {
+	read := func() []string {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return append([]string(nil), s.cliModels[site.Normalized()]...)
+	}
+	if cached := read(); len(cached) > 0 {
 		return cached
 	}
-	models, err := s.ListModels(ctx)
-	if err != nil {
-		log.Printf("backend: Qoder CN CLI model discovery failed: %v", err)
-		return nil
+	if _, err := s.listCLIMergedModels(ctx); err != nil {
+		log.Printf("backend: %s CLI model discovery failed: %v", site.Label(), err)
 	}
-	out := make([]string, 0, len(models))
-	for _, model := range models {
-		out = append(out, model.ID)
-	}
-	return out
+	return read()
 }
 
 func (s *Service) remoteFallbackModels() []string {

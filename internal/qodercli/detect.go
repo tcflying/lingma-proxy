@@ -7,67 +7,102 @@ import (
 	"strings"
 )
 
-// Location points at a usable Qoder CN CLI host. Either the standalone
-// qoderclicn binary, or the desktop app's Electron binary plus the bundled
-// agent SDK worker runtime that ships inside its resources directory.
+// Location points at a usable Qoder CLI host for one site. Either the standalone
+// qodercli/qoderclicn binary, or a desktop app's Electron binary plus the agent
+// SDK worker runtime that ships inside its resources directory.
 type Location struct {
 	// HostExe is launched directly for StandaloneCLI, or with
 	// ELECTRON_RUN_AS_NODE=1 for the bundled worker runtime.
 	HostExe   string
 	RuntimeJS string
+	Site      Site
 	// EnvPrefix is what the bundled CLI expects for its own environment
 	// variables, e.g. "QODERCN_" for the CN build.
 	EnvPrefix  string
 	ProfileDir string
+	// ConfigDir is passed as --config-dir when the site must stay out of the
+	// desktop app's own config root.
+	ConfigDir string
 }
 
-const workerGlob = "resources/app.asar.unpacked/node_modules/@qoder-ai/*-agent-sdk/dist/_worker/qoder-worker-runtime.obf.mjs"
-
-func (l Location) useWorker() bool { return l.RuntimeJS != "" }
-
-// Detect finds an installed Qoder CN CLI host together with its app profile dir.
-func Detect() (Location, bool) {
-	if exe := strings.TrimSpace(os.Getenv("LINGMA_QODERCLI_BIN")); exe != "" && fileExists(exe) {
-		return finish(Location{HostExe: exe, EnvPrefix: envPrefixFor(exe)}), true
-	}
-	if exe := strings.TrimSpace(os.Getenv("LINGMA_QODERCLI_RUNTIME")); exe != "" && fileExists(exe) {
-		if host := strings.TrimSpace(os.Getenv("LINGMA_QODERCLI_HOST")); host != "" && fileExists(host) {
-			return finish(Location{HostExe: host, RuntimeJS: exe, EnvPrefix: envPrefixFor(exe)}), true
+// DetectSite finds the CLI host installed for one site.
+func DetectSite(site Site) (Location, bool) {
+	if loc, ok := explicitLocation(); ok {
+		if loc.Site.Normalized() != site.Normalized() {
+			return Location{}, false
 		}
+		return finish(loc), true
 	}
-
-	for _, root := range installRoots() {
-		if standalone := standaloneCLI(root); standalone != "" {
-			return finish(Location{HostExe: standalone, EnvPrefix: "QODERCN_"}), true
+	for _, root := range installRoots(site) {
+		if standalone := standaloneCLI(root, site); standalone != "" {
+			return finish(newLocation(site, standalone, "")), true
 		}
-		runtimeJS := firstMatch(filepath.Join(root, workerGlob))
+		runtimeJS := firstMatch(filepath.Join(root, workerGlob(site)))
 		if runtimeJS == "" {
 			continue
 		}
-		host := hostExecutable(root)
+		host := hostExecutable(root, site)
 		if host == "" {
 			continue
 		}
-		return finish(Location{HostExe: host, RuntimeJS: runtimeJS, EnvPrefix: envPrefixFor(runtimeJS)}), true
+		return finish(newLocation(site, host, runtimeJS)), true
 	}
 	return Location{}, false
 }
 
-// Available reports whether both a CLI host and usable login state exist.
-func Available() bool {
-	loc, ok := Detect()
+// Available reports whether any enabled site has both a CLI host and a login.
+func Available() bool { return len(UsableSites()) > 0 }
+
+// AvailableSite reports whether both a CLI host and usable login state exist.
+func AvailableSite(site Site) bool {
+	loc, ok := DetectSite(site)
 	return ok && loc.ProfileDir != "" && hasAppCredential(loc.ProfileDir)
 }
 
+// explicitLocation honours the host overrides an operator sets to pin a build.
+func explicitLocation() (Location, bool) {
+	if exe := strings.TrimSpace(os.Getenv("LINGMA_QODERCLI_BIN")); exe != "" && fileExists(exe) {
+		return newLocation(siteForPath(exe), exe, ""), true
+	}
+	if rt := strings.TrimSpace(os.Getenv("LINGMA_QODERCLI_RUNTIME")); rt != "" && fileExists(rt) {
+		host := strings.TrimSpace(os.Getenv("LINGMA_QODERCLI_HOST"))
+		if host != "" && fileExists(host) {
+			return newLocation(siteForPath(rt), host, rt), true
+		}
+	}
+	return Location{}, false
+}
+
+func newLocation(site Site, host, runtimeJS string) Location {
+	site = site.Normalized()
+	return Location{
+		HostExe:   host,
+		RuntimeJS: runtimeJS,
+		Site:      site,
+		EnvPrefix: site.profile().envPrefix,
+	}
+}
+
 func finish(loc Location) Location {
+	if loc.Site == "" {
+		loc.Site = SiteCN
+	}
+	if loc.EnvPrefix == "" {
+		loc.EnvPrefix = loc.Site.profile().envPrefix
+	}
 	if loc.ProfileDir == "" {
-		loc.ProfileDir = detectProfileDir()
+		loc.ProfileDir = detectProfileDir(loc.Site)
+	}
+	if loc.ConfigDir == "" {
+		loc.ConfigDir = loc.Site.ownConfigDir()
 	}
 	return loc
 }
 
-func standaloneCLI(root string) string {
-	name := "qoderclicn"
+func (l Location) useWorker() bool { return l.RuntimeJS != "" }
+
+func standaloneCLI(root string, site Site) string {
+	name := site.profile().standaloneBin
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
@@ -78,23 +113,22 @@ func standaloneCLI(root string) string {
 	return ""
 }
 
-func installRoots() []string {
+func installRoots(site Site) []string {
+	profile := site.profile()
 	var roots []string
 	if runtime.GOOS == "windows" {
 		roots = append(roots, registryInstallRoots()...)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		roots = append(roots,
-			filepath.Join(home, ".qoder-cn", "bin", "qoderclicn"),
-			filepath.Join(home, "AppData", "Local", "Programs", "Qoder CN"),
-			filepath.Join(home, "AppData", "Local", "Programs", "Qoder"),
-			"/Applications/Qoder CN.app",
-			"/Applications/Qoder.app",
+			filepath.Join(home, profile.homeDirName, "bin", profile.standaloneBin),
+			filepath.Join(home, "AppData", "Local", "Programs", profile.appName),
+			filepath.Join("/Applications", profile.appName+".app"),
 		)
 	}
 	for _, envName := range []string{"ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"} {
 		if base := strings.TrimSpace(os.Getenv(envName)); base != "" {
-			roots = append(roots, filepath.Join(base, "Qoder CN"), filepath.Join(base, "Qoder"))
+			roots = append(roots, filepath.Join(base, profile.appName))
 		}
 	}
 	for _, path := range filepath.SplitList(os.Getenv("PATH")) {
@@ -102,26 +136,26 @@ func installRoots() []string {
 		if trimmed == "" {
 			continue
 		}
-		if base := appRootFromPath(trimmed); base != "" {
+		if base := appRootFromPath(trimmed, site); base != "" {
 			roots = append(roots, base)
 		}
 	}
 	if runtime.GOOS == "windows" {
-		roots = append(roots, `C:\Qoder CN`)
+		roots = append(roots, filepath.Join(`C:\`, profile.appName))
 	}
 	return uniqueNonEmpty(roots)
 }
 
 // appRootFromPath walks up from a PATH entry such as
 // "C:\Qoder CN\resources\bin" looking for an Electron installation.
-func appRootFromPath(entry string) string {
+func appRootFromPath(entry string, site Site) string {
 	current := filepath.Clean(entry)
 	for i := 0; i < 5; i++ {
 		parent := filepath.Dir(current)
 		if parent == current {
 			return ""
 		}
-		if hostExecutable(parent) != "" {
+		if hostExecutable(parent, site) != "" {
 			return parent
 		}
 		current = parent
@@ -130,15 +164,16 @@ func appRootFromPath(entry string) string {
 }
 
 // hostExecutable returns the binary to launch with ELECTRON_RUN_AS_NODE=1.
-func hostExecutable(root string) string {
+func hostExecutable(root string, site Site) string {
+	app := site.profile().appName
 	var names []string
 	if runtime.GOOS == "darwin" {
 		names = []string{
-			filepath.Join("Contents", "MacOS", "Qoder CN"),
-			filepath.Join("Contents", "MacOS", "Qoder"),
+			filepath.Join("Contents", "MacOS", app),
+			filepath.Join("Contents", "MacOS", "Electron"),
 		}
 	} else {
-		names = []string{"Qoder CN.exe", "Qoder.exe"}
+		names = []string{app + ".exe", app}
 	}
 	for _, name := range names {
 		if candidate := filepath.Join(root, name); fileExists(candidate) {
@@ -148,15 +183,13 @@ func hostExecutable(root string) string {
 	return ""
 }
 
-func envPrefixFor(path string) string {
-	if strings.Contains(strings.ToLower(path), "qoder-cn") {
-		return "QODERCN_"
-	}
-	return "QODER_"
+func workerGlob(site Site) string {
+	return filepath.Join("resources", "app.asar.unpacked", "node_modules", "@qoder-ai",
+		site.profile().workerPkg, "dist", "_worker", "qoder-worker-runtime.obf.mjs")
 }
 
 func firstMatch(pattern string) string {
-	matches, err := filepath.Glob(pattern)
+	matches, err := filepath.Glob(filepath.FromSlash(pattern))
 	if err != nil {
 		return ""
 	}

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"lingma-ipc-proxy/internal/qodercli"
 	"lingma-ipc-proxy/internal/toolemulation"
 )
 
@@ -433,8 +434,11 @@ func TestSplitCLIModelEffort(t *testing.T) {
 	}{
 		{"Qwen3.8-Flash-xhigh", "Qwen3.8-Flash", "xhigh"},
 		{"Qwen3.8-Flash-极高", "Qwen3.8-Flash", "xhigh"},
+		{"Qwen3.8-Flash-最高", "Qwen3.8-Flash", "max"},
 		{"lingma-proxy/Qwen3.8-Flash-xhigh", "Qwen3.8-Flash", "xhigh"},
 		{"Qwen3.8-Flash", "Qwen3.8-Flash", ""},
+		{"Qwen3.8-Max", "Qwen3.8-Max", ""},
+		{"Qwen3.8-Flash-max", "Qwen3.8-Flash-max", ""},
 		{"MiniMax-M2.7", "MiniMax-M2.7", ""},
 		{"Kimi-K2.8-Preview", "Kimi-K2.8-Preview", ""},
 		{"Auto", "Auto", ""},
@@ -443,6 +447,32 @@ func TestSplitCLIModelEffort(t *testing.T) {
 		name, effort := splitCLIModelEffort(tc.in)
 		if name != tc.wantName || effort != tc.wantEff {
 			t.Fatalf("splitCLIModelEffort(%q) = %q,%q want %q,%q", tc.in, name, effort, tc.wantName, tc.wantEff)
+		}
+	}
+}
+
+func TestSplitCLISiteReadsTheSiteMarkerFromAnySegment(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    qodercli.Site
+		wantCmd string
+		named   bool
+	}{
+		{"Qwen3.8-Flash", qodercli.SiteCN, "Qwen3.8-Flash", false},
+		{"intl/Qwen3.8-Flash", qodercli.SiteGlobal, "Qwen3.8-Flash", true},
+		{"global/Kimi-K3", qodercli.SiteGlobal, "Kimi-K3", true},
+		{"国际版/Qwen3.8-Flash", qodercli.SiteGlobal, "Qwen3.8-Flash", true},
+		// Clients prefix the id with their own provider key.
+		{"lingma-proxy/intl/Qwen3.8-Flash-xhigh", qodercli.SiteGlobal, "Qwen3.8-Flash-xhigh", true},
+		{"INTL/Auto", qodercli.SiteGlobal, "Auto", true},
+		// A bare marker names no model, so it stays a CN request.
+		{"intl", qodercli.SiteCN, "intl", false},
+	}
+	for _, tc := range cases {
+		site, model, named := splitCLISite(tc.in)
+		if site != tc.want || model != tc.wantCmd || named != tc.named {
+			t.Fatalf("splitCLISite(%q) = %q,%q,%v want %q,%q,%v",
+				tc.in, site, model, named, tc.want, tc.wantCmd, tc.named)
 		}
 	}
 }

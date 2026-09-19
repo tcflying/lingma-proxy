@@ -24,5 +24,9 @@
   "shell_type": "powershell",
   "current_file_path": "",
   "pipe": "",
-  "websocket_url": ""
+  "websocket_url": "",
+  "qodercli_sites": [
+    "cn",
+    "global"
+  ]
 }

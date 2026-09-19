@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -15,9 +16,10 @@ import (
 	"lingma-ipc-proxy/internal/remote"
 )
 
-// Client drives the bundled Qoder CN CLI as a subprocess. It exists because the
+// Client drives the bundled Qoder CLI as a subprocess. It exists because the
 // inference gateway signs every request from inside the CLI (a WASM module with
-// hardware-bound key material), so signing cannot be replayed from Go.
+// hardware-bound key material), so signing cannot be replayed from Go. One
+// client serves one site.
 type Client struct {
 	loc     Location
 	tokens  *TokenSource
@@ -31,12 +33,15 @@ const maxSystemPromptArgChars = 20000
 func NewClient(loc Location, timeout time.Duration) *Client {
 	return &Client{
 		loc:     loc,
-		tokens:  NewTokenSource(loc.ProfileDir),
+		tokens:  NewTokenSource(loc.ProfileDir, loc.Site),
 		timeout: timeout,
 	}
 }
 
 func (c *Client) Location() Location { return c.loc }
+
+// label names the site this client drives in user-facing messages.
+func (c *Client) label() string { return c.loc.Site.Label() }
 
 // credential returns the JSON blob the CLI reads from its job token env var.
 func (c *Client) credential(ctx context.Context) (string, error) {
@@ -67,7 +72,7 @@ func (c *Client) ListModels(ctx context.Context) ([]remote.Model, error) {
 		models = append(models, remote.Model{Key: name, DisplayName: name, Model: name, Enable: true})
 	}
 	if len(models) == 0 {
-		return nil, errors.New("Qoder CN CLI reported no models")
+		return nil, fmt.Errorf("%s CLI reported no models", c.label())
 	}
 	return models, nil
 }
@@ -82,7 +87,7 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 		return nil, errors.New("empty user message")
 	}
 	if len(request.Images) > 0 {
-		return nil, errors.New("the Qoder CN CLI backend does not support image input")
+		return nil, fmt.Errorf("the %s CLI backend does not support image input", c.label())
 	}
 
 	args := []string{
@@ -96,12 +101,12 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 	if strings.TrimSpace(request.Model) != "" {
 		args = append(args, "--model", strings.TrimSpace(request.Model))
 	}
-	if effort := normalizeReasoningEffort(request.ReasoningEffort); effort != "" {
+	if effort := c.clampReasoningEffort(request.Model, normalizeReasoningEffort(request.ReasoningEffort)); effort != "" {
 		args = append(args, "--reasoning-effort", effort)
 	}
-	// Client instructions go to the CLI's system slot: the Qoder CN gateway
-	// reroutes user turns that assert another product's identity, and the prompt
-	// text is a user turn here.
+	// Client instructions go to the CLI's system slot: the gateway reroutes user
+	// turns that assert another product's identity, and the prompt text is a user
+	// turn here.
 	if system := strings.TrimSpace(request.System); system != "" {
 		if len(system) <= maxSystemPromptArgChars {
 			args = append(args, "--append-system-prompt", system)
@@ -114,7 +119,7 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 	args = append(args, "--tools", "")
 
 	stdout, runErr := c.runWithStdin(ctx, prompt, args...)
-	result, parseErr := parseResult(stdout, request.Model, onDelta)
+	result, parseErr := parseResult(stdout, request.Model, c.label(), c.loc.Site.Normalized(), onDelta)
 	if runErr == nil {
 		return result, parseErr
 	}
@@ -157,7 +162,7 @@ func (c *Client) runWithStdin(ctx context.Context, prompt string, args ...string
 func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, args ...string) (string, error) {
 	credential, err := c.credential(ctx)
 	if err != nil {
-		return "", fmt.Errorf("Qoder CN 登录态不可用：%w", err)
+		return "", fmt.Errorf("%s 登录态不可用：%w", c.label(), err)
 	}
 
 	runCtx := ctx
@@ -181,24 +186,33 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, args ...str
 	if err := cmd.Run(); err != nil {
 		if runCtx.Err() != nil {
 			if c.timeout > 0 {
-				return stdout.String(), fmt.Errorf("Qoder CN CLI timed out after %s", c.timeout)
+				return stdout.String(), fmt.Errorf("%s CLI timed out after %s", c.label(), c.timeout)
 			}
-			return stdout.String(), fmt.Errorf("Qoder CN CLI was cancelled before it finished: %w", runCtx.Err())
+			return stdout.String(), fmt.Errorf("%s CLI was cancelled before it finished: %w", c.label(), runCtx.Err())
 		}
 		detail := errorLines(stderr.String(), 6)
 		if detail != "" {
-			return stdout.String(), fmt.Errorf("Qoder CN CLI failed: %s", detail)
+			return stdout.String(), fmt.Errorf("%s CLI failed: %s", c.label(), detail)
 		}
-		return stdout.String(), fmt.Errorf("Qoder CN CLI failed: %w with no output", err)
+		return stdout.String(), fmt.Errorf("%s CLI failed: %w with no output", c.label(), err)
 	}
 	return stdout.String(), nil
 }
 
 func (c *Client) commandArgs(args []string) (string, []string) {
-	if !c.loc.useWorker() {
-		return c.loc.HostExe, args
+	argv := args
+	if c.loc.useWorker() {
+		argv = append([]string{c.loc.RuntimeJS}, argv...)
 	}
-	return c.loc.HostExe, append([]string{c.loc.RuntimeJS}, args...)
+	if c.loc.ConfigDir != "" {
+		// Best-effort: the CLI creates the directory itself, and the failure is
+		// then visible in its own error rather than swallowed here.
+		if err := os.MkdirAll(c.loc.ConfigDir, 0o700); err != nil {
+			log.Printf("qodercli: %s CLI config dir %s could not be created: %v", c.label(), c.loc.ConfigDir, err)
+		}
+		argv = append(argv, "--config-dir", c.loc.ConfigDir)
+	}
+	return c.loc.HostExe, argv
 }
 
 func (c *Client) environment(credential string) []string {
@@ -257,7 +271,7 @@ type usageBlock struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
-func parseResult(stdout, model string, onDelta func(string)) (*remote.ChatResult, error) {
+func parseResult(stdout, model, label string, site Site, onDelta func(string)) (*remote.ChatResult, error) {
 	var (
 		text      strings.Builder
 		frames    []string
@@ -306,7 +320,7 @@ func parseResult(stdout, model string, onDelta func(string)) (*remote.ChatResult
 
 	if result != nil {
 		if result.IsError || result.Subtype != "" && result.Subtype != "success" {
-			return nil, &cliError{text: cliErrorText(*result, frames)}
+			return nil, &cliError{label: label, text: cliErrorText(*result, frames)}
 		}
 		if strings.TrimSpace(result.Result) != "" {
 			text.Reset()
@@ -327,7 +341,7 @@ func parseResult(stdout, model string, onDelta func(string)) (*remote.ChatResult
 
 	out := strings.TrimRight(text.String(), " \t\r\n")
 	if out == "" {
-		return nil, fmt.Errorf("Qoder CN CLI returned no answer: %s", tailLines(stdout, 8))
+		return nil, fmt.Errorf("%s CLI returned no answer: %s", label, tailLines(stdout, 8))
 	}
 	if onDelta != nil {
 		onDelta(out)
@@ -337,7 +351,7 @@ func parseResult(stdout, model string, onDelta func(string)) (*remote.ChatResult
 		InputTokens:   inputTok,
 		OutputTokens:  outputTok,
 		RequestID:     requestID,
-		CredentialSrc: "qodercli",
+		CredentialSrc: "qodercli:" + string(site),
 	}, nil
 }
 
@@ -362,9 +376,18 @@ func cliErrorText(result outputFrame, frames []string) string {
 
 // cliError is a failure the CLI reported in its own result frame. Chat prefers it
 // over stderr, where the runtime prints per-run startup warnings regardless.
-type cliError struct{ text string }
+type cliError struct {
+	label string
+	text  string
+}
 
-func (e *cliError) Error() string { return "Qoder CN CLI error: " + e.text }
+func (e *cliError) Error() string {
+	label := strings.TrimSpace(e.label)
+	if label == "" {
+		label = SiteCN.Label()
+	}
+	return label + " CLI error: " + e.text
+}
 
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
@@ -375,39 +398,132 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// reasoningEffortAliases maps client-side effort words (including the Qoder CN
-// UI's Chinese labels) onto the levels --reasoning-effort accepts.
+// reasoningEffortAliases maps client-side effort words (including the Qoder CN UI's
+// Chinese labels) onto the tier names the CLI parses. Which of those a given model
+// applies is a separate question, answered by reasoningLadders below.
 var reasoningEffortAliases = map[string]string{
-	"minimal": "low",
-	"low":     "low",
-	"medium":  "medium",
-	"auto":    "medium",
-	"high":    "high",
-	"xhigh":   "xhigh",
-	"ultra":   "xhigh",
-	"highest": "xhigh",
-	"max":     "xhigh",
-	"低":       "low",
-	"中":       "medium",
-	"高":       "high",
-	"极高":      "xhigh",
-	"最高":      "xhigh",
+	"none":     "none",
+	"off":      "none",
+	"disabled": "none",
+	"minimal":  "low",
+	"low":      "low",
+	"medium":   "medium",
+	"auto":     "medium",
+	"high":     "high",
+	"xhigh":    "xhigh",
+	"ultra":    "max",
+	"highest":  "max",
+	"max":      "max",
+	"关闭":       "none",
+	"不思考":      "none",
+	"低":        "low",
+	"中":        "medium",
+	"高":        "high",
+	"极高":       "xhigh",
+	"最高":       "max",
 }
 
-// normalizeReasoningEffort returns the CLI level for a client-supplied effort,
-// or "" when the client asked for no thinking.
+// normalizeReasoningEffort returns the CLI level for a client-supplied effort. It
+// returns "" only when the client named no tier at all: the CLI's own default does
+// start thinking, so "off" has to travel explicitly as none.
 func normalizeReasoningEffort(effort string) string {
 	key := strings.ToLower(strings.TrimSpace(effort))
-	switch key {
-	case "":
-		return ""
-	case "none", "disabled", "off":
+	if key == "" {
 		return ""
 	}
 	if level, ok := reasoningEffortAliases[key]; ok {
 		return level
 	}
 	return ""
+}
+
+// reasoningTierRank orders the tier names the CLI's internal ladder accepts.
+var reasoningTierRank = map[string]int{
+	"none":   0,
+	"low":    1,
+	"medium": 2,
+	"high":   3,
+	"xhigh":  4,
+	"max":    5,
+}
+
+// reasoningLadders records which tiers each model actually applies. The CLI parses
+// any tier name, then gates it against the signed model catalog, and a tier the
+// model does not offer is simply not applied -- the run log then reports
+// reasoning_effort=none, meaning "unset", while the turn still thinks at the
+// model's own default. So the ladder has to be resolved here, not upstream.
+// Measured from the CLI's per-run logs on 2026-09-19 by sending every tier to every
+// model and reading back what stuck. nil means the model ignored all of them.
+var reasoningLadders = map[string][]string{
+	// Qwen3.8: off / low / medium / xhigh. There is no "high" and no "max".
+	"Qwen3.8-Flash": {"none", "low", "medium", "xhigh"},
+	"Qwen3.8-Max":   {"none", "low", "medium", "xhigh"},
+	// GLM, Kimi and DeepSeek-Flash: off / low / high / max. No medium, no xhigh.
+	"GLM-5.3":           {"none", "low", "high", "max"},
+	"Kimi-K3":           {"none", "low", "high", "max"},
+	"Kimi-K2.8-Preview": {"none", "low", "high", "max"},
+	"DeepSeek-Flash":    {"none", "low", "high", "max"},
+	// These three skipped the low rung as well.
+	"GLM-5.2":         {"none", "high", "max"},
+	"GLM-5.3-Flash":   {"none", "high", "max"},
+	"DeepSeek-V4-Pro": {"none", "high", "max"},
+	// Measured to ignore every tier name, thinking level included.
+	"Auto":          nil,
+	"Qwen3.7-Max":   nil,
+	"Qwen3.7-Plus":  nil,
+	"Qwen3.7-Flash": nil,
+	"MiniMax-M2.7":  nil,
+}
+
+// clampReasoningEffort maps the requested tier onto the model's ladder: the
+// strongest supported tier at or below the request, or the model's top tier when
+// the request is at or above it. reasoningLadders was measured against the CN
+// catalog, so other sites pass the tier through and let their own signed catalog
+// drop what it does not offer.
+func (c *Client) clampReasoningEffort(model, effort string) string {
+	if c.loc.Site.Normalized() != SiteCN {
+		return effort
+	}
+	ladder, ok := reasoningLadders[strings.TrimSpace(model)]
+	if !ok || effort == "" {
+		return effort
+	}
+	clamped := clampTier(ladder, effort)
+	if clamped != effort {
+		log.Printf("qodercli: model %s does not offer tier %s, using %s", model, effort, clamped)
+	}
+	return clamped
+}
+
+func clampTier(ladder []string, effort string) string {
+	rank, ok := reasoningTierRank[effort]
+	if !ok {
+		return effort
+	}
+	if len(ladder) == 0 {
+		return ""
+	}
+	top := ladder[len(ladder)-1]
+	if rank >= reasoningTierRank[top] {
+		return keepOrOmit(top, rank)
+	}
+	best := ladder[0]
+	for _, tier := range ladder {
+		if r := reasoningTierRank[tier]; r <= rank && r > reasoningTierRank[best] {
+			best = tier
+		}
+	}
+	return keepOrOmit(best, rank)
+}
+
+// keepOrOmit drops the tier entirely when clamping would only have produced
+// "none": a model that offers no thinking tiers (Auto is one) still thinks by
+// default, and sending none would switch that off rather than pick a level.
+func keepOrOmit(tier string, requestedRank int) string {
+	if tier == "none" && requestedRank > reasoningTierRank["none"] {
+		return ""
+	}
+	return tier
 }
 
 func tailLines(text string, count int) string {
