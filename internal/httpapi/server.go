@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif"
@@ -20,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/service"
 	"lingma-ipc-proxy/internal/toolemulation"
 	"lingma-ipc-proxy/internal/version"
@@ -368,7 +370,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	models, err := s.svc.ListModels(r.Context())
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeOpenAIUpstreamError(w, err)
 		return
 	}
 
@@ -481,7 +483,7 @@ func (s *Server) handleLMStudioModels(w http.ResponseWriter, r *http.Request) {
 
 	models, err := s.svc.ListModels(r.Context())
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeOpenAIUpstreamError(w, err)
 		return
 	}
 
@@ -520,7 +522,7 @@ func (s *Server) handleOllamaTags(w http.ResponseWriter, r *http.Request) {
 
 	models, err := s.svc.ListModels(r.Context())
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeOpenAIUpstreamError(w, err)
 		return
 	}
 
@@ -652,7 +654,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 
 	result, err := s.svc.Generate(r.Context(), normalized)
 	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeAnthropicUpstreamError(w, err)
 		return
 	}
 
@@ -723,7 +725,7 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 
 	result, err := s.svc.Generate(r.Context(), normalized)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeOpenAIUpstreamError(w, err)
 		return
 	}
 
@@ -770,7 +772,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.svc.Generate(r.Context(), normalized)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeOpenAIUpstreamError(w, err)
 		return
 	}
 	writeOpenAIResponse(w, result)
@@ -792,7 +794,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 	if shouldAggregateToolStream(req) {
 		result, err := s.svc.Generate(r.Context(), req)
 		if err != nil {
-			writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+			writeAnthropicUpstreamError(w, err)
 			return
 		}
 
@@ -909,7 +911,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 
 	events, done, err := s.svc.GenerateStream(r.Context(), req)
 	if err != nil {
-		writeAnthropicError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeAnthropicUpstreamError(w, err)
 		return
 	}
 
@@ -1251,7 +1253,7 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 	if shouldAggregateToolStream(req) {
 		result, err := s.svc.Generate(r.Context(), req)
 		if err != nil {
-			writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+			writeOpenAIUpstreamError(w, err)
 			return
 		}
 		streamingHeaders(w)
@@ -1296,7 +1298,7 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 
 	events, done, err := s.svc.GenerateStream(r.Context(), req)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeOpenAIUpstreamError(w, err)
 		return
 	}
 
@@ -1500,7 +1502,7 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 
 	events, done, err := s.svc.GenerateStream(r.Context(), req)
 	if err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "api_error", err.Error())
+		writeOpenAIUpstreamError(w, err)
 		return
 	}
 
@@ -2322,6 +2324,26 @@ func writeOpenAIError(w http.ResponseWriter, status int, kind string, message st
 			"param":   nil,
 		},
 	})
+}
+
+// writeAnthropicUpstreamError and writeOpenAIUpstreamError answer a generation
+// failure. A transient one -- the bundled CLI losing the openapi call that turns a
+// job token into a session -- is reported as 503 so clients retry it instead of
+// surfacing a dead end, which is how those failures used to look.
+func writeAnthropicUpstreamError(w http.ResponseWriter, err error) {
+	status, kind := http.StatusInternalServerError, "api_error"
+	if errors.Is(err, remote.ErrTransientUpstream) {
+		status, kind = http.StatusServiceUnavailable, "overloaded_error"
+	}
+	writeAnthropicError(w, status, kind, err.Error())
+}
+
+func writeOpenAIUpstreamError(w http.ResponseWriter, err error) {
+	status := http.StatusInternalServerError
+	if errors.Is(err, remote.ErrTransientUpstream) {
+		status = http.StatusServiceUnavailable
+	}
+	writeOpenAIError(w, status, "api_error", err.Error())
 }
 
 func writeOpenAIChatCompletion(w http.ResponseWriter, result *service.ChatResult) {

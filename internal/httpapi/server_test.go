@@ -3,6 +3,8 @@ package httpapi
 import (
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/service"
 	"lingma-ipc-proxy/internal/toolemulation"
 )
@@ -736,5 +739,38 @@ func TestSanitizeRecordedBodyRedactsImagePayloads(t *testing.T) {
 	}
 	if !strings.Contains(got, "[image payload redacted") {
 		t.Fatalf("missing redaction marker: %s", got)
+	}
+}
+
+// A transient CLI handshake failure must leave the client a retryable status; the
+// old behaviour was a bare 500, which ZCode surfaced as retryable=false.
+func TestTransientUpstreamIsRetryable(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeAnthropicUpstreamError(rec, fmt.Errorf("wrap: %w", remote.ErrTransientUpstream))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("anthropic transient status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+	var body struct {
+		Error struct {
+			Type string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.Error.Type != "overloaded_error" {
+		t.Fatalf("anthropic transient type = %q", body.Error.Type)
+	}
+
+	rec = httptest.NewRecorder()
+	writeAnthropicUpstreamError(rec, errors.New("model refused"))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("permanent status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+
+	rec = httptest.NewRecorder()
+	writeOpenAIUpstreamError(rec, fmt.Errorf("wrap: %w", remote.ErrTransientUpstream))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("openai transient status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
 	}
 }

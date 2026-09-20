@@ -192,6 +192,11 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, args ...str
 		}
 		detail := errorLines(stderr.String(), 6)
 		if detail != "" {
+			if transientAuthHandshake(detail) {
+				return stdout.String(), fmt.Errorf(
+					"%s CLI could not exchange its job token for a session (openapi call failed): %w",
+					c.label(), remote.ErrTransientUpstream)
+			}
 			return stdout.String(), fmt.Errorf("%s CLI failed: %s", c.label(), detail)
 		}
 		return stdout.String(), fmt.Errorf("%s CLI failed: %w with no output", c.label(), err)
@@ -539,6 +544,21 @@ func tailLines(text string, count int) string {
 var cliNoisePrefixes = []string{
 	`Skill "`,
 	"Warning:",
+}
+
+// authHandshakeFrames name the CLI's job-token-to-session exchange. When that
+// network call dies the CLI prints a rejected promise chain and no message at all,
+// so the frame names are the only way to tell "the account call failed, retry" from
+// a real refusal -- and quoting the stack at the user hides both.
+var authHandshakeFrames = []string{"loginWithJobToken", "fetchOpenApiUserInfo", "openApiJsonRequest"}
+
+func transientAuthHandshake(detail string) bool {
+	for _, frame := range authHandshakeFrames {
+		if strings.Contains(detail, frame) {
+			return true
+		}
+	}
+	return false
 }
 
 // errorLines keeps the tail of stderr but drops the per-run noise lines. It

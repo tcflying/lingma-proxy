@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,6 +54,12 @@ type baseURLCacheFile struct {
 	URL       string `json:"url"`
 	UpdatedAt string `json:"updated_at"`
 }
+
+// ErrTransientUpstream marks a failure that a retry can plausibly clear, such as
+// the bundled CLI losing the openapi call it uses to turn a job token into a
+// session. Callers use it to answer 503 so clients retry instead of surfacing a
+// dead-end error.
+var ErrTransientUpstream = errors.New("transient upstream failure")
 
 type Model struct {
 	Key         string `json:"key"`
