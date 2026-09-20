@@ -85,6 +85,7 @@ go build -o lingma-ipc-proxy ./cmd/lingma-ipc-proxy
 
 ```bash
 cd desktop/frontend && npm run build
+cd desktop && go run ./genicon -ico build/windows/icon.ico -out lpicon.syso
 cd desktop        && go build -tags production -o LingmaProxy.exe .
 ```
 
@@ -96,6 +97,12 @@ cd desktop        && go build -tags production -o LingmaProxy.exe .
    correct build tags」的空壳。
 3. **`go build -o` 传绝对 MSYS 路径（`/c/Users/...`）会"退出 0 但没写文件"**，留下上一次的旧产物
    骗过你。必须 `cd desktop` 后用相对文件名，装之前核对 mtime 和大小（生产构建约 20.7 MB）。
+4. 中间那句 `genicon` 是**图标**：手工 `go build` 不像 `wails build` 会注入资源，不生成 `.syso`
+   的话任务栏和文件管理器里就是一个通用图标。资源必须注册在 **ID 3** 上——Wails 运行时按
+   `winc.AppIconID = 3` 找窗口图标，图标在别的编号或字符串名下会「exe 里有、窗口看不到」，
+   实测这样任务栏仍然是默认蓝图标。`desktop/*.syso` 已进 `.gitignore`，**别提交**——
+   `wails build` 会在项目根自己生成 `<name>-res.syso`，两份资源一起链接直接
+   `too many .rsrc sections` 报错（实测），CI 的 `wails build` 会被搞挂。
    同一个坑的另一个变体：`git worktree add /c/...` 会落到 `<当前盘>:\c\...`。
 
 ### 出安装包
