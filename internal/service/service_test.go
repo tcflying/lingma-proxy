@@ -510,3 +510,72 @@ func TestSplitCLISiteReadsTheSiteMarkerFromAnySegment(t *testing.T) {
 		}
 	}
 }
+
+// TestFreshCLICatalogIsServedWithoutProbing pins the cache hit: a probe is an
+// Electron subprocess that measures seconds, so /v1/models must not pay for one
+// while a site's catalog is still inside its TTL.
+func TestFreshCLICatalogIsServedWithoutProbing(t *testing.T) {
+	s := &Service{cfg: Config{Backend: BackendQoderCLI}}
+	sites := s.cliSites()
+	if len(sites) == 0 {
+		t.Skip("no CLI site is configured")
+	}
+	// Names no installed CLI would return, so anything else in the output means
+	// the merge probed instead of reading the cache.
+	for _, site := range sites {
+		s.setCLICatalog(site, []string{"cached-a", "cached-b"}, time.Now().Add(time.Minute))
+	}
+
+	out, err := s.listCLIMergedModels(context.Background())
+	if err != nil {
+		t.Fatalf("listCLIMergedModels: %v", err)
+	}
+	// The global catalog is namespaced, so the two sites never dedup against
+	// each other here.
+	if len(out) != 2*len(sites) {
+		t.Fatalf("merged %d models, want %d cached ones: %v", len(out), 2*len(sites), out)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, site := range sites {
+		ids := s.cliModels[site.Normalized()]
+		if len(ids) != 2 || ids[0] != "cached-a" {
+			t.Fatalf("site %v tier ids = %v, want the bare cached names", site, ids)
+		}
+	}
+}
+
+// TestMergeCLICatalogsSilentSiteFailsLouderThanAHalfList pins the defect that a
+// cold `both` proxy measured at 3 of 6 requests: one site's probe failed, the
+// other 14 models came back as a 200, and clients read that as a delisting.
+func TestMergeCLICatalogsSilentSiteFailsLouderThanAHalfList(t *testing.T) {
+	s := &Service{}
+	sites := []qodercli.Site{qodercli.SiteCN, qodercli.SiteGlobal}
+	boom := errors.New("intl CLI failed")
+
+	out, err := s.mergeCLICatalogs(sites, []cliSiteListing{
+		{names: []string{"Auto"}},
+		{names: []string{"Auto"}, err: boom},
+	})
+	if err != nil {
+		t.Fatalf("a site with a cached catalog must still answer: %v", err)
+	}
+	if len(out) != 2 || out[0].ID != "Auto" || out[1].ID != cliGlobalPrefix+"Auto" {
+		t.Fatalf("merged = %v, want the CN id and the namespaced stale id", out)
+	}
+
+	out, err = s.mergeCLICatalogs(sites, []cliSiteListing{
+		{names: []string{"Auto"}},
+		{err: boom},
+	})
+	if err == nil {
+		t.Fatalf("half list returned as success: %v", out)
+	}
+	if out != nil {
+		t.Fatalf("models returned alongside the error: %v", out)
+	}
+	if !strings.Contains(err.Error(), "没有返回模型列表") || !strings.Contains(err.Error(), boom.Error()) {
+		t.Fatalf("error must name the site and wrap the cause, got %v", err)
+	}
+}

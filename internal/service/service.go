@@ -164,6 +164,7 @@ type Service struct {
 	remoteClient     *remote.Client
 	cliClients       map[qodercli.Site]*qodercli.Client
 	cliModels        map[qodercli.Site][]string
+	cliCatalog       map[qodercli.Site]cliCatalogEntry
 	detectedCLISites []qodercli.Site
 	cliSitesResolved bool
 	remoteProbeCache map[string]remoteModelProbeEntry
@@ -457,40 +458,109 @@ func (s *Service) State() State {
 	}
 }
 
-// listCLIMergedModels lists the models of every served site. The international
-// catalog is namespaced because both sites expose models under the same names.
 // cliSiteListing keeps one site's probe result so the merge below can stay in
 // site order no matter which goroutine finished first.
 type cliSiteListing struct {
-	models []remote.Model
-	err    error
+	names []string
+	err   error
 }
 
+// A probe is a CLI subprocess spawn: measured 3-17s per site. Listing every
+// site on every request therefore put /v1/models behind that variance, which is
+// what clients time out on. The catalogs change on the order of days, so the
+// last good names are reused for cliCatalogTTL and a probe that runs past
+// cliProbeTimeout answers from them instead of handing back a half list.
+//
+// A site with nothing cached yet gets cliColdProbeTimeout instead: cutting it
+// off at 8s with no fallback was measured to return the international 17 models
+// on its own, which reads to a client as "the CN catalog is empty".
+const (
+	cliCatalogTTL       = 5 * time.Minute
+	cliProbeTimeout     = 8 * time.Second
+	cliColdProbeTimeout = 25 * time.Second
+)
+
+type cliCatalogEntry struct {
+	names     []string
+	expiresAt time.Time
+}
+
+func (s *Service) cliCatalogEntry(site qodercli.Site) cliCatalogEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cliCatalog[site.Normalized()]
+}
+
+func (s *Service) setCLICatalog(site qodercli.Site, names []string, expiresAt time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cliCatalog == nil {
+		s.cliCatalog = map[qodercli.Site]cliCatalogEntry{}
+	}
+	s.cliCatalog[site.Normalized()] = cliCatalogEntry{names: names, expiresAt: expiresAt}
+}
+
+// listCLIMergedModels lists the models of every served site. The international
+// catalog is namespaced because both sites expose models under the same names.
 func (s *Service) listCLIMergedModels(ctx context.Context) ([]Model, error) {
 	sites := s.cliSites()
-	// Each probe spawns a CLI subprocess that takes seconds. One after another made
-	// /v1/models the SUM of the sites (measured 7-10s for two), which is what
-	// clients time out on; the probes share no lock, so run them together.
+	now := time.Now()
 	listings := make([]cliSiteListing, len(sites))
-	var wg sync.WaitGroup
+	var pending []int
 	for i, site := range sites {
+		entry := s.cliCatalogEntry(site)
+		if entry.names != nil && now.Before(entry.expiresAt) {
+			listings[i].names = entry.names
+			continue
+		}
+		pending = append(pending, i)
+	}
+
+	var wg sync.WaitGroup
+	for _, i := range pending {
 		wg.Add(1)
 		go func(i int, site qodercli.Site) {
 			defer wg.Done()
-			client, err := s.cliClientFor(site)
-			if err == nil {
-				listings[i].models, err = client.ListModels(ctx)
+			stale := s.cliCatalogEntry(site).names
+			timeout := cliProbeTimeout
+			if stale == nil {
+				timeout = cliColdProbeTimeout
 			}
-			listings[i].err = err
+			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			client, err := s.cliClientFor(site)
+			var names []string
+			if err == nil {
+				var models []remote.Model
+				if models, err = client.ListModels(probeCtx); err == nil {
+					for _, model := range models {
+						if name := strings.TrimSpace(model.Key); name != "" {
+							names = append(names, name)
+						}
+					}
+				}
+			}
 			if err != nil {
 				log.Printf("backend: %s CLI model discovery failed: %v", site.Label(), err)
+				listings[i] = cliSiteListing{names: stale, err: err}
+				return
 			}
-		}(i, site)
+			s.setCLICatalog(site, names, now.Add(cliCatalogTTL))
+			listings[i].names = names
+		}(i, sites[i])
 	}
 	wg.Wait()
 
+	return s.mergeCLICatalogs(sites, listings)
+}
+
+// mergeCLICatalogs folds one listing per site into the ids clients see. A site
+// that errored falls back to the catalog it last answered with; a site with
+// nothing to fall back to makes the whole answer a lie, so it is reported.
+func (s *Service) mergeCLICatalogs(sites []qodercli.Site, listings []cliSiteListing) ([]Model, error) {
 	var out []Model
 	var firstErr error
+	var silent []string
 	seen := map[string]bool{}
 	// The prefix exists only to disambiguate the two catalogs; a single-site
 	// proxy serves plain CLI model names.
@@ -501,16 +571,15 @@ func (s *Service) listCLIMergedModels(ctx context.Context) ([]Model, error) {
 			if firstErr == nil {
 				firstErr = listing.err
 			}
-			// Leave the site's cached ids alone: a failed probe must not retire a
-			// model a client may still be naming.
-			continue
-		}
-		ids := make([]string, 0, len(listing.models))
-		for _, model := range listing.models {
-			name := strings.TrimSpace(model.Key)
-			if name == "" {
+			if listing.names == nil {
+				silent = append(silent, site.Label())
+				// Nothing cached either: leave the site's ids alone, a failed
+				// probe must not retire a model a client may still be naming.
 				continue
 			}
+		}
+		ids := make([]string, 0, len(listing.names))
+		for _, name := range listing.names {
 			id := name
 			if prefixGlobal && site.Normalized() == qodercli.SiteGlobal {
 				id = cliGlobalPrefix + name
@@ -524,6 +593,13 @@ func (s *Service) listCLIMergedModels(ctx context.Context) ([]Model, error) {
 			ids = append(ids, name)
 		}
 		s.setCLIModels(site, ids)
+	}
+	if len(silent) > 0 {
+		// Handing back only the sites that answered would tell a client the
+		// silent site's models had been delisted; measured, a client then caches
+		// that. Fail instead: the retry pays only for the silent site, the rest
+		// is already cached.
+		return nil, fmt.Errorf("%s 站点本次没有返回模型列表：%w", strings.Join(silent, "、"), firstErr)
 	}
 	if len(out) == 0 {
 		if firstErr != nil {
