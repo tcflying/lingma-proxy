@@ -170,6 +170,8 @@ CLI 返回错误码 110「daily usage limit」，代理侧表现成 HTTP 500，�
 - **必须始终传 `--tools ""`**，否则 CLI 会启用它自己的原生工具链，在 `--max-turns 1` 下失败。
 - CLI 的 stream-json 输出**没有** `stream_event` 增量，SSE 只能由最终文本分块合成。
 - 桌面应用冷启动后第一个请求偶发 `openApiJsonRequest` 失败（jobToken 交换竞态），重试即好。
+  这类失败现在被识别为 `remote.ErrTransientUpstream` 并以 **HTTP 503 / `overloaded_error`** 返回
+  （以前是裸 500，ZCode 会显示成 `reason=unknown retryable=false`，把两秒钟的网络抖动报成死路）。
 - CLI 退出码非 0 但已经产出完整回答是常态（Windows 上的 teardown 竞态），
   代码里"有可用结果或真实 result-frame 错误就优先于 stderr 噪音"这条逻辑不能删。
 
