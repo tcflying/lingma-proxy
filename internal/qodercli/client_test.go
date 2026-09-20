@@ -33,3 +33,42 @@ func TestClampTierStopsAtTheStrongestTierTheModelOffers(t *testing.T) {
 		})
 	}
 }
+
+func TestErrorLinesDropRuntimeLogNoise(t *testing.T) {
+	// Both shapes were observed standing in for the failure message, so the user
+	// read a crashpad path or a skill collision instead of what went wrong.
+	stderr := "[0920/043244.997:ERROR:third_party\\crashpad\\crashpad\\util\\win\\registration_protocol_win.cc:108] CreateFile: 系统找不到指定的文件。 (0x2)\n" +
+		"[0920/043244.998:FATAL:gin\\v8_initializer.cc:681] Error loading V8 startup snapshot file\n" +
+		"Skill \"paseo-advisor\" overrides same-source skill at /x/y\n" +
+		"Warning: native tool hooks are not fully supported\n" +
+		"upstream rejected the prompt"
+	if got := errorLines(stderr, 6); got != "upstream rejected the prompt" {
+		t.Fatalf("errorLines kept noise: %q", got)
+	}
+
+	// Nothing but noise must read as "no reason given", not as the noise itself.
+	if got := errorLines("[0920/043224.168:FATAL:gin\\v8_initializer.cc:681] boom\n", 6); got != "" {
+		t.Fatalf("pure noise should yield empty, got %q", got)
+	}
+
+	// A real failure that happens to mention a log-looking line still surfaces.
+	if got := errorLines("gateway returned 403 for model Qwen3.8-Flash", 6); got == "" {
+		t.Fatal("plain error dropped")
+	}
+}
+
+func TestDeadLoginReasonFindsTheCauseAboveTheTail(t *testing.T) {
+	// The measured shape: the gateway's reason arrives first, then six frames of
+	// obfuscated promise chain, so the tail alone never mentions the login.
+	stderr := "auth.getUserInfo failed: token is not active\n" +
+		"    at async xoe.initAuthWithOptions (file:///runtime.obf.mjs:1:3958178)\n" +
+		"    at async xoe.initAuth (file:///runtime.obf.mjs:1:3955357)\n" +
+		"    at async C$.refreshAuth (file:///runtime.obf.mjs:267:819330)\n"
+	if got := deadLoginReason(stderr); got == "" {
+		t.Fatal("revoked login must be named, not reported as a stack")
+	}
+	// The same prefix fronts plain network failures, which have to stay retryable.
+	if got := deadLoginReason("auth.getUserInfo failed: connection reset"); got != "" {
+		t.Fatalf("a network hiccup is not a dead login, matched %q", got)
+	}
+}

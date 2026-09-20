@@ -638,12 +638,18 @@ func (s *Service) generateRemoteInternal(
 	emulateTools = emulateTools || shouldEmulateRemoteTools(req)
 	if requestHasImages(req) {
 		if s.backend() == BackendQoderCLI {
-			return nil, errors.New("Qoder CN CLI 后端暂不支持图片输入，请改用 ipc 或 remote 后端")
-		}
-		if len(req.Tools) > 0 && req.ToolChoice.Mode != "none" {
+			if currentTurnHasImages(req) {
+				return nil, errors.New("Qoder CN CLI 后端暂不支持图片输入，请改用 ipc 或 remote 后端")
+			}
+			// The image is only in replayed history: the CLI channel has no image
+			// slot at all, so drop the blocks rather than let one past attachment
+			// fail every later turn of the session.
+			req = requestWithoutImages(req)
+		} else if len(req.Tools) > 0 && req.ToolChoice.Mode != "none" {
 			return s.generateRemoteWithImageContext(ctx, req, onDelta)
+		} else {
+			return s.generateWithReconnect(ctx, req, onDelta)
 		}
-		return s.generateWithReconnect(ctx, req, onDelta)
 	}
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = s.DefaultModel()
@@ -896,6 +902,29 @@ func requestHasImages(req ChatRequest) bool {
 		}
 	}
 	return false
+}
+
+// currentTurnHasImages reports whether the turn being answered now carries an
+// attachment. History replay means an older attachment shows up in nearly every
+// later request, so scanning all messages would blame the wrong turn.
+func currentTurnHasImages(req ChatRequest) bool {
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if !strings.EqualFold(strings.TrimSpace(req.Messages[i].Role), "user") {
+			continue
+		}
+		return len(remoteImagesFromChatMessage(req.Messages[i])) > 0
+	}
+	return false
+}
+
+func requestWithoutImages(req ChatRequest) ChatRequest {
+	out := req
+	out.Messages = make([]ChatMessage, len(req.Messages))
+	for i, message := range req.Messages {
+		message.Images = nil
+		out.Messages[i] = message
+	}
+	return out
 }
 
 func requestForImageContext(req ChatRequest) ChatRequest {

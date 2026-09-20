@@ -296,6 +296,40 @@ func TestRequestHasImages(t *testing.T) {
 	}
 }
 
+func TestCurrentTurnHasImagesIgnoresReplayedHistory(t *testing.T) {
+	req := ChatRequest{Messages: []ChatMessage{
+		{Role: "user", Text: "看图", Images: []Image{{MediaType: "image/png", Data: "AAAA"}}},
+		{Role: "assistant", Text: "图里是一只猫"},
+		{Role: "user", Text: "它是什么动物"},
+	}}
+	if requestHasImages(req) == false {
+		t.Fatal("replayed history still carries the attachment")
+	}
+	if currentTurnHasImages(req) {
+		t.Fatal("the turn being answered has no attachment")
+	}
+
+	stripped := requestWithoutImages(req)
+	if requestHasImages(stripped) {
+		t.Fatal("images should be gone")
+	}
+	if stripped.Messages[0].Text != "看图" || stripped.Messages[2].Text != "它是什么动物" {
+		t.Fatalf("stripping must keep the text, got %#v", stripped.Messages)
+	}
+	if len(req.Messages[0].Images) != 1 {
+		t.Fatal("the caller's request must not be modified")
+	}
+
+	last := ChatRequest{Messages: []ChatMessage{
+		{Role: "user", Text: "早上的问题"},
+		{Role: "assistant", Text: "答完了"},
+		{Role: "user", Text: "再看这张", Images: []Image{{MediaType: "image/png", Data: "AAAA"}}},
+	}}
+	if !currentTurnHasImages(last) {
+		t.Fatal("the newest user turn carries the attachment")
+	}
+}
+
 func TestRequestForImageContextUsesLatestImageTurnOnly(t *testing.T) {
 	req := ChatRequest{
 		System: "old system",

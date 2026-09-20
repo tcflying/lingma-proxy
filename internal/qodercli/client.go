@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
@@ -191,6 +192,10 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, args ...str
 			return stdout.String(), fmt.Errorf("%s CLI was cancelled before it finished: %w", c.label(), runCtx.Err())
 		}
 		detail := errorLines(stderr.String(), 6)
+		if reason := deadLoginReason(stderr.String()); reason != "" {
+			return stdout.String(), fmt.Errorf(
+				"%s CLI 登录态已失效（%s）：请在桌面版重新登录后再试", c.label(), reason)
+		}
 		if detail != "" {
 			if transientAuthHandshake(detail) {
 				return stdout.String(), fmt.Errorf(
@@ -546,11 +551,39 @@ var cliNoisePrefixes = []string{
 	"Warning:",
 }
 
+// chromiumLogRe matches the runtime's own stderr diagnostics, e.g.
+// "[0920/043244.997:ERROR:third_party\crashpad\util\win\...:108] CreateFile: ...".
+// They appear whatever the request did and quote internal source paths, so quoting
+// one at the user reads like a refusal while hiding the real cause.
+var chromiumLogRe = regexp.MustCompile(`^\[\d{4}/\d{6}\.\d{3}:`)
+
 // authHandshakeFrames name the CLI's job-token-to-session exchange. When that
 // network call dies the CLI prints a rejected promise chain and no message at all,
 // so the frame names are the only way to tell "the account call failed, retry" from
 // a real refusal -- and quoting the stack at the user hides both.
 var authHandshakeFrames = []string{"loginWithJobToken", "fetchOpenApiUserInfo", "openApiJsonRequest"}
+
+// deadLoginReasons are the gateway's own words for a login it stopped accepting.
+// They can sit anywhere in stderr while the tail holds only promise frames, so
+// this must not share errorLines' window -- without it a revoked login reads as an
+// opaque stack that ZCode dutifully retries eleven times. Only token-state wording
+// counts: "auth.getUserInfo failed" also fronts plain network failures, which must
+// stay retryable.
+var deadLoginReasons = []string{
+	"token is not active",
+	"token has expired",
+	"invalid token",
+}
+
+func deadLoginReason(stderr string) string {
+	lowered := strings.ToLower(stderr)
+	for _, reason := range deadLoginReasons {
+		if strings.Contains(lowered, strings.ToLower(reason)) {
+			return reason
+		}
+	}
+	return ""
+}
 
 func transientAuthHandshake(detail string) bool {
 	for _, frame := range authHandshakeFrames {
@@ -586,7 +619,7 @@ func isCLINoise(line string) bool {
 			return true
 		}
 	}
-	return false
+	return chromiumLogRe.MatchString(line)
 }
 
 func truncate(text string, limit int) string {
