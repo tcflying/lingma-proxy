@@ -27,8 +27,16 @@ import urllib.request
 PROXY = os.environ.get("LINGMA_PROXY_URL", "http://127.0.0.1:8095")
 TIERS = ["none", "low", "medium", "high", "xhigh", "max"]
 
-# The CLI's per-run logs and transcripts live under its own config root.
-QODER_HOME = os.path.expanduser(os.environ.get("QODER_HOME_DIR", "~/.qoder-cn"))
+# The CLI's per-run logs and transcripts live under its own config root, and the
+# proxy launches every site with --config-dir. The desktop root (~/.qoder-cn) now
+# holds the user's own interactive sessions, so reading it would quietly measure
+# the wrong traffic: prefer the proxy-owned root, fall back only when absent.
+PROXY_HOME = os.path.join(
+    os.environ.get("APPDATA") or os.path.expanduser("~/.config"),
+    "lingma-proxy", "qoder-cli-cn")
+if not os.path.isdir(PROXY_HOME):
+    PROXY_HOME = "~/.qoder-cn"
+QODER_HOME = os.path.expanduser(os.environ.get("QODER_HOME_DIR", PROXY_HOME))
 RUNS = os.path.join(QODER_HOME, "logs", "runs")
 PROJECTS = os.path.join(QODER_HOME, "projects")
 
