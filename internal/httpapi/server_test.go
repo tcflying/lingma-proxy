@@ -774,3 +774,14 @@ func TestTransientUpstreamIsRetryable(t *testing.T) {
 		t.Fatalf("openai transient status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
 	}
 }
+
+// A disconnect must not file itself as an upstream error, or the access log
+// blames the proxy for a client that simply gave up.
+func TestClientCancelledRequestIsNotLoggedAsError(t *testing.T) {
+	if got := debugLogLevel(499); got == "error" {
+		t.Fatalf("499 logged as error")
+	}
+	if got := debugLogLevel(500); got != "error" {
+		t.Fatalf("500 level = %q, want error", got)
+	}
+}

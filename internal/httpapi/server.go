@@ -2757,6 +2757,13 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 		next.ServeHTTP(rw, r)
 		duration := time.Since(start)
 
+		// The client hung up while a subprocess was still working. Answering that
+		// as a 500 made a plain disconnect read as an upstream failure in every
+		// log and dashboard; 499 is the "client closed request" code nginx uses.
+		if rw.statusCode >= 500 && r.Context().Err() != nil {
+			rw.statusCode = 499
+		}
+
 		respBody := sanitizeRecordedBody(rw.body)
 
 		s.recordRequest(r.Method, r.URL.Path, rw.statusCode, duration, reqBody, respBody)

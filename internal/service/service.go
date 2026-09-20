@@ -459,29 +459,54 @@ func (s *Service) State() State {
 
 // listCLIMergedModels lists the models of every served site. The international
 // catalog is namespaced because both sites expose models under the same names.
+// cliSiteListing keeps one site's probe result so the merge below can stay in
+// site order no matter which goroutine finished first.
+type cliSiteListing struct {
+	models []remote.Model
+	err    error
+}
+
 func (s *Service) listCLIMergedModels(ctx context.Context) ([]Model, error) {
+	sites := s.cliSites()
+	// Each probe spawns a CLI subprocess that takes seconds. One after another made
+	// /v1/models the SUM of the sites (measured 7-10s for two), which is what
+	// clients time out on; the probes share no lock, so run them together.
+	listings := make([]cliSiteListing, len(sites))
+	var wg sync.WaitGroup
+	for i, site := range sites {
+		wg.Add(1)
+		go func(i int, site qodercli.Site) {
+			defer wg.Done()
+			client, err := s.cliClientFor(site)
+			if err == nil {
+				listings[i].models, err = client.ListModels(ctx)
+			}
+			listings[i].err = err
+			if err != nil {
+				log.Printf("backend: %s CLI model discovery failed: %v", site.Label(), err)
+			}
+		}(i, site)
+	}
+	wg.Wait()
+
 	var out []Model
 	var firstErr error
 	seen := map[string]bool{}
-	sites := s.cliSites()
 	// The prefix exists only to disambiguate the two catalogs; a single-site
 	// proxy serves plain CLI model names.
 	prefixGlobal := len(sites) > 1
-	for _, site := range sites {
-		client, err := s.cliClientFor(site)
-		var models []remote.Model
-		if err == nil {
-			models, err = client.ListModels(ctx)
-		}
-		if err != nil {
+	for i, site := range sites {
+		listing := listings[i]
+		if listing.err != nil {
 			if firstErr == nil {
-				firstErr = err
+				firstErr = listing.err
 			}
-			log.Printf("backend: %s CLI model discovery failed: %v", site.Label(), err)
+			// Leave the site's cached ids alone: a failed probe must not retire a
+			// model a client may still be naming.
 			continue
 		}
-		ids := make([]string, 0, len(models))
-		for _, model := range models {
+		ids := make([]string, 0, len(listing.models))
+		for _, model := range listing.models {
 			name := strings.TrimSpace(model.Key)
 			if name == "" {
 				continue
