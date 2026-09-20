@@ -78,21 +78,21 @@ func TestSiteForPathAttributesTheInstallToItsOwnSite(t *testing.T) {
 	}
 }
 
-// TestGlobalSiteNeedsItsOwnConfigDir pins the reason the international build is
-// launched with --config-dir: sharing ~/.qoder makes its CLI reject every job
-// token as inactive.
-func TestGlobalSiteNeedsItsOwnConfigDir(t *testing.T) {
-	if SiteCN.ownConfigDir() != "" {
-		t.Fatalf("the CN site must keep using its default config root")
-	}
-	dir := SiteGlobal.ownConfigDir()
-	if dir == "" {
-		t.Fatal("global site has no isolated config dir")
-	}
-	if filepath.Base(dir) != "qoder-cli-global" {
-		t.Fatalf("ownConfigDir() = %q", dir)
-	}
-	if !siteProfiles[SiteGlobal].needsOwnConfigDir {
-		t.Fatal("global site must be marked as needing its own config dir")
+// TestBothSitesNeedTheirOwnConfigDir pins why every site is launched with
+// --config-dir: sharing the desktop app's config root makes its CLI reject the
+// proxy's job token as inactive even while the account stays logged in.
+func TestBothSitesNeedTheirOwnConfigDir(t *testing.T) {
+	for _, site := range []Site{SiteCN, SiteGlobal} {
+		dir := site.ownConfigDir()
+		if dir == "" {
+			t.Fatalf("%s site has no isolated config dir", site)
+		}
+		want := "qoder-cli-" + string(site.Normalized())
+		if filepath.Base(dir) != want {
+			t.Fatalf("ownConfigDir(%s) = %q, want base %q", site, dir, want)
+		}
+		if !siteProfiles[site].needsOwnConfigDir {
+			t.Fatalf("%s site must be marked as needing its own config dir", site)
+		}
 	}
 }

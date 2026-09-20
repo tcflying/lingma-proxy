@@ -57,18 +57,18 @@ func TestErrorLinesDropRuntimeLogNoise(t *testing.T) {
 	}
 }
 
-func TestDeadLoginReasonFindsTheCauseAboveTheTail(t *testing.T) {
+func TestRejectedCredentialFindsTheCauseAboveTheTail(t *testing.T) {
 	// The measured shape: the gateway's reason arrives first, then six frames of
-	// obfuscated promise chain, so the tail alone never mentions the login.
+	// obfuscated promise chain, so the tail alone never mentions the token.
 	stderr := "auth.getUserInfo failed: token is not active\n" +
 		"    at async xoe.initAuthWithOptions (file:///runtime.obf.mjs:1:3958178)\n" +
 		"    at async xoe.initAuth (file:///runtime.obf.mjs:1:3955357)\n" +
 		"    at async C$.refreshAuth (file:///runtime.obf.mjs:267:819330)\n"
-	if got := deadLoginReason(stderr); got == "" {
-		t.Fatal("revoked login must be named, not reported as a stack")
+	if got := rejectedCredential(stderr); got == "" {
+		t.Fatal("a rejected credential must be named, not reported as a stack")
 	}
 	// The same prefix fronts plain network failures, which have to stay retryable.
-	if got := deadLoginReason("auth.getUserInfo failed: connection reset"); got != "" {
-		t.Fatalf("a network hiccup is not a dead login, matched %q", got)
+	if got := rejectedCredential("auth.getUserInfo failed: connection reset"); got != "" {
+		t.Fatalf("a network hiccup is not a rejected token, matched %q", got)
 	}
 }

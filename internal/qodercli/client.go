@@ -192,9 +192,12 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, args ...str
 			return stdout.String(), fmt.Errorf("%s CLI was cancelled before it finished: %w", c.label(), runCtx.Err())
 		}
 		detail := errorLines(stderr.String(), 6)
-		if reason := deadLoginReason(stderr.String()); reason != "" {
+		if reason := rejectedCredential(stderr.String()); reason != "" {
+			// "the CLI rejected this credential", not "your login is dead": the
+			// same phrase also appears when the CLI reads the desktop app's own
+			// config root, which --config-dir now keeps it out of.
 			return stdout.String(), fmt.Errorf(
-				"%s CLI 登录态已失效（%s）：请在桌面版重新登录后再试", c.label(), reason)
+				"%s CLI 拒绝了当前会话凭据（%s）：请在桌面版重新登录后再试", c.label(), reason)
 		}
 		if detail != "" {
 			if transientAuthHandshake(detail) {
@@ -563,21 +566,21 @@ var chromiumLogRe = regexp.MustCompile(`^\[\d{4}/\d{6}\.\d{3}:`)
 // a real refusal -- and quoting the stack at the user hides both.
 var authHandshakeFrames = []string{"loginWithJobToken", "fetchOpenApiUserInfo", "openApiJsonRequest"}
 
-// deadLoginReasons are the gateway's own words for a login it stopped accepting.
-// They can sit anywhere in stderr while the tail holds only promise frames, so
-// this must not share errorLines' window -- without it a revoked login reads as an
-// opaque stack that ZCode dutifully retries eleven times. Only token-state wording
-// counts: "auth.getUserInfo failed" also fronts plain network failures, which must
-// stay retryable.
-var deadLoginReasons = []string{
+// rejectedCredentialReasons are the gateway's words for a job token it will not
+// serve. They can sit anywhere in stderr while the tail holds only promise
+// frames, so this must not share errorLines' window -- without it the user reads
+// six frames of obfuscated runtime as if it were the failure. Only token-state
+// wording counts: "auth.getUserInfo failed" also fronts plain network failures,
+// which must stay retryable.
+var rejectedCredentialReasons = []string{
 	"token is not active",
 	"token has expired",
 	"invalid token",
 }
 
-func deadLoginReason(stderr string) string {
+func rejectedCredential(stderr string) string {
 	lowered := strings.ToLower(stderr)
-	for _, reason := range deadLoginReasons {
+	for _, reason := range rejectedCredentialReasons {
 		if strings.Contains(lowered, strings.ToLower(reason)) {
 			return reason
 		}

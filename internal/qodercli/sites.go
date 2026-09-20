@@ -27,10 +27,12 @@ type siteProfile struct {
 	homeDirName   string
 	profileNames  []string
 	// needsOwnConfigDir marks the sites that must not read the desktop app's own
-	// config root. The global build's ~/.qoder holds the desktop login, and a
-	// CLI that finds it answers every request with "auth.getUserInfo failed:
-	// token is not active" even though the same job token is accepted when the
-	// gateway is queried directly. A private config root avoids the stale state.
+	// config root. A CLI that finds a desktop login state there answers every
+	// request with "auth.getUserInfo failed: token is not active" even though the
+	// same job token is accepted when the gateway is queried directly -- measured
+	// on both builds: sharing ~/.qoder broke the global site, and sharing
+	// ~/.qoder-cn broke the CN site the same way while the account stayed logged
+	// in. A private config root avoids the stale state.
 	needsOwnConfigDir bool
 }
 
@@ -44,6 +46,9 @@ var siteProfiles = map[Site]siteProfile{
 		appName:       "Qoder CN",
 		homeDirName:   ".qoder-cn",
 		profileNames:  []string{"com.qodercn.app.stable", "com.qodercn.app.canary"},
+		// Measured: with the shared root the CN CLI answers "token is not active"
+		// for a job token the gateway accepts on its own.
+		needsOwnConfigDir: true,
 	},
 	SiteGlobal: {
 		label:             "Qoder",
