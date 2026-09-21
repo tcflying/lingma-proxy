@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/service"
@@ -665,6 +666,23 @@ func streamFilterTools() []toolemulation.ToolDef {
 	}}
 }
 
+func streamFilterRequest() service.ChatRequest {
+	return service.ChatRequest{Tools: streamFilterTools(), ToolChoice: toolemulation.ToolChoice{Mode: "auto"}}
+}
+
+// TestToolStreamFilterOffWhenToolChoiceNone: with the client forbidding tool
+// calls, applyToolEmulation keeps action blocks in the text, so the stream must
+// not swallow them either.
+func TestToolStreamFilterOffWhenToolChoiceNone(t *testing.T) {
+	req := streamFilterRequest()
+	req.ToolChoice = toolemulation.ToolChoice{Mode: "none"}
+	block := "```json action\n" + `{"tool":"Bash","parameters":{"command":"pwd"}}` + "\n```"
+	got := strings.Join(newToolStreamFilter(req).Push(block), "")
+	if got != block {
+		t.Fatalf("tool_choice:none must leave the block in the text, got %q", got)
+	}
+}
+
 func streamThrough(t *testing.T, filter *toolStreamFilter, deltas ...string) string {
 	t.Helper()
 	var out strings.Builder
@@ -676,7 +694,7 @@ func streamThrough(t *testing.T, filter *toolStreamFilter, deltas ...string) str
 }
 
 func TestToolStreamFilterStreamsNormalTextWithTools(t *testing.T) {
-	filter := newToolStreamFilter(true, streamFilterTools())
+	filter := newToolStreamFilter(streamFilterRequest())
 	var chunks []string
 	chunks = append(chunks, filter.Push(strings.Repeat("你", 120))...)
 	chunks = append(chunks, filter.Push("后续内容")...)
@@ -705,7 +723,7 @@ func TestShouldAggregateToolStreamRequiresOptIn(t *testing.T) {
 // filter blocked permanently at the first marker, so a turn that called a tool
 // lost every word that followed it.
 func TestToolStreamFilterSuppressesRealActionBlockOnly(t *testing.T) {
-	filter := newToolStreamFilter(true, streamFilterTools())
+	filter := newToolStreamFilter(streamFilterRequest())
 	got := streamThrough(t, filter,
 		"先看这段说明\n",
 		"```json action\n",
@@ -725,7 +743,7 @@ func TestToolStreamFilterSuppressesRealActionBlockOnly(t *testing.T) {
 // client never declared stays in the text on the non-streaming path, so the
 // stream must not swallow it either.
 func TestToolStreamFilterKeepsBlockTheParserRejects(t *testing.T) {
-	filter := newToolStreamFilter(true, streamFilterTools())
+	filter := newToolStreamFilter(streamFilterRequest())
 	got := streamThrough(t, filter,
 		"举例说明格式：\n```json action\n",
 		`{"tool":"NotATool","parameters":{"x":1}}`,
@@ -742,7 +760,7 @@ func TestToolStreamFilterKeepsBlockTheParserRejects(t *testing.T) {
 // answer quoting a compact JSON object was cut at `{"name"` and the rest of the
 // reply never reached the client, with finish_reason=stop and no error.
 func TestToolStreamFilterKeepsProseAfterInlineJSON(t *testing.T) {
-	filter := newToolStreamFilter(true, streamFilterTools())
+	filter := newToolStreamFilter(streamFilterRequest())
 	var out strings.Builder
 	for _, delta := range []string{"前半句START ", "{\"name\":\"Alice\",", "\"age\":7} ", "后半句END"} {
 		pushed := filter.Push(delta)
@@ -760,7 +778,7 @@ func TestToolStreamFilterKeepsProseAfterInlineJSON(t *testing.T) {
 // TestToolStreamFilterHoldsSplitFence keeps a fence that arrives across two
 // deltas from leaking half of itself before the block is recognised.
 func TestToolStreamFilterHoldsSplitFence(t *testing.T) {
-	filter := newToolStreamFilter(true, streamFilterTools())
+	filter := newToolStreamFilter(streamFilterRequest())
 	if chunks := filter.Push("好的```j"); len(chunks) != 1 || chunks[0] != "好的" {
 		t.Fatalf("partial fence leaked or prose was held: %#v", chunks)
 	}
@@ -789,7 +807,7 @@ func TestToolStreamFilterSuppressesXMLDialectCall(t *testing.T) {
 	)
 	block := open + "\n" + fnOpen + "Bash>\n" + pOpen + "command>\nls\n" + pClose + "\n" + fnClose + "\n" + closeTag
 
-	filter := newToolStreamFilter(true, streamFilterTools())
+	filter := newToolStreamFilter(streamFilterRequest())
 	// Feed the block in small slices so every tag is split mid-name: half a
 	// tag must not reach the client either, or the wire format shows up as prose
 	// before the block is recognised.
@@ -812,6 +830,27 @@ func TestToolStreamFilterSuppressesXMLDialectCall(t *testing.T) {
 	got := out.String()
 	if got != "前段后段" {
 		t.Fatalf("streamed %q, want only the prose", got)
+	}
+}
+
+// TestTruncateRecordedStringBoundsRetention: the recorder keeps the last 200
+// bodies, so an uncapped SSE answer used to be retained in full forever.
+func TestTruncateRecordedStringBoundsRetention(t *testing.T) {
+	if got := truncateRecordedString("short"); got != "short" {
+		t.Fatalf("short value changed: %q", got)
+	}
+
+	value := strings.Repeat("你", recordedBodyLimit) // 3x over the byte limit
+	got := truncateRecordedString(value)
+	if len(got) >= len(value) {
+		t.Fatalf("value was not truncated: %d bytes", len(got))
+	}
+	if !strings.Contains(got, "[truncated,") {
+		t.Fatalf("missing truncation marker: %s", got[:40])
+	}
+	head := got[:strings.Index(got, "…[")]
+	if !utf8.ValidString(head) {
+		t.Fatal("truncation split a multi-byte rune")
 	}
 }
 

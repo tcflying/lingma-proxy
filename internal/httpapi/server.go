@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/service"
@@ -633,10 +634,6 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if reqBody, _ := json.Marshal(req); len(reqBody) > 0 {
-		fmt.Printf("[ANTHROPIC REQUEST] %s\n", string(reqBody))
-	}
-
 	if call, ok := anthropicHostedWebSearchCall(req); ok {
 		if req.Stream {
 			s.writeAnthropicHostedToolStream(w, req.Model, call)
@@ -941,7 +938,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	filter := newToolStreamFilter(len(req.Tools) > 0, req.Tools)
+	filter := newToolStreamFilter(req)
 	eventsCh := events
 	doneCh := done
 	var final *service.ChatResult
@@ -1319,7 +1316,7 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	filter := newToolStreamFilter(len(req.Tools) > 0, req.Tools)
+	filter := newToolStreamFilter(req)
 	eventsCh := events
 	doneCh := done
 	var final *service.ChatResult
@@ -1502,7 +1499,7 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	filter := newToolStreamFilter(len(req.Tools) > 0, req.Tools)
+	filter := newToolStreamFilter(req)
 	eventsCh := events
 	doneCh := done
 	var final *service.ChatResult
@@ -1607,8 +1604,11 @@ type toolStreamFilter struct {
 	pending string
 }
 
-func newToolStreamFilter(enabled bool, tools []toolemulation.ToolDef) *toolStreamFilter {
-	return &toolStreamFilter{enabled: enabled, tools: tools}
+func newToolStreamFilter(req service.ChatRequest) *toolStreamFilter {
+	// tool_choice:"none" also disables suppression: applyToolEmulation leaves such
+	// blocks in the text, so withholding them here would drop prose the client keeps.
+	enabled := len(req.Tools) > 0 && req.ToolChoice.Mode != "none"
+	return &toolStreamFilter{enabled: enabled, tools: req.Tools}
 }
 
 func (f *toolStreamFilter) Push(delta string) []string {
@@ -2903,8 +2903,20 @@ func mustMarshalJSON(value any) []byte {
 	return body
 }
 
+// recordedBodyLimit bounds what the debug recorder keeps per request. The record
+// list holds the last 200 requests, so an uncapped body turns a few long SSE
+// answers into hundreds of megabytes that never come back.
+const recordedBodyLimit = 8 << 10
+
 func truncateRecordedString(value string) string {
-	return value
+	if len(value) <= recordedBodyLimit {
+		return value
+	}
+	cut := recordedBodyLimit
+	for cut > 0 && !utf8.RuneStart(value[cut]) {
+		cut--
+	}
+	return value[:cut] + fmt.Sprintf("…[truncated, %d bytes total]", len(value))
 }
 
 func withCORS(next http.Handler) http.Handler {
