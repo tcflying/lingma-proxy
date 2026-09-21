@@ -775,6 +775,46 @@ func TestToolStreamFilterHoldsSplitFence(t *testing.T) {
 	}
 }
 
+// TestToolStreamFilterSuppressesXMLDialectCall covers the native dialect the
+// models actually emit: the block must not stream, and the prose on both sides
+// of it must.
+func TestToolStreamFilterSuppressesXMLDialectCall(t *testing.T) {
+	const (
+		open     = "<" + "tool_call" + ">"
+		closeTag = "</" + "tool_call" + ">"
+		fnOpen   = "<" + "function="
+		fnClose  = "</" + "function" + ">"
+		pOpen    = "<" + "parameter="
+		pClose   = "</" + "parameter" + ">"
+	)
+	block := open + "\n" + fnOpen + "Bash>\n" + pOpen + "command>\nls\n" + pClose + "\n" + fnClose + "\n" + closeTag
+
+	filter := newToolStreamFilter(true, streamFilterTools())
+	// Feed the block in small slices so every tag is split mid-name: half a
+	// tag must not reach the client either, or the wire format shows up as prose
+	// before the block is recognised.
+	chunks := []string{"前段"}
+	for i := 0; i < len(block); i += 7 {
+		end := i + 7
+		if end > len(block) {
+			end = len(block)
+		}
+		chunks = append(chunks, block[i:end])
+	}
+	chunks = append(chunks, "后段")
+
+	var out strings.Builder
+	for _, delta := range chunks {
+		out.WriteString(strings.Join(filter.Push(delta), ""))
+	}
+	out.WriteString(strings.Join(filter.Flush(), ""))
+
+	got := out.String()
+	if got != "前段后段" {
+		t.Fatalf("streamed %q, want only the prose", got)
+	}
+}
+
 func TestParseImageURLReadsLocalFileURL(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "sample.jpg")

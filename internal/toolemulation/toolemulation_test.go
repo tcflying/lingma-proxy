@@ -325,3 +325,131 @@ func TestParseActionBlocksDeduplicatesAndLimitsCalls(t *testing.T) {
 		t.Fatalf("first command = %+v", calls[0].Arguments)
 	}
 }
+
+// The XML dialect tags are spelled out so this file cannot itself read like a
+// tool call in an agent transcript.
+const (
+	xOpen      = "<" + "tool_call" + ">"
+	xClose     = "</" + "tool_call" + ">"
+	xFuncOpen  = "<" + "function="
+	xFuncClose = "</" + "function" + ">"
+	xParamOpen = "<" + "parameter="
+	xParamEnd  = "</" + "parameter" + ">"
+)
+
+func xParam(name, value string) string {
+	return xParamOpen + name + ">\n" + value + "\n" + xParamEnd
+}
+
+func xCall(name string, params ...string) string {
+	return xOpen + "\n" + xFuncOpen + name + ">\n" + strings.Join(params, "\n") + "\n" + xFuncClose + "\n" + xClose
+}
+
+func xmlSchemaTool(name string, props map[string]any, required ...string) ToolDef {
+	schema := map[string]any{"type": "object", "properties": props}
+	if len(required) > 0 {
+		keys := make([]any, 0, len(required))
+		for _, key := range required {
+			keys = append(keys, key)
+		}
+		schema["required"] = keys
+	}
+	return ToolDef{Name: name, InputSchema: schema}
+}
+
+func xmlTools() []ToolDef {
+	return []ToolDef{
+		xmlSchemaTool("Bash", map[string]any{
+			"command":                   map[string]any{"type": "string"},
+			"timeout":                   map[string]any{"type": "integer"},
+			"dangerouslyDisableSandbox": map[string]any{"type": "boolean"},
+		}, "command"),
+		xmlSchemaTool("Read", map[string]any{"file_path": map[string]any{"type": "string"}}, "file_path"),
+	}
+}
+
+// TestParseActionBlocksReadsTheNativeXMLDialect uses the shape captured from a
+// real session: prose, then calls whose parameters arrive as raw text lines.
+func TestParseActionBlocksReadsTheNativeXMLDialect(t *testing.T) {
+	text := "核对两件事：\n" +
+		xCall("Bash",
+			xParam("command", "ls -a"),
+			xParam("timeout", "15000"),
+			xParam("dangerouslyDisableSandbox", "false")) +
+		"\n" +
+		xCall("Read", xParam("file_path", `C:\Users\me\output.txt`)) +
+		"\n结果回来后我给终审结论。"
+
+	calls, clean, err := ParseActionBlocks(text, xmlTools(), Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("calls = %+v", calls)
+	}
+	if calls[0].Name != "Bash" || calls[0].Arguments["command"] != "ls -a" {
+		t.Fatalf("calls[0] = %+v", calls[0])
+	}
+	if calls[0].Arguments["timeout"] != int64(15000) {
+		t.Fatalf("timeout should coerce to an integer, got %#v", calls[0].Arguments["timeout"])
+	}
+	if calls[0].Arguments["dangerouslyDisableSandbox"] != false {
+		t.Fatalf("boolean should coerce, got %#v", calls[0].Arguments["dangerouslyDisableSandbox"])
+	}
+	if calls[1].Name != "Read" || calls[1].Arguments["file_path"] != `C:\Users\me\output.txt` {
+		t.Fatalf("calls[1] = %+v", calls[1])
+	}
+	if strings.Contains(clean, xOpen) || strings.Contains(clean, xFuncOpen) {
+		t.Fatalf("clean text still carries the wire format: %q", clean)
+	}
+	if !strings.Contains(clean, "核对两件事") || !strings.Contains(clean, "终审结论") {
+		t.Fatalf("clean text lost the prose around the calls: %q", clean)
+	}
+}
+
+func TestParseActionBlocksRejectsXMLCallsForUnknownTools(t *testing.T) {
+	text := "示例：" + xCall("NotATool", xParam("command", "ls"))
+	calls, clean, err := ParseActionBlocks(text, xmlTools(), Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("an undeclared tool must not produce a call: %+v", calls)
+	}
+	if !strings.Contains(clean, xOpen) {
+		t.Fatalf("rejected blocks stay verbatim, got %q", clean)
+	}
+}
+
+func TestParseActionBlocksLeavesUnterminatedXMLAsProse(t *testing.T) {
+	text := "开头" + xOpen + "\n" + xFuncOpen + "Bash>\n" + xParam("command", "ls")
+	calls, clean, err := ParseActionBlocks(text, xmlTools(), Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("an open block cannot be a call: %+v", calls)
+	}
+	if !strings.Contains(clean, xOpen) {
+		t.Fatalf("unterminated text must survive, got %q", clean)
+	}
+}
+
+func TestFindActionBlockSpanHandlesTheXMLDialect(t *testing.T) {
+	tools := xmlTools()
+	block := xCall("Bash", xParam("command", "ls"))
+	text := "前段" + block + "后段"
+
+	start, end, pending := FindActionBlockSpan(text, tools)
+	if pending {
+		t.Fatal("a closed block must not report pending")
+	}
+	if start < 0 || end <= start || text[start:end] != block {
+		t.Fatalf("span = [%d,%d) of %q", start, end, text)
+	}
+
+	open := "前段" + xOpen + "\n" + xFuncOpen + "Bash>\n" + xParam("command", "ls")
+	if _, _, stillPending := FindActionBlockSpan(open, tools); !stillPending {
+		t.Fatal("an unterminated block must hold the streamer back")
+	}
+}

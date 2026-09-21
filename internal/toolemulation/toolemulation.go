@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -637,7 +638,7 @@ func ParseActionBlocks(text string, tools []ToolDef, cfg Config) ([]ToolCall, st
 		text = text[:cfg.MaxScanBytes]
 	}
 
-	openings := findActionOpenings(text)
+	openings := findBlockOpenings(text)
 	if len(openings) == 0 {
 		return nil, strings.TrimSpace(text), nil
 	}
@@ -655,7 +656,7 @@ func ParseActionBlocks(text string, tools []ToolDef, cfg Config) ([]ToolCall, st
 	}
 
 	for _, start := range openings {
-		match := matchActionBlock(text, start, toolNameMap, toolSchemaMap)
+		match := matchBlockAt(text, start, toolNameMap, toolSchemaMap)
 		if !match.closed || match.call.Name == "" {
 			continue
 		}
@@ -789,23 +790,253 @@ func matchActionBlock(text string, pos int, toolNameMap map[string]string, toolS
 	if raw == "" {
 		return rejected
 	}
-	parsed, ok := parseToolCallJSON(raw)
+	parsed, parsedOK := parseToolCallJSON(raw)
+	if !parsedOK {
+		return rejected
+	}
+	call, ok := validateToolCall(parsed.Name, parsed.Arguments, false, toolNameMap, toolSchemaMap)
 	if !ok {
 		return rejected
 	}
-	if normalized := normalizeToolName(parsed.Name, toolNameMap); normalized != "" {
-		parsed.Name = normalized
+	return actionMatch{start: pos, end: closing + 3, call: call, closed: true}
+}
+
+// validateToolCall is the single acceptance gate both dialects go through: the
+// tool must be one the client declared, unknown parameters are stripped, and a
+// missing required argument rejects the block. coerce applies only to the XML
+// dialect, whose values arrive as raw text rather than typed JSON.
+func validateToolCall(name string, args map[string]any, coerce bool, names map[string]string, schemas map[string]map[string]any) (ToolCall, bool) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ToolCall{}, false
 	}
-	if _, ok := toolNameMap[strings.ToLower(strings.TrimSpace(parsed.Name))]; !ok {
-		return rejected
+	if normalized := normalizeToolName(name, names); normalized != "" {
+		name = normalized
 	}
-	if schema, ok := toolSchemaMap[parsed.Name]; ok && len(schema) > 0 {
-		parsed.Arguments = filterArgsBySchema(parsed.Arguments, schema)
-		if !hasRequiredArgs(parsed.Arguments, schema) {
-			return rejected
+	if _, ok := names[strings.ToLower(name)]; !ok {
+		return ToolCall{}, false
+	}
+	if schema, ok := schemas[name]; ok && len(schema) > 0 {
+		if coerce {
+			args = coerceArgsBySchema(args, schema)
+		}
+		args = filterArgsBySchema(args, schema)
+		if !hasRequiredArgs(args, schema) {
+			return ToolCall{}, false
 		}
 	}
-	return actionMatch{start: pos, end: closing + 3, call: parsed, closed: true}
+	return ToolCall{ID: newCallID(), Name: name, Arguments: args}, true
+}
+
+// matchBlockAt dispatches on whichever dialect opens at pos, so callers only
+// need one list of openings.
+func matchBlockAt(text string, pos int, names map[string]string, schemas map[string]map[string]any) actionMatch {
+	if strings.HasPrefix(text[pos:], xmlBlockOpen) {
+		return matchXMLBlock(text, pos, names, schemas)
+	}
+	return matchActionBlock(text, pos, names, schemas)
+}
+
+// findBlockOpenings merges both dialects' openings in position order.
+func findBlockOpenings(text string) []int {
+	out := findActionOpenings(text)
+	out = append(out, findXMLOpenings(text)...)
+	sort.Ints(out)
+	return out
+}
+
+// The models behind the Qoder CLI were trained on a second, XML tool-call
+// dialect and emit it even though the proxy's injected prompt teaches the fenced
+// JSON shape above. Across the ZCode session store there were 200 blocks in this
+// dialect against one fenced block, and nothing parsed them: the tags reached the
+// IDE as prose, which is what users see as "replies full of tool calling".
+//
+// The tags are spelled out by concatenation so this source cannot itself look
+// like a tool call in an agent transcript.
+var (
+	xmlBlockOpen   = "<" + "tool_call"
+	xmlBlockClose  = "</" + "tool_call" + ">"
+	xmlFuncOpen    = "<" + "function="
+	xmlFuncClose   = "</" + "function" + ">"
+	xmlInvokeOpen  = "<" + "invoke name="
+	xmlInvokeClose = "</" + "invoke" + ">"
+	xmlParamOpen   = "<" + "parameter="
+	xmlParamClose  = "</" + "parameter" + ">"
+)
+
+func findXMLOpenings(text string) []int {
+	out := make([]int, 0)
+	for idx := 0; ; {
+		i := indexFrom(text, xmlBlockOpen, idx)
+		if i < 0 {
+			return out
+		}
+		out = append(out, i)
+		idx = i + len(xmlBlockOpen)
+	}
+}
+
+// matchXMLBlock reads the block opened at pos and puts it through the same
+// acceptance gate as the fenced JSON dialect.
+func matchXMLBlock(text string, pos int, names map[string]string, schemas map[string]map[string]any) actionMatch {
+	block, complete := scanXMLBlock(text, pos)
+	if !complete {
+		return actionMatch{start: pos, closed: false}
+	}
+	end := indexFrom(text, xmlBlockClose, pos)
+	rejected := actionMatch{start: pos, closed: true}
+	if end < 0 {
+		return rejected
+	}
+	rejected.end = end + len(xmlBlockClose)
+	call, ok := validateToolCall(block.name, block.args, true, names, schemas)
+	if !ok {
+		return rejected
+	}
+	call.ID = newCallID()
+	rejected.call = call
+	return rejected
+}
+
+type xmlBlock struct {
+	name string
+	args map[string]any
+}
+
+// scanXMLBlock reads the function name and its parameters, returning complete
+// false when the block is still open so a streamer knows to keep buffering.
+func scanXMLBlock(text string, pos int) (xmlBlock, bool) {
+	openEnd := indexFrom(text, ">", pos+len(xmlBlockOpen))
+	if openEnd < 0 {
+		return xmlBlock{}, false
+	}
+	cursor := openEnd + 1
+	blockClose := indexFrom(text, xmlBlockClose, cursor)
+
+	name := ""
+	closer := ""
+	fn := indexFrom(text, xmlFuncOpen, cursor)
+	invoke := indexFrom(text, xmlInvokeOpen, cursor)
+	switch {
+	case fn >= 0 && (invoke < 0 || fn < invoke):
+		tagEnd := indexFrom(text, ">", fn+len(xmlFuncOpen))
+		if tagEnd < 0 {
+			return xmlBlock{}, false
+		}
+		name = strings.TrimSpace(text[fn+len(xmlFuncOpen) : tagEnd])
+		cursor = tagEnd + 1
+		closer = xmlFuncClose
+	case invoke >= 0:
+		quote := indexFrom(text, `"`, invoke+len(xmlInvokeOpen))
+		if quote < 0 {
+			return xmlBlock{}, false
+		}
+		closing := indexFrom(text, `"`, quote+1)
+		tagEnd := indexFrom(text, ">", closing+1)
+		if closing < 0 || tagEnd < 0 {
+			return xmlBlock{}, false
+		}
+		name = strings.TrimSpace(text[quote+1 : closing])
+		cursor = tagEnd + 1
+		closer = xmlInvokeClose
+	default:
+		// An opening tag with no function name is prose, not a call.
+		return xmlBlock{name: ""}, blockClose >= 0
+	}
+
+	args := map[string]any{}
+	for {
+		param := indexFrom(text, xmlParamOpen, cursor)
+		blockClose = indexFrom(text, xmlBlockClose, cursor)
+		if blockClose < 0 {
+			return xmlBlock{}, false
+		}
+		nameClose := indexFrom(text, closer, cursor)
+		if param >= 0 && param < blockClose && (nameClose < 0 || param < nameClose) {
+			tagEnd := indexFrom(text, ">", param+len(xmlParamOpen))
+			valueEnd := -1
+			if tagEnd >= 0 {
+				valueEnd = indexFrom(text, xmlParamClose, tagEnd+1)
+			}
+			if tagEnd < 0 || valueEnd < 0 {
+				return xmlBlock{}, false
+			}
+			if key := strings.TrimSpace(text[param+len(xmlParamOpen) : tagEnd]); key != "" {
+				args[key] = strings.TrimSpace(text[tagEnd+1 : valueEnd])
+			}
+			cursor = valueEnd + len(xmlParamClose)
+			continue
+		}
+		// A missing function close is tolerated: the block close ends the call.
+		return xmlBlock{name: name, args: args}, true
+	}
+}
+
+// coerceArgsBySchema retypes the raw text values the XML dialect carries, because
+// a schema that declares an integer arrives as "15000" and clients reject that.
+func coerceArgsBySchema(args map[string]any, schema map[string]any) map[string]any {
+	props, ok := schema["properties"].(map[string]any)
+	if !ok || len(props) == 0 {
+		return args
+	}
+	out := make(map[string]any, len(args))
+	for key, value := range args {
+		raw, isText := value.(string)
+		prop, known := props[key]
+		if !isText || !known {
+			out[key] = value
+			continue
+		}
+		out[key] = coerceTypedValue(raw, propertyType(prop))
+	}
+	return out
+}
+
+func propertyType(prop any) string {
+	m, ok := prop.(map[string]any)
+	if !ok {
+		return ""
+	}
+	typ, _ := m["type"].(string)
+	return typ
+}
+
+func coerceTypedValue(raw, typ string) any {
+	trimmed := strings.TrimSpace(raw)
+	switch typ {
+	case "integer":
+		if i, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+			return i
+		}
+	case "number":
+		if f, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			return f
+		}
+	case "boolean":
+		if b, err := strconv.ParseBool(trimmed); err == nil {
+			return b
+		}
+	case "object", "array":
+		var value any
+		if err := json.Unmarshal([]byte(normalizeJSON(trimmed)), &value); err == nil {
+			return value
+		}
+	}
+	return raw
+}
+
+func indexFrom(text, needle string, from int) int {
+	if from < 0 {
+		from = 0
+	}
+	if from >= len(text) {
+		return -1
+	}
+	i := strings.Index(text[from:], needle)
+	if i < 0 {
+		return -1
+	}
+	return from + i
 }
 
 func toolLookupMaps(tools []ToolDef) (map[string]string, map[string]map[string]any) {
@@ -827,17 +1058,20 @@ func toolLookupMaps(tools []ToolDef) (map[string]string, map[string]map[string]a
 var actionOpenNeedles = []string{"```json action", "```json\n", "```json\r\n"}
 
 // ActionOpenPrefixHold returns how many trailing bytes of text could still grow
-// into an opening fence, so a streamer withholds exactly that much.
+// into an opening tag of either dialect, so a streamer withholds exactly that
+// much. Without the XML needle a half-received opening tag would leak to the
+// client and only be recognised once its body arrived.
 func ActionOpenPrefixHold(text string) int {
+	needles := append(append([]string{}, actionOpenNeedles...), xmlBlockOpen)
 	longest := 0
-	for _, needle := range actionOpenNeedles {
+	for _, needle := range needles {
 		if len(needle) > longest {
 			longest = len(needle)
 		}
 	}
 	for n := min(len(text), longest); n > 0; n-- {
 		suffix := text[len(text)-n:]
-		for _, needle := range actionOpenNeedles {
+		for _, needle := range needles {
 			if strings.HasPrefix(needle, suffix) {
 				return n
 			}
@@ -852,8 +1086,8 @@ func ActionOpenPrefixHold(text string) int {
 // from that point until more arrives.
 func FindActionBlockSpan(text string, tools []ToolDef) (start, end int, pending bool) {
 	names, schemas := toolLookupMaps(tools)
-	for _, pos := range findActionOpenings(text) {
-		m := matchActionBlock(text, pos, names, schemas)
+	for _, pos := range findBlockOpenings(text) {
+		m := matchBlockAt(text, pos, names, schemas)
 		if !m.closed {
 			return pos, 0, true
 		}
