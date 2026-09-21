@@ -309,14 +309,30 @@ func TestCurrentTurnHasImagesIgnoresReplayedHistory(t *testing.T) {
 		t.Fatal("the turn being answered has no attachment")
 	}
 
-	stripped := requestWithoutImages(req)
-	if requestHasImages(stripped) {
-		t.Fatal("images should be gone")
+	kept := requestWithCurrentTurnImagesOnly(req)
+	if requestHasImages(kept) {
+		t.Fatal("a history-only attachment must be dropped")
 	}
-	if stripped.Messages[0].Text != "看图" || stripped.Messages[2].Text != "它是什么动物" {
-		t.Fatalf("stripping must keep the text, got %#v", stripped.Messages)
+	if kept.Messages[0].Text != "看图" || kept.Messages[2].Text != "它是什么动物" {
+		t.Fatalf("stripping must keep the text, got %#v", kept.Messages)
 	}
 	if len(req.Messages[0].Images) != 1 {
+		t.Fatal("the caller's request must not be modified")
+	}
+
+	fresh := ChatRequest{Messages: []ChatMessage{
+		{Role: "user", Text: "早上那张图", Images: []Image{{MediaType: "image/png", Data: "AAAA"}}},
+		{Role: "assistant", Text: "一张红图"},
+		{Role: "user", Text: "这张呢", Images: []Image{{MediaType: "image/png", Data: "BBBB"}}},
+	}}
+	current := requestWithCurrentTurnImagesOnly(fresh)
+	if len(current.Messages[0].Images) != 0 {
+		t.Fatal("the history attachment must be dropped")
+	}
+	if len(current.Messages[2].Images) != 1 || current.Messages[2].Images[0].Data != "BBBB" {
+		t.Fatalf("the current turn's attachment must survive: %#v", current.Messages[2])
+	}
+	if len(fresh.Messages[0].Images) != 1 {
 		t.Fatal("the caller's request must not be modified")
 	}
 

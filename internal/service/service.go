@@ -739,13 +739,11 @@ func (s *Service) generateRemoteInternal(
 	emulateTools = emulateTools || shouldEmulateRemoteTools(req)
 	if requestHasImages(req) {
 		if s.backend() == BackendQoderCLI {
-			if currentTurnHasImages(req) {
-				return nil, errors.New("Qoder CN CLI 后端暂不支持图片输入，请改用 ipc 或 remote 后端")
-			}
-			// The image is only in replayed history: the CLI channel has no image
-			// slot at all, so drop the blocks rather than let one past attachment
-			// fail every later turn of the session.
-			req = requestWithoutImages(req)
+			// The CLI takes images as content blocks on the turn being answered.
+			// Replayed history still carries older attachments, and re-sending them
+			// on every turn would both bloat the frame and show the model pictures
+			// it never saw, so keep only the current turn's.
+			req = requestWithCurrentTurnImagesOnly(req)
 		} else if len(req.Tools) > 0 && req.ToolChoice.Mode != "none" {
 			return s.generateRemoteWithImageContext(ctx, req, onDelta)
 		} else {
@@ -878,6 +876,7 @@ func (s *Service) generateRemoteWithModel(
 		}
 	}
 
+	finishReason, stopReason := backendFinishReasons(remoteResult.StopReason)
 	result := &ChatResult{
 		Text:             remoteResult.Text,
 		Model:            valueOr(strings.TrimSpace(model), "lingma"),
@@ -885,8 +884,8 @@ func (s *Service) generateRemoteWithModel(
 		OutputTokens:     remoteResult.OutputTokens,
 		SessionID:        "",
 		RequestID:        remoteResult.RequestID,
-		FinishReason:     "stop",
-		StopReason:       "stop",
+		FinishReason:     finishReason,
+		StopReason:       stopReason,
 		Endpoint:         remote.ResolveBaseURL(s.cfg.RemoteBaseURL),
 		Transport:        string(s.backend()),
 		EffectiveSession: SessionModeFresh,
@@ -961,6 +960,19 @@ func remoteMessagesFromRequest(req ChatRequest) []remote.Message {
 	return out
 }
 
+// backendFinishReasons translates the backend's own stop_reason into the pair
+// the API layer serves: an OpenAI finish_reason and an Anthropic stop_reason.
+// Only a token-budget stop is distinguishable today; everything else stays the
+// plain "finished" value, so a turn the model ended on its own is never relabelled.
+func backendFinishReasons(stopReason string) (string, string) {
+	switch strings.ToLower(strings.TrimSpace(stopReason)) {
+	case "max_tokens":
+		return "length", "max_tokens"
+	default:
+		return "stop", "end_turn"
+	}
+}
+
 func remoteImagesFromChatMessage(message ChatMessage) []remote.Image {
 	if len(message.Images) == 0 {
 		return nil
@@ -1018,11 +1030,23 @@ func currentTurnHasImages(req ChatRequest) bool {
 	return false
 }
 
-func requestWithoutImages(req ChatRequest) ChatRequest {
+// requestWithCurrentTurnImagesOnly keeps the attachment on the turn being
+// answered and strips the ones replayed from history. currentTurnHasImages names
+// the same message: the last user turn, which is what the CLI receives.
+func requestWithCurrentTurnImagesOnly(req ChatRequest) ChatRequest {
+	keep := -1
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if strings.EqualFold(strings.TrimSpace(req.Messages[i].Role), "user") {
+			keep = i
+			break
+		}
+	}
 	out := req
 	out.Messages = make([]ChatMessage, len(req.Messages))
 	for i, message := range req.Messages {
-		message.Images = nil
+		if i != keep {
+			message.Images = nil
+		}
 		out.Messages[i] = message
 	}
 	return out

@@ -106,6 +106,10 @@ type ChatResult struct {
 	RequestID     string
 	CredentialSrc string
 	ToolCalls     []toolemulation.ToolCall
+	// StopReason is the backend's own terminal reason, e.g. "end_turn" or
+	// "max_tokens". It is what lets the API layer tell a finished answer apart
+	// from one the model ran out of budget on.
+	StopReason string
 }
 
 type StreamEvent struct {

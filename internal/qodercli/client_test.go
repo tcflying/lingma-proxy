@@ -1,6 +1,11 @@
 package qodercli
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+
+	"lingma-ipc-proxy/internal/remote"
+)
 
 func TestClampTierStopsAtTheStrongestTierTheModelOffers(t *testing.T) {
 	// Measured shapes: Qwen3.8-Flash has no high/max rung, GLM-5.3 has no
@@ -80,7 +85,7 @@ func TestRejectedCredentialFindsTheCauseAboveTheTail(t *testing.T) {
 func TestParseResultDistinguishesFinishedFromKilled(t *testing.T) {
 	partial := `{"type":"assistant","message":{"content":[{"type":"text","text":"说到一半"}]}}` + "\n"
 
-	result, sawResult, err := parseResult(partial, "Qwen3.8-Flash", "CN", SiteCN, nil)
+	result, sawResult, err := parseResult(partial, "Qwen3.8-Flash", "CN", SiteCN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,7 +97,7 @@ func TestParseResultDistinguishesFinishedFromKilled(t *testing.T) {
 	}
 
 	finished := partial + `{"type":"result","subtype":"success","result":"说到一半就说完了"}` + "\n"
-	result, sawResult, err = parseResult(finished, "Qwen3.8-Flash", "CN", SiteCN, nil)
+	result, sawResult, err = parseResult(finished, "Qwen3.8-Flash", "CN", SiteCN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,5 +106,93 @@ func TestParseResultDistinguishesFinishedFromKilled(t *testing.T) {
 	}
 	if result.Text != "说到一半就说完了" {
 		t.Fatalf("text = %q", result.Text)
+	}
+}
+
+// TestPartialTextDeltaStreamsOnlyText guards the latency fix: the CLI's
+// stream_event frames are the only source of early text, and thinking, tool
+// spans and lifecycle events must not be forwarded as answer text.
+func TestPartialTextDeltaStreamsOnlyText(t *testing.T) {
+	text := `{"type":"stream_event","event":{"type":"content_block_delta","index":1,` +
+		`"delta":{"type":"text_delta","text":"你好"}}}`
+	if got, ok := partialTextDelta(text); !ok || got != "你好" {
+		t.Fatalf("text delta = %q ok=%v", got, ok)
+	}
+
+	skip := []string{
+		`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"想"}}}`,
+		`{"type":"stream_event","event":{"type":"message_start"}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"整段"}]}}`,
+		`{"type":"result","subtype":"success","result":"整段"}`,
+		`not json at all`,
+	}
+	for _, line := range skip {
+		if got, ok := partialTextDelta(line); ok && got != "" {
+			t.Fatalf("must not stream %q from %s", got, line)
+		}
+	}
+}
+
+// TestUserFrameCarriesImagesAsContentBlocks is the CLI's own shape: a base64
+// source block next to the text, which is what makes image input work at all.
+func TestUserFrameCarriesImagesAsContentBlocks(t *testing.T) {
+	frame, err := userFrame("看图", []remote.Image{
+		{MediaType: "image/jpeg", Data: "/9j/AA=="},
+		{MediaType: "", Data: "AAAA"},
+		{MediaType: "image/png", Data: "  "},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Type    string `json:"type"`
+		Message struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Type   string `json:"type"`
+				Text   string `json:"text"`
+				Source struct {
+					Type      string `json:"type"`
+					MediaType string `json:"media_type"`
+					Data      string `json:"data"`
+				} `json:"source"`
+			} `json:"content"`
+		} `json:"message"`
+	}
+	if err := json.Unmarshal(frame, &decoded); err != nil {
+		t.Fatalf("frame is not valid JSON: %v (%s)", err, frame)
+	}
+	if decoded.Type != "user" || decoded.Message.Role != "user" {
+		t.Fatalf("frame head = %#v", decoded)
+	}
+	if len(decoded.Message.Content) != 3 {
+		t.Fatalf("content = %+v", decoded.Message.Content)
+	}
+	if decoded.Message.Content[0].Text != "看图" {
+		t.Fatalf("text block = %+v", decoded.Message.Content[0])
+	}
+	jpeg := decoded.Message.Content[1]
+	if jpeg.Type != "image" || jpeg.Source.Type != "base64" ||
+		jpeg.Source.MediaType != "image/jpeg" || jpeg.Source.Data != "/9j/AA==" {
+		t.Fatalf("jpeg block = %+v", jpeg)
+	}
+	if decoded.Message.Content[2].Source.MediaType != "image/png" {
+		t.Fatalf("an unspecified media type must default to png, got %+v", decoded.Message.Content[2])
+	}
+}
+
+// TestParseResultReportsTheBackendStopReason is what lets the API layer tell a
+// budget-stopped answer apart from one the model finished.
+func TestParseResultReportsTheBackendStopReason(t *testing.T) {
+	stdout := `{"type":"result","subtype":"success","stop_reason":"max_tokens","result":"停在预算上"}` + "\n"
+	result, sawResult, err := parseResult(stdout, "Qwen3.8-Flash", "CN", SiteCN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawResult {
+		t.Fatal("a result frame is terminal evidence")
+	}
+	if result.StopReason != "max_tokens" {
+		t.Fatalf("stop reason = %q", result.StopReason)
 	}
 }

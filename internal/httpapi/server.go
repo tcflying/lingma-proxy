@@ -669,7 +669,7 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		content = append(content, map[string]any{"type": "thinking", "thinking": result.ThoughtText})
 	}
 	content = append(content, map[string]any{"type": "text", "text": result.Text})
-	stopReason := "end_turn"
+	stopReason := anthropicStopReason(result)
 	if len(result.ToolCalls) > 0 {
 		for _, tc := range result.ToolCalls {
 			content = append(content, map[string]any{
@@ -897,7 +897,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 			index++
 		}
 
-		stopReason := "end_turn"
+		stopReason := anthropicStopReason(result)
 		if len(result.ToolCalls) > 0 {
 			stopReason = "tool_use"
 		}
@@ -1123,7 +1123,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 			"index": blockIndex,
 		})
 	}
-	stopReason := "end_turn"
+	stopReason := anthropicStopReason(final)
 	if len(final.ToolCalls) > 0 {
 		stopReason = "tool_use"
 	}
@@ -1281,7 +1281,7 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 				}},
 			})
 		}
-		finishReason := "stop"
+		finishReason := openAIFinishReason(result)
 		if len(result.ToolCalls) > 0 {
 			finishReason = "tool_calls"
 		}
@@ -1431,7 +1431,7 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 			}},
 		})
 	}
-	finishReason := "stop"
+	finishReason := openAIFinishReason(final)
 	if len(final.ToolCalls) > 0 {
 		finishReason = "tool_calls"
 	}
@@ -1657,6 +1657,25 @@ func (f *toolStreamFilter) Flush() []string {
 	out := f.pending
 	f.pending = ""
 	return []string{out}
+}
+
+// anthropicStopReason names how a turn with no pending tool call ended. Callers
+// override it with "tool_use" whenever the model asked for a tool, because that
+// outranks everything else the backend reported.
+func anthropicStopReason(result *service.ChatResult) string {
+	if result != nil && result.StopReason == "max_tokens" {
+		return "max_tokens"
+	}
+	return "end_turn"
+}
+
+// openAIFinishReason is the same signal in OpenAI's vocabulary: "length" means
+// the answer stopped because the budget ran out, not because the model finished.
+func openAIFinishReason(result *service.ChatResult) string {
+	if result != nil && result.FinishReason == "length" {
+		return "length"
+	}
+	return "stop"
 }
 
 func truthyEnv(name string) bool {
@@ -2314,7 +2333,7 @@ func writeOpenAIChatCompletion(w http.ResponseWriter, result *service.ChatResult
 		"role":    "assistant",
 		"content": result.Text,
 	}
-	finishReason := "stop"
+	finishReason := openAIFinishReason(result)
 	if len(result.ToolCalls) > 0 {
 		toolCalls := make([]map[string]any, 0, len(result.ToolCalls))
 		for _, tc := range result.ToolCalls {

@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"lingma-ipc-proxy/internal/remote"
@@ -30,6 +32,10 @@ type Client struct {
 // maxSystemPromptArgChars keeps the CLI command line below the ~32767 character
 // CreateProcess limit Windows enforces on the whole argv.
 const maxSystemPromptArgChars = 20000
+
+// partialStreamUnsupported latches after a CLI install refuses
+// --include-partial-messages, so one old build does not fail every streamed turn.
+var partialStreamUnsupported atomic.Bool
 
 func NewClient(loc Location, timeout time.Duration) *Client {
 	return &Client{
@@ -87,17 +93,24 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 	if prompt == "" {
 		return nil, errors.New("empty user message")
 	}
-	if len(request.Images) > 0 {
-		return nil, fmt.Errorf("the %s CLI backend does not support image input", c.label())
-	}
 
 	args := []string{
+		"--print",
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
 		"--permission-mode", "bypass_permissions",
 		"--max-turns", "1",
 		"--strict-mcp-config",
 		"--mcp-config", `{"mcpServers":{}}`,
+	}
+	// --include-partial-messages is what makes this backend stream at all: without
+	// it the CLI reports nothing until the whole turn is over, which measured a
+	// 51s average and 88s worst-case before the client saw a single character.
+	// Older installs reject the flag outright, so the first such failure disables
+	// it for the rest of the process instead of failing every request.
+	partial := onDelta != nil && !partialStreamUnsupported.Load()
+	if partial {
+		args = append(args, "--include-partial-messages")
 	}
 	if strings.TrimSpace(request.Model) != "" {
 		args = append(args, "--model", strings.TrimSpace(request.Model))
@@ -119,8 +132,34 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 	// leaving it on makes the CLI load its full agent toolchain per request.
 	args = append(args, "--tools", "")
 
-	stdout, runErr := c.runWithStdin(ctx, prompt, args...)
-	result, sawResult, parseErr := parseResult(stdout, request.Model, c.label(), c.loc.Site.Normalized(), onDelta)
+	frame, frameErr := userFrame(prompt, request.Images)
+	if frameErr != nil {
+		return nil, frameErr
+	}
+
+	streamed := false
+	var onLine func(string)
+	if partial {
+		onLine = func(line string) {
+			text, ok := partialTextDelta(line)
+			if !ok || text == "" {
+				return
+			}
+			streamed = true
+			onDelta(text)
+		}
+	}
+
+	stdout, runErr := c.runWithStdinData(ctx, frame, onLine, args...)
+	if runErr != nil && partial && !streamed && strings.Contains(runErr.Error(), "include-partial-messages") {
+		partialStreamUnsupported.Store(true)
+		args = args[:len(args)-1]
+		stdout, runErr = c.runWithStdinData(ctx, frame, nil, args...)
+	}
+	result, sawResult, parseErr := parseResult(stdout, request.Model, c.label(), c.loc.Site.Normalized())
+	if !streamed && result != nil && onDelta != nil && parseErr == nil {
+		onDelta(result.Text)
+	}
 	if runErr == nil {
 		return result, parseErr
 	}
@@ -145,24 +184,72 @@ func (c *Client) Warmup(ctx context.Context) error {
 }
 
 func (c *Client) run(ctx context.Context, args ...string) (string, error) {
-	return c.runWithStdinData(ctx, nil, args...)
+	return c.runWithStdinData(ctx, nil, nil, args...)
 }
 
-func (c *Client) runWithStdin(ctx context.Context, prompt string, args ...string) (string, error) {
+// userFrame builds the stream-json user turn. Images ride along as Anthropic
+// content blocks, which is the shape the CLI's own content normalizer accepts.
+func userFrame(prompt string, images []remote.Image) ([]byte, error) {
+	content := []map[string]any{{"type": "text", "text": prompt}}
+	for _, image := range images {
+		data := strings.TrimSpace(image.Data)
+		if data == "" {
+			continue
+		}
+		media := strings.TrimSpace(image.MediaType)
+		if media == "" {
+			media = "image/png"
+		}
+		content = append(content, map[string]any{
+			"type": "image",
+			"source": map[string]any{
+				"type":       "base64",
+				"media_type": media,
+				"data":       data,
+			},
+		})
+	}
 	frame, err := json.Marshal(map[string]any{
 		"type": "user",
 		"message": map[string]any{
 			"role":    "user",
-			"content": []map[string]string{{"type": "text", "text": prompt}},
+			"content": content,
 		},
 	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
-	return c.runWithStdinData(ctx, append(frame, '\n'), args...)
+	return append(frame, '\n'), nil
 }
 
-func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, args ...string) (string, error) {
+// partialTextDelta picks the text out of a stream_event delta frame. Everything
+// else - thinking, tool spans, lifecycle events - stays buffered for the final
+// parse, because the proxy's own text filter needs the whole answer.
+func partialTextDelta(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "{") || !strings.Contains(line, "content_block_delta") {
+		return "", false
+	}
+	var frame struct {
+		Type  string `json:"type"`
+		Event struct {
+			Type  string `json:"type"`
+			Delta struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"delta"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal([]byte(line), &frame); err != nil {
+		return "", false
+	}
+	if frame.Type != "stream_event" || frame.Event.Delta.Type != "text_delta" {
+		return "", false
+	}
+	return frame.Event.Delta.Text, true
+}
+
+func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func(string), args ...string) (string, error) {
 	credential, err := c.credential(ctx)
 	if err != nil {
 		return "", fmt.Errorf("%s 登录态不可用：%w", c.label(), err)
@@ -184,9 +271,40 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, args ...str
 	} else {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
-	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
+	var pipe io.ReadCloser
+	if onLine == nil {
+		cmd.Stdout = &stdout
+	} else {
+		// The pipe path is what turns this backend from "wait for the whole turn"
+		// into a stream. The scan must finish in this goroutine before Wait, which
+		// closes the pipe once the process exits.
+		opened, pipeErr := cmd.StdoutPipe()
+		if pipeErr != nil {
+			cmd.Stdout = &stdout
+			onLine = nil
+		} else {
+			pipe = opened
+		}
+	}
+	startErr := cmd.Start()
+	if startErr == nil && pipe != nil {
+		scanner := bufio.NewScanner(pipe)
+		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		for scanner.Scan() {
+			line := scanner.Text()
+			stdout.WriteString(line)
+			stdout.WriteByte('\n')
+			onLine(line)
+		}
+	}
+	var waitErr error
+	if startErr == nil {
+		waitErr = cmd.Wait()
+	} else {
+		waitErr = startErr
+	}
+	if waitErr != nil {
 		if runCtx.Err() != nil {
 			if c.timeout > 0 {
 				return stdout.String(), fmt.Errorf("%s CLI timed out after %s", c.label(), c.timeout)
@@ -256,16 +374,17 @@ func (c *Client) environment(credential string) []string {
 }
 
 type outputFrame struct {
-	Type      string          `json:"type"`
-	Subtype   string          `json:"subtype"`
-	Message   *chatMessage    `json:"message"`
-	Result    string          `json:"result"`
-	Errors    []string        `json:"errors"`
-	ErrorCode int             `json:"error_code"`
-	IsError   bool            `json:"is_error"`
-	SessionID string          `json:"session_id"`
-	Usage     json.RawMessage `json:"usage"`
-	Model     string          `json:"model"`
+	Type       string          `json:"type"`
+	Subtype    string          `json:"subtype"`
+	Message    *chatMessage    `json:"message"`
+	Result     string          `json:"result"`
+	StopReason string          `json:"stop_reason"`
+	Errors     []string        `json:"errors"`
+	ErrorCode  int             `json:"error_code"`
+	IsError    bool            `json:"is_error"`
+	SessionID  string          `json:"session_id"`
+	Usage      json.RawMessage `json:"usage"`
+	Model      string          `json:"model"`
 }
 
 type chatMessage struct {
@@ -289,7 +408,7 @@ type usageBlock struct {
 // parseResult folds the CLI's JSONL output into one answer. sawResult reports
 // whether a terminal result frame was seen, which is the only evidence that the
 // turn actually finished: text without it can stop mid-sentence.
-func parseResult(stdout, model, label string, site Site, onDelta func(string)) (*remote.ChatResult, bool, error) {
+func parseResult(stdout, model, label string, site Site) (*remote.ChatResult, bool, error) {
 	var (
 		text      strings.Builder
 		frames    []string
@@ -362,8 +481,9 @@ func parseResult(stdout, model, label string, site Site, onDelta func(string)) (
 	if out == "" {
 		return nil, sawResult, fmt.Errorf("%s CLI returned no answer: %s", label, tailLines(stdout, 8))
 	}
-	if onDelta != nil {
-		onDelta(out)
+	stopReason := ""
+	if result != nil {
+		stopReason = strings.TrimSpace(result.StopReason)
 	}
 	return &remote.ChatResult{
 		Text:          out,
@@ -371,6 +491,7 @@ func parseResult(stdout, model, label string, site Site, onDelta func(string)) (
 		OutputTokens:  outputTok,
 		RequestID:     requestID,
 		CredentialSrc: "qodercli:" + string(site),
+		StopReason:    stopReason,
 	}, sawResult, nil
 }
 
