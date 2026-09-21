@@ -1639,8 +1639,12 @@ func (f *toolStreamFilter) Push(delta string) []string {
 	return f.flushSafeTail(96)
 }
 
+// Flush returns whatever the filter withheld. Every caller invokes it only when
+// the turn produced no tool calls, so a block that looked like an action block
+// but did not parse was prose: it must go back to the client instead of being
+// dropped, which is what silently truncated replies containing inline JSON.
 func (f *toolStreamFilter) Flush() []string {
-	if f.buffer == "" || f.blocked {
+	if f.buffer == "" {
 		return nil
 	}
 	out := f.buffer

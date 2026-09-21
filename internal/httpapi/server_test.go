@@ -685,9 +685,29 @@ func TestToolStreamFilterBuffersActionBlock(t *testing.T) {
 	var chunks []string
 	chunks = append(chunks, filter.Push("```json ")...)
 	chunks = append(chunks, filter.Push("action\n{\"tool\":\"Bash\",\"parameters\":{\"command\":\"pwd\"}}\n```")...)
-	chunks = append(chunks, filter.Flush()...)
 	if len(chunks) != 0 {
 		t.Fatalf("unexpected leaked action chunks: %#v", chunks)
+	}
+	// Callers only reach Flush when the turn produced no tool calls, which means
+	// this block did not parse and is prose. The non-streaming path leaves it in
+	// the text (service.applyToolEmulation), so streaming must not eat it either.
+	if leaked := filter.Flush(); len(leaked) == 0 {
+		t.Fatal("Flush dropped the withheld text instead of returning it")
+	}
+}
+
+// TestToolStreamFilterKeepsProseAfterInlineJSON is the reproduced truncation: an
+// answer quoting a compact JSON object was cut at `{"name"` and the rest of the
+// reply never reached the client, with finish_reason=stop and no error.
+func TestToolStreamFilterKeepsProseAfterInlineJSON(t *testing.T) {
+	filter := newToolStreamFilter(true)
+	var out strings.Builder
+	for _, delta := range []string{"前半句START ", "{\"name\":\"Alice\",", "\"age\":7} ", "后半句END"} {
+		out.WriteString(strings.Join(filter.Push(delta), ""))
+	}
+	out.WriteString(strings.Join(filter.Flush(), ""))
+	if got := out.String(); got != `前半句START {"name":"Alice","age":7} 后半句END` {
+		t.Fatalf("streamed text = %q, want the whole reply", got)
 	}
 }
 
