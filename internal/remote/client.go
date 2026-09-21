@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"lingma-ipc-proxy/internal/toolemulation"
@@ -43,6 +44,23 @@ type Client struct {
 	cfg         Config
 	client      *http.Client
 	autoBaseURL bool
+
+	// base is the endpoint in use. Auto-detect switches it while other requests
+	// are still reading it, so it cannot live in the plain cfg struct.
+	baseMu sync.RWMutex
+	base   string
+}
+
+func (c *Client) currentBase() string {
+	c.baseMu.RLock()
+	defer c.baseMu.RUnlock()
+	return c.base
+}
+
+func (c *Client) setBase(base string) {
+	c.baseMu.Lock()
+	defer c.baseMu.Unlock()
+	c.base = base
 }
 
 type BaseURLHint struct {
@@ -129,7 +147,7 @@ func New(cfg Config) *Client {
 	if transport, err := transportForProxy(cfg.ProxyURL); err == nil && transport != nil {
 		client.Transport = transport
 	}
-	return &Client{cfg: cfg, client: client, autoBaseURL: autoBaseURL}
+	return &Client{cfg: cfg, client: client, autoBaseURL: autoBaseURL, base: cfg.BaseURL}
 }
 
 func ValidateProxyURL(value string) error {
@@ -277,7 +295,7 @@ func (c *Client) Warmup(ctx context.Context) error {
 func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
 	models, err := c.listModels(ctx)
 	if err == nil && c.autoBaseURL {
-		cacheSuccessfulBaseURL(c.cfg.BaseURL)
+		cacheSuccessfulBaseURL(c.currentBase())
 	}
 	if err == nil || !c.autoBaseURL || ctx.Err() != nil {
 		return models, err
@@ -286,6 +304,13 @@ func (c *Client) ListModels(ctx context.Context) ([]Model, error) {
 }
 
 func (c *Client) listModels(ctx context.Context) ([]Model, error) {
+	return c.listModelsFrom(ctx, c.currentBase())
+}
+
+// listModelsFrom asks one specific endpoint for the model list. The endpoint is
+// a parameter rather than a field the caller temporarily rewrites, so probing a
+// candidate cannot disturb a chat request that is already in flight.
+func (c *Client) listModelsFrom(ctx context.Context, baseURL string) ([]Model, error) {
 	cred, err := LoadCredential(c.cfg.AuthFile)
 	if err != nil {
 		return nil, err
@@ -294,7 +319,7 @@ func (c *Client) listModels(ctx context.Context) ([]Model, error) {
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+modelListPath, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+modelListPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -308,7 +333,7 @@ func (c *Client) listModels(ctx context.Context) ([]Model, error) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return nil, c.modelListStatusError(resp.StatusCode, string(body))
+		return nil, c.modelListStatusError(baseURL, resp.StatusCode, string(body))
 	}
 	var payload struct {
 		Chat   []Model `json:"chat"`
@@ -324,22 +349,20 @@ func (c *Client) listModelsWithAutoBaseURLFallback(ctx context.Context, firstErr
 	candidates := ResolveBaseURLCandidates()
 	tried := 1
 	var lastErr error
-	current := strings.TrimRight(c.cfg.BaseURL, "/")
+	current := strings.TrimRight(c.currentBase(), "/")
 	for _, candidate := range candidates {
 		baseURL := strings.TrimRight(strings.TrimSpace(candidate.URL), "/")
 		if baseURL == "" || baseURL == current {
 			continue
 		}
 		tried++
-		previous := c.cfg.BaseURL
-		c.cfg.BaseURL = baseURL
-		models, err := c.listModels(ctx)
+		models, err := c.listModelsFrom(ctx, baseURL)
 		if err == nil {
-			cacheSuccessfulBaseURL(c.cfg.BaseURL)
+			c.setBase(baseURL)
+			cacheSuccessfulBaseURL(baseURL)
 			return models, nil
 		}
 		lastErr = err
-		c.cfg.BaseURL = previous
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
@@ -350,8 +373,8 @@ func (c *Client) listModelsWithAutoBaseURLFallback(ctx context.Context, firstErr
 	return nil, firstErr
 }
 
-func (c *Client) modelListStatusError(statusCode int, body string) error {
-	message := fmt.Sprintf("remote model list status %d from %s: %s", statusCode, c.cfg.BaseURL, truncate(body, 500))
+func (c *Client) modelListStatusError(baseURL string, statusCode int, body string) error {
+	message := fmt.Sprintf("remote model list status %d from %s: %s", statusCode, baseURL, truncate(body, 500))
 	if statusCode == http.StatusNotFound || strings.Contains(body, "NoSuchKey") {
 		message += "。这通常表示远端 API 域名自动探测命中了错误地址，请到设置页手动填写 Lingma 官方或企业专属远端 API 域名；官方默认域名为 https://lingma.alibabacloud.com。"
 	}
@@ -372,7 +395,7 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.BaseURL+chatPath+chatQuery, strings.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.currentBase()+chatPath+chatQuery, strings.NewReader(body))
 	if err != nil {
 		return nil, err
 	}

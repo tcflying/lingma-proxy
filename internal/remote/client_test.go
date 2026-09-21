@@ -198,9 +198,28 @@ func TestResolveBaseURLCandidatesPreferCachedSuccess(t *testing.T) {
 	}
 }
 
+func TestBaseURLSurvivesConcurrentReaders(t *testing.T) {
+	client := New(Config{BaseURL: "https://first.example"})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200000; i++ {
+			if client.currentBase() == "" {
+				t.Error("currentBase returned empty")
+				return
+			}
+		}
+	}()
+	client.setBase("https://second.example")
+	<-done
+	if got := client.currentBase(); got != "https://second.example" {
+		t.Fatalf("got %q", got)
+	}
+}
+
 func TestModelListStatusErrorSuggestsManualRemoteBaseURLOn404(t *testing.T) {
 	client := New(Config{BaseURL: "https://lingma-ide.oss-rg-china-mainland.aliyuncs.com"})
-	err := client.modelListStatusError(404, `<Error><Code>NoSuchKey</Code></Error>`)
+	err := client.modelListStatusError(client.currentBase(), 404, `<Error><Code>NoSuchKey</Code></Error>`)
 	if err == nil {
 		t.Fatal("expected error")
 	}
