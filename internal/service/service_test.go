@@ -296,6 +296,21 @@ func TestRequestHasImages(t *testing.T) {
 	}
 }
 
+func TestApplyToolEmulationRespectsToolChoiceNone(t *testing.T) {
+	req := ChatRequest{
+		Tools:      []toolemulation.ToolDef{{Name: "Bash", InputSchema: map[string]any{"properties": map[string]any{"command": map[string]any{"type": "string"}}, "required": []any{"command"}}}},
+		ToolChoice: toolemulation.ToolChoice{Mode: "none"},
+	}
+	result := &ChatResult{Text: "```json action\n{\"tool\":\"Bash\",\"parameters\":{\"command\":\"pwd\"}}\n```"}
+	(&Service{}).applyToolEmulation(context.Background(), req, "", result, nil, nil)
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("tool_choice:none must not produce calls: %+v", result.ToolCalls)
+	}
+	if !strings.Contains(result.Text, "```json action") {
+		t.Fatalf("the block should stay in the text, got %q", result.Text)
+	}
+}
+
 func TestCurrentTurnHasImagesIgnoresReplayedHistory(t *testing.T) {
 	req := ChatRequest{Messages: []ChatMessage{
 		{Role: "user", Text: "看图", Images: []Image{{MediaType: "image/png", Data: "AAAA"}}},

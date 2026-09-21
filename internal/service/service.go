@@ -1573,7 +1573,10 @@ func (s *Service) applyToolEmulation(
 	onDelta func(StreamEvent),
 	retry func(string) (string, int, error),
 ) {
-	if len(req.Tools) > 0 {
+	// tool_choice:"none" is the client forbidding tool calls, so a block that
+	// arrives anyway (from an echoed example, or from history) stays prose:
+	// turning it into a tool call would hand back an action the client ruled out.
+	if len(req.Tools) > 0 && req.ToolChoice.Mode != "none" {
 		calls, remaining, parseErr := toolemulation.ParseActionBlocks(result.Text, req.Tools, toolemulation.Config{})
 		if parseErr == nil && len(calls) > 0 {
 			result.Text = remaining
