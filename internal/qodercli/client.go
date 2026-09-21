@@ -120,14 +120,16 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 	args = append(args, "--tools", "")
 
 	stdout, runErr := c.runWithStdin(ctx, prompt, args...)
-	result, parseErr := parseResult(stdout, request.Model, c.label(), c.loc.Site.Normalized(), onDelta)
+	result, sawResult, parseErr := parseResult(stdout, request.Model, c.label(), c.loc.Site.Normalized(), onDelta)
 	if runErr == nil {
 		return result, parseErr
 	}
 	// The CLI can exit non-zero after a completed turn (teardown races on
 	// Windows), so a usable answer or a real result-frame error both outrank
-	// whatever stderr happened to hold.
-	if parseErr == nil {
+	// whatever stderr happened to hold. Without a result frame there is no
+	// evidence the turn finished, and the text on stdout may stop mid-sentence:
+	// that is the one case where the exit status is the only truth.
+	if parseErr == nil && sawResult {
 		return result, nil
 	}
 	var cliErr *cliError
@@ -284,7 +286,10 @@ type usageBlock struct {
 	OutputTokens int `json:"output_tokens"`
 }
 
-func parseResult(stdout, model, label string, site Site, onDelta func(string)) (*remote.ChatResult, error) {
+// parseResult folds the CLI's JSONL output into one answer. sawResult reports
+// whether a terminal result frame was seen, which is the only evidence that the
+// turn actually finished: text without it can stop mid-sentence.
+func parseResult(stdout, model, label string, site Site, onDelta func(string)) (*remote.ChatResult, bool, error) {
 	var (
 		text      strings.Builder
 		frames    []string
@@ -333,7 +338,7 @@ func parseResult(stdout, model, label string, site Site, onDelta func(string)) (
 
 	if result != nil {
 		if result.IsError || result.Subtype != "" && result.Subtype != "success" {
-			return nil, &cliError{label: label, text: cliErrorText(*result, frames)}
+			return nil, true, &cliError{label: label, text: cliErrorText(*result, frames)}
 		}
 		if strings.TrimSpace(result.Result) != "" {
 			text.Reset()
@@ -353,8 +358,9 @@ func parseResult(stdout, model, label string, site Site, onDelta func(string)) (
 	}
 
 	out := strings.TrimRight(text.String(), " \t\r\n")
+	sawResult := result != nil
 	if out == "" {
-		return nil, fmt.Errorf("%s CLI returned no answer: %s", label, tailLines(stdout, 8))
+		return nil, sawResult, fmt.Errorf("%s CLI returned no answer: %s", label, tailLines(stdout, 8))
 	}
 	if onDelta != nil {
 		onDelta(out)
@@ -365,7 +371,7 @@ func parseResult(stdout, model, label string, site Site, onDelta func(string)) (
 		OutputTokens:  outputTok,
 		RequestID:     requestID,
 		CredentialSrc: "qodercli:" + string(site),
-	}, nil
+	}, sawResult, nil
 }
 
 func cliErrorText(result outputFrame, frames []string) string {

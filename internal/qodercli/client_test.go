@@ -72,3 +72,34 @@ func TestRejectedCredentialFindsTheCauseAboveTheTail(t *testing.T) {
 		t.Fatalf("a network hiccup is not a rejected token, matched %q", got)
 	}
 }
+
+// TestParseResultDistinguishesFinishedFromKilled: a CLI killed mid-turn leaves
+// assistant frames but never a result frame. Chat uses that flag to refuse to
+// report a half answer as a completed turn, which is what surfaced as replies
+// that simply stopped mid-sentence with no error.
+func TestParseResultDistinguishesFinishedFromKilled(t *testing.T) {
+	partial := `{"type":"assistant","message":{"content":[{"type":"text","text":"说到一半"}]}}` + "\n"
+
+	result, sawResult, err := parseResult(partial, "Qwen3.8-Flash", "CN", SiteCN, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Text != "说到一半" {
+		t.Fatalf("partial text must still parse, got %#v", result)
+	}
+	if sawResult {
+		t.Fatal("frames without a result frame cannot prove the turn finished")
+	}
+
+	finished := partial + `{"type":"result","subtype":"success","result":"说到一半就说完了"}` + "\n"
+	result, sawResult, err = parseResult(finished, "Qwen3.8-Flash", "CN", SiteCN, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawResult {
+		t.Fatal("a success result frame is the evidence that the turn finished")
+	}
+	if result.Text != "说到一半就说完了" {
+		t.Fatalf("text = %q", result.Text)
+	}
+}
