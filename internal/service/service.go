@@ -154,6 +154,7 @@ type State struct {
 type Service struct {
 	cfg              Config
 	mu               sync.Mutex
+	connectMu        sync.Mutex // serialises the IPC handshake only; see ensureConnected
 	client           *lingmaipc.Client
 	pipePath         string
 	endpoint         string
@@ -406,6 +407,8 @@ func (s *Service) usesRemoteTransport() bool {
 }
 
 func (s *Service) Close() error {
+	s.connectMu.Lock()
+	defer s.connectMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.closeClientLocked()
@@ -1677,15 +1680,19 @@ func (s *Service) buildChatResult(
 	}
 }
 
+// ensureConnected dials the plugin IPC endpoint once and reuses the client.
+// The handshake runs under connectMu rather than s.mu: dialing and initialize
+// can take seconds, and s.mu also guards the remote and CLI backends, so a
+// slow reconnect used to freeze unrelated requests.
 func (s *Service) ensureConnected(ctx context.Context) (*lingmaipc.Client, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.ensureConnectedLocked(ctx)
-}
+	if client := s.connectedClient(); client != nil {
+		return client, nil
+	}
 
-func (s *Service) ensureConnectedLocked(ctx context.Context) (*lingmaipc.Client, error) {
-	if s.client != nil {
-		return s.client, nil
+	s.connectMu.Lock()
+	defer s.connectMu.Unlock()
+	if client := s.connectedClient(); client != nil {
+		return client, nil
 	}
 
 	dialOptions, err := lingmaipc.ResolveDialOptions(s.cfg.Transport, s.cfg.Pipe, s.cfg.WebSocketURL)
@@ -1705,11 +1712,24 @@ func (s *Service) ensureConnectedLocked(ctx context.Context) (*lingmaipc.Client,
 		return nil, err
 	}
 
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.client != nil {
+		// resetConnection ran while the handshake was in flight; keep that state.
+		_ = client.Close()
+		return s.client, nil
+	}
 	s.client = client
 	s.pipePath = dialOptions.PipePath
 	s.endpoint = client.Address()
 	s.transport = client.Transport()
 	return client, nil
+}
+
+func (s *Service) connectedClient() *lingmaipc.Client {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.client
 }
 
 func (s *Service) closeClientLocked() error {
@@ -1730,6 +1750,8 @@ func (s *Service) closeClientLocked() error {
 }
 
 func (s *Service) resetConnection() {
+	s.connectMu.Lock()
+	defer s.connectMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_ = s.closeClientLocked()
