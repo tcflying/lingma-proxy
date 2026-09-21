@@ -643,15 +643,7 @@ func ParseActionBlocks(text string, tools []ToolDef, cfg Config) ([]ToolCall, st
 	}
 
 	// Build lookup maps for tool alias normalization and schema filtering.
-	toolNameMap := make(map[string]string, len(tools))
-	toolSchemaMap := make(map[string]map[string]any, len(tools))
-	for _, t := range tools {
-		name := strings.TrimSpace(t.Name)
-		if name != "" {
-			toolNameMap[strings.ToLower(name)] = name
-			toolSchemaMap[name] = t.InputSchema
-		}
-	}
+	toolNameMap, toolSchemaMap := toolLookupMaps(tools)
 
 	type span struct{ start, end int }
 	spans := make([]span, 0, len(openings))
@@ -663,38 +655,12 @@ func ParseActionBlocks(text string, tools []ToolDef, cfg Config) ([]ToolCall, st
 	}
 
 	for _, start := range openings {
-		contentStart := start
-		if i := strings.Index(text[start:], "\n"); i >= 0 {
-			contentStart = start + i + 1
-		}
-		end := findClosingFence(text, contentStart)
-		if end < 0 {
+		match := matchActionBlock(text, start, toolNameMap, toolSchemaMap)
+		if !match.closed || match.call.Name == "" {
 			continue
 		}
-
-		raw := strings.TrimSpace(text[contentStart:end])
-		if raw == "" {
-			continue
-		}
-		call, ok := parseToolCallJSON(raw)
-		if !ok {
-			continue
-		}
-		if normalized := normalizeToolName(call.Name, toolNameMap); normalized != "" {
-			call.Name = normalized
-		}
-		if _, ok := toolNameMap[strings.ToLower(strings.TrimSpace(call.Name))]; !ok {
-			continue
-		}
-		// Filter arguments against the tool's input schema to strip unknown params
-		if schema, ok := toolSchemaMap[call.Name]; ok && len(schema) > 0 {
-			call.Arguments = filterArgsBySchema(call.Arguments, schema)
-			if !hasRequiredArgs(call.Arguments, schema) {
-				continue
-			}
-		}
-		spans = append(spans, span{start: start, end: end + 3})
-		key := toolCallKey(call)
+		spans = append(spans, span{start: match.start, end: match.end})
+		key := toolCallKey(match.call)
 		if seen[key] {
 			continue
 		}
@@ -702,7 +668,7 @@ func ParseActionBlocks(text string, tools []ToolDef, cfg Config) ([]ToolCall, st
 		if len(calls) >= maxCalls {
 			continue
 		}
-		calls = append(calls, call)
+		calls = append(calls, match.call)
 	}
 
 	if len(calls) == 0 {
@@ -791,9 +757,116 @@ func containsString(values []string, value string) bool {
 	return false
 }
 
+// actionMatch is the parser's verdict on one candidate opening. closed is false
+// while the fence is still open, so the block is not decidable yet — that is the
+// streaming case, where the caller must hold text rather than emit it. When
+// closed is true and call.Name is empty, the block was read but rejected, which
+// means it is prose and must reach the client verbatim.
+type actionMatch struct {
+	start  int
+	end    int
+	call   ToolCall
+	closed bool
+}
+
+// matchActionBlock applies the parser's full acceptance test to the candidate
+// opening at pos: closing fence, JSON body, a tool the client actually declared,
+// and that tool's required arguments.
+//
+// FindActionBlockSpan and ParseActionBlocks both go through here, so a streamer
+// can never withhold text the parser would have kept, or the other way round.
+func matchActionBlock(text string, pos int, toolNameMap map[string]string, toolSchemaMap map[string]map[string]any) actionMatch {
+	contentStart := pos
+	if i := strings.Index(text[pos:], "\n"); i >= 0 {
+		contentStart = pos + i + 1
+	}
+	closing := findClosingFence(text, contentStart)
+	if closing < 0 {
+		return actionMatch{start: pos, closed: false}
+	}
+	rejected := actionMatch{start: pos, end: closing + 3, closed: true}
+	raw := strings.TrimSpace(text[contentStart:closing])
+	if raw == "" {
+		return rejected
+	}
+	parsed, ok := parseToolCallJSON(raw)
+	if !ok {
+		return rejected
+	}
+	if normalized := normalizeToolName(parsed.Name, toolNameMap); normalized != "" {
+		parsed.Name = normalized
+	}
+	if _, ok := toolNameMap[strings.ToLower(strings.TrimSpace(parsed.Name))]; !ok {
+		return rejected
+	}
+	if schema, ok := toolSchemaMap[parsed.Name]; ok && len(schema) > 0 {
+		parsed.Arguments = filterArgsBySchema(parsed.Arguments, schema)
+		if !hasRequiredArgs(parsed.Arguments, schema) {
+			return rejected
+		}
+	}
+	return actionMatch{start: pos, end: closing + 3, call: parsed, closed: true}
+}
+
+func toolLookupMaps(tools []ToolDef) (map[string]string, map[string]map[string]any) {
+	names := make(map[string]string, len(tools))
+	schemas := make(map[string]map[string]any, len(tools))
+	for _, t := range tools {
+		name := strings.TrimSpace(t.Name)
+		if name != "" {
+			names[strings.ToLower(name)] = name
+			schemas[name] = t.InputSchema
+		}
+	}
+	return names, schemas
+}
+
+// actionOpenNeedles are the fences ParseActionBlocks treats as the start of a
+// candidate action block. They are shared with the streaming filter so a partial
+// fence that arrives across two deltas cannot leak to the client.
+var actionOpenNeedles = []string{"```json action", "```json\n", "```json\r\n"}
+
+// ActionOpenPrefixHold returns how many trailing bytes of text could still grow
+// into an opening fence, so a streamer withholds exactly that much.
+func ActionOpenPrefixHold(text string) int {
+	longest := 0
+	for _, needle := range actionOpenNeedles {
+		if len(needle) > longest {
+			longest = len(needle)
+		}
+	}
+	for n := min(len(text), longest); n > 0; n-- {
+		suffix := text[len(text)-n:]
+		for _, needle := range actionOpenNeedles {
+			if strings.HasPrefix(needle, suffix) {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// FindActionBlockSpan locates the first action block in text that
+// ParseActionBlocks would consume, as the span [start,end). pending is true when
+// an opening fence is still unterminated, so a streaming caller must hold text
+// from that point until more arrives.
+func FindActionBlockSpan(text string, tools []ToolDef) (start, end int, pending bool) {
+	names, schemas := toolLookupMaps(tools)
+	for _, pos := range findActionOpenings(text) {
+		m := matchActionBlock(text, pos, names, schemas)
+		if !m.closed {
+			return pos, 0, true
+		}
+		if m.call.Name != "" {
+			return m.start, m.end, false
+		}
+	}
+	return 0, 0, false
+}
+
 func findActionOpenings(text string) []int {
 	out := make([]int, 0)
-	searches := []string{"```json action", "```json\n", "```json\r\n"}
+	searches := actionOpenNeedles
 	for idx := 0; idx < len(text); {
 		foundAt := -1
 		foundLen := 0

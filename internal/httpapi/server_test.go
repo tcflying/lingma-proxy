@@ -655,8 +655,28 @@ func TestDiscoveryCompatibilityEndpoints(t *testing.T) {
 	}
 }
 
+func streamFilterTools() []toolemulation.ToolDef {
+	return []toolemulation.ToolDef{{
+		Name: "Bash",
+		InputSchema: map[string]any{
+			"properties": map[string]any{"command": map[string]any{"type": "string"}},
+			"required":   []any{"command"},
+		},
+	}}
+}
+
+func streamThrough(t *testing.T, filter *toolStreamFilter, deltas ...string) string {
+	t.Helper()
+	var out strings.Builder
+	for _, delta := range deltas {
+		out.WriteString(strings.Join(filter.Push(delta), ""))
+	}
+	out.WriteString(strings.Join(filter.Flush(), ""))
+	return out.String()
+}
+
 func TestToolStreamFilterStreamsNormalTextWithTools(t *testing.T) {
-	filter := newToolStreamFilter(true)
+	filter := newToolStreamFilter(true, streamFilterTools())
 	var chunks []string
 	chunks = append(chunks, filter.Push(strings.Repeat("你", 120))...)
 	chunks = append(chunks, filter.Push("后续内容")...)
@@ -680,19 +700,41 @@ func TestShouldAggregateToolStreamRequiresOptIn(t *testing.T) {
 	}
 }
 
-func TestToolStreamFilterBuffersActionBlock(t *testing.T) {
-	filter := newToolStreamFilter(true)
-	var chunks []string
-	chunks = append(chunks, filter.Push("```json ")...)
-	chunks = append(chunks, filter.Push("action\n{\"tool\":\"Bash\",\"parameters\":{\"command\":\"pwd\"}}\n```")...)
-	if len(chunks) != 0 {
-		t.Fatalf("unexpected leaked action chunks: %#v", chunks)
+// TestToolStreamFilterSuppressesRealActionBlockOnly is the whole point of the
+// filter: the block goes, but the prose on both sides of it survives. The old
+// filter blocked permanently at the first marker, so a turn that called a tool
+// lost every word that followed it.
+func TestToolStreamFilterSuppressesRealActionBlockOnly(t *testing.T) {
+	filter := newToolStreamFilter(true, streamFilterTools())
+	got := streamThrough(t, filter,
+		"先看这段说明\n",
+		"```json action\n",
+		`{"tool":"Bash","parameters":{"command":"pwd"}}`,
+		"\n```\n",
+		"最后一句必须完整出现。",
+	)
+	if !strings.Contains(got, "先看这段说明") || !strings.Contains(got, "最后一句必须完整出现。") {
+		t.Fatalf("prose around the action block was lost: %q", got)
 	}
-	// Callers only reach Flush when the turn produced no tool calls, which means
-	// this block did not parse and is prose. The non-streaming path leaves it in
-	// the text (service.applyToolEmulation), so streaming must not eat it either.
-	if leaked := filter.Flush(); len(leaked) == 0 {
-		t.Fatal("Flush dropped the withheld text instead of returning it")
+	if strings.Contains(got, "```json") || strings.Contains(got, `"tool"`) {
+		t.Fatalf("the consumed action block leaked to the client: %q", got)
+	}
+}
+
+// TestToolStreamFilterKeepsBlockTheParserRejects: a fenced call for a tool the
+// client never declared stays in the text on the non-streaming path, so the
+// stream must not swallow it either.
+func TestToolStreamFilterKeepsBlockTheParserRejects(t *testing.T) {
+	filter := newToolStreamFilter(true, streamFilterTools())
+	got := streamThrough(t, filter,
+		"举例说明格式：\n```json action\n",
+		`{"tool":"NotATool","parameters":{"x":1}}`,
+		"\n```\n",
+		"以上只是示例。",
+	)
+	want := "举例说明格式：\n```json action\n" + `{"tool":"NotATool","parameters":{"x":1}}` + "\n```\n以上只是示例。"
+	if got != want {
+		t.Fatalf("streamed %q, want %q", got, want)
 	}
 }
 
@@ -700,14 +742,36 @@ func TestToolStreamFilterBuffersActionBlock(t *testing.T) {
 // answer quoting a compact JSON object was cut at `{"name"` and the rest of the
 // reply never reached the client, with finish_reason=stop and no error.
 func TestToolStreamFilterKeepsProseAfterInlineJSON(t *testing.T) {
-	filter := newToolStreamFilter(true)
+	filter := newToolStreamFilter(true, streamFilterTools())
 	var out strings.Builder
 	for _, delta := range []string{"前半句START ", "{\"name\":\"Alice\",", "\"age\":7} ", "后半句END"} {
-		out.WriteString(strings.Join(filter.Push(delta), ""))
+		pushed := filter.Push(delta)
+		if len(pushed) == 0 && delta != "后半句END" {
+			t.Fatalf("filter withheld %q, which is ordinary prose", delta)
+		}
+		out.WriteString(strings.Join(pushed, ""))
 	}
 	out.WriteString(strings.Join(filter.Flush(), ""))
 	if got := out.String(); got != `前半句START {"name":"Alice","age":7} 后半句END` {
 		t.Fatalf("streamed text = %q, want the whole reply", got)
+	}
+}
+
+// TestToolStreamFilterHoldsSplitFence keeps a fence that arrives across two
+// deltas from leaking half of itself before the block is recognised.
+func TestToolStreamFilterHoldsSplitFence(t *testing.T) {
+	filter := newToolStreamFilter(true, streamFilterTools())
+	if chunks := filter.Push("好的```j"); len(chunks) != 1 || chunks[0] != "好的" {
+		t.Fatalf("partial fence leaked or prose was held: %#v", chunks)
+	}
+	if chunks := filter.Push("son\n{\"tool\":\"Bash\",\"parameters\":{\"command\":\"pwd\"}}"); len(chunks) != 0 {
+		t.Fatalf("an opened action block leaked: %#v", chunks)
+	}
+	if chunks := filter.Push("\n```"); len(chunks) != 0 {
+		t.Fatalf("a completed action block leaked: %#v", chunks)
+	}
+	if got := strings.Join(filter.Flush(), ""); got != "" {
+		t.Fatalf("nothing should remain after a parsed block, got %q", got)
 	}
 }
 

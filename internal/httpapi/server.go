@@ -27,6 +27,12 @@ import (
 	"lingma-ipc-proxy/internal/version"
 )
 
+// streamKeepaliveInterval bounds how long an Anthropic stream may stay silent
+// before it sends a ping. IDE clients give up on a response that has not started
+// within well under a model turn, and the qodercli backend can only report
+// progress once its subprocess finishes.
+const streamKeepaliveInterval = 15 * time.Second
+
 type Server struct {
 	svc     *service.Service
 	http    *http.Server
@@ -935,7 +941,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	filter := newToolStreamFilter(len(req.Tools) > 0)
+	filter := newToolStreamFilter(len(req.Tools) > 0, req.Tools)
 	eventsCh := events
 	doneCh := done
 	var final *service.ChatResult
@@ -948,10 +954,64 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 		textIndex = 1
 	}
 
+	// emitText streams already-filtered deltas, closing an open thinking block and
+	// opening the text block as needed. It reports false once the client is gone,
+	// which is the caller's signal to stop writing.
+	emitText := func(deltas []string) bool {
+		for _, delta := range deltas {
+			if delta == "" {
+				continue
+			}
+			if thinkingOpen {
+				if err := writeSSEEvent(w, flusher, "content_block_stop", map[string]any{
+					"type":  "content_block_stop",
+					"index": 0,
+				}); err != nil {
+					return false
+				}
+				thinkingOpen = false
+			}
+			if !textOpen {
+				if err := writeSSEEvent(w, flusher, "content_block_start", map[string]any{
+					"type":          "content_block_start",
+					"index":         textIndex,
+					"content_block": map[string]any{"type": "text", "text": ""},
+				}); err != nil {
+					return false
+				}
+				textOpen = true
+			}
+			if err := writeSSEEvent(w, flusher, "content_block_delta", map[string]any{
+				"type":  "content_block_delta",
+				"index": textIndex,
+				"delta": map[string]any{
+					"type": "text_delta",
+					"text": delta,
+				},
+			}); err != nil {
+				return false
+			}
+		}
+		return true
+	}
+
+	// A turn can stay silent until the model's first delta lands, which is long
+	// enough to trip the first-token timeouts in IDE clients. Anthropic defines
+	// ping for exactly this, and clients that ignore it still see a live socket.
+	keepalive := time.NewTicker(streamKeepaliveInterval)
+	defer keepalive.Stop()
+
 	for eventsCh != nil || doneCh != nil {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-keepalive.C:
+			if textOpen || thinkingOpen {
+				continue
+			}
+			if err := writeSSEEvent(w, flusher, "ping", map[string]any{"type": "ping"}); err != nil {
+				return
+			}
 		case event, ok := <-eventsCh:
 			if !ok {
 				eventsCh = nil
@@ -983,39 +1043,8 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 					return
 				}
 			default:
-				for _, delta := range filter.Push(event.Delta) {
-					if delta == "" {
-						continue
-					}
-					if thinkingOpen {
-						if err := writeSSEEvent(w, flusher, "content_block_stop", map[string]any{
-							"type":  "content_block_stop",
-							"index": 0,
-						}); err != nil {
-							return
-						}
-						thinkingOpen = false
-					}
-					if !textOpen {
-						if err := writeSSEEvent(w, flusher, "content_block_start", map[string]any{
-							"type":          "content_block_start",
-							"index":         textIndex,
-							"content_block": map[string]any{"type": "text", "text": ""},
-						}); err != nil {
-							return
-						}
-						textOpen = true
-					}
-					if err := writeSSEEvent(w, flusher, "content_block_delta", map[string]any{
-						"type":  "content_block_delta",
-						"index": textIndex,
-						"delta": map[string]any{
-							"type": "text_delta",
-							"text": delta,
-						},
-					}); err != nil {
-						return
-					}
+				if !emitText(filter.Push(event.Delta)) {
+					return
 				}
 			}
 		case result, ok := <-doneCh:
@@ -1049,41 +1078,10 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 		})
 		return
 	}
-	if len(final.ToolCalls) == 0 {
-		for _, delta := range filter.Flush() {
-			if delta == "" {
-				continue
-			}
-			if thinkingOpen {
-				if err := writeSSEEvent(w, flusher, "content_block_stop", map[string]any{
-					"type":  "content_block_stop",
-					"index": 0,
-				}); err != nil {
-					return
-				}
-				thinkingOpen = false
-			}
-			if !textOpen {
-				if err := writeSSEEvent(w, flusher, "content_block_start", map[string]any{
-					"type":          "content_block_start",
-					"index":         textIndex,
-					"content_block": map[string]any{"type": "text", "text": ""},
-				}); err != nil {
-					return
-				}
-				textOpen = true
-			}
-			if err := writeSSEEvent(w, flusher, "content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": textIndex,
-				"delta": map[string]any{
-					"type": "text_delta",
-					"text": delta,
-				},
-			}); err != nil {
-				return
-			}
-		}
+	// Whatever the filter still holds is prose: an action block it consumed is
+	// already gone from pending, and an unterminated fence is not a block.
+	if !emitText(filter.Flush()) {
+		return
 	}
 	if thinkingOpen {
 		if err := writeSSEEvent(w, flusher, "content_block_stop", map[string]any{
@@ -1321,7 +1319,7 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 		return
 	}
 
-	filter := newToolStreamFilter(len(req.Tools) > 0)
+	filter := newToolStreamFilter(len(req.Tools) > 0, req.Tools)
 	eventsCh := events
 	doneCh := done
 	var final *service.ChatResult
@@ -1395,28 +1393,26 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 		flusher.Flush()
 		return
 	}
-	if len(final.ToolCalls) == 0 {
-		for _, delta := range filter.Flush() {
-			if delta == "" {
-				continue
-			}
-			if err := writeOpenAIChunk(w, flusher, map[string]any{
-				"id":      chatID,
-				"object":  "chat.completion.chunk",
-				"created": created,
-				"model":   model,
-				"choices": []map[string]any{
-					{
-						"index": 0,
-						"delta": map[string]any{
-							"content": delta,
-						},
-						"finish_reason": nil,
+	for _, delta := range filter.Flush() {
+		if delta == "" {
+			continue
+		}
+		if err := writeOpenAIChunk(w, flusher, map[string]any{
+			"id":      chatID,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{
+				{
+					"index": 0,
+					"delta": map[string]any{
+						"content": delta,
 					},
+					"finish_reason": nil,
 				},
-			}); err != nil {
-				return
-			}
+			},
+		}); err != nil {
+			return
 		}
 	}
 	for i, tc := range final.ToolCalls {
@@ -1506,7 +1502,7 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	filter := newToolStreamFilter(len(req.Tools) > 0)
+	filter := newToolStreamFilter(len(req.Tools) > 0, req.Tools)
 	eventsCh := events
 	doneCh := done
 	var final *service.ChatResult
@@ -1569,31 +1565,29 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 		}
 		reasoningEmitted = true
 	}
-	if len(final.ToolCalls) == 0 {
-		pendingText = append(pendingText, filter.Flush()...)
-		for _, delta := range pendingText {
-			if delta == "" {
-				continue
-			}
-			outputIndex := 0
-			if reasoningEmitted {
-				outputIndex = 1
-			}
-			if !messageStarted {
-				if err := writeOpenAIResponseMessageStarted(emitter, messageID, outputIndex); err != nil {
-					return
-				}
-				messageStarted = true
-			}
-			if err := emitter.Event("response.output_text.delta", map[string]any{
-				"type":          "response.output_text.delta",
-				"item_id":       messageID,
-				"output_index":  outputIndex,
-				"content_index": 0,
-				"delta":         delta,
-			}); err != nil {
+	pendingText = append(pendingText, filter.Flush()...)
+	for _, delta := range pendingText {
+		if delta == "" {
+			continue
+		}
+		outputIndex := 0
+		if reasoningEmitted {
+			outputIndex = 1
+		}
+		if !messageStarted {
+			if err := writeOpenAIResponseMessageStarted(emitter, messageID, outputIndex); err != nil {
 				return
 			}
+			messageStarted = true
+		}
+		if err := emitter.Event("response.output_text.delta", map[string]any{
+			"type":          "response.output_text.delta",
+			"item_id":       messageID,
+			"output_index":  outputIndex,
+			"content_index": 0,
+			"delta":         delta,
+		}); err != nil {
+			return
 		}
 	}
 	writeOpenAIResponseStreamCompleted(emitter, responseID, created, model, final, messageID, messageStarted, reasoningEmitted)
@@ -1603,14 +1597,18 @@ func shouldAggregateToolStream(req service.ChatRequest) bool {
 	return len(req.Tools) > 0 && truthyEnv("LINGMA_AGGREGATE_TOOL_STREAM")
 }
 
+// toolStreamFilter withholds an action block from a streaming response while
+// letting the prose around it through. It decides with toolemulation's own
+// acceptance test, so the client never sees a block the parser is going to
+// consume, and never loses text the parser is going to keep.
 type toolStreamFilter struct {
 	enabled bool
-	buffer  string
-	blocked bool
+	tools   []toolemulation.ToolDef
+	pending string
 }
 
-func newToolStreamFilter(enabled bool) *toolStreamFilter {
-	return &toolStreamFilter{enabled: enabled}
+func newToolStreamFilter(enabled bool, tools []toolemulation.ToolDef) *toolStreamFilter {
+	return &toolStreamFilter{enabled: enabled, tools: tools}
 }
 
 func (f *toolStreamFilter) Push(delta string) []string {
@@ -1620,85 +1618,45 @@ func (f *toolStreamFilter) Push(delta string) []string {
 	if !f.enabled {
 		return []string{delta}
 	}
-	f.buffer += delta
-	if f.blocked {
-		return nil
-	}
-	if idx := actionBlockStartIndex(f.buffer); idx >= 0 {
-		safe := f.buffer[:idx]
-		f.buffer = f.buffer[idx:]
-		f.blocked = true
-		if safe == "" {
-			return nil
+	f.pending += delta
+	var out []string
+	for {
+		start, end, unterminated := toolemulation.FindActionBlockSpan(f.pending, f.tools)
+		switch {
+		case unterminated:
+			// A block has opened but not closed. Its prose is safe; the rest is
+			// withheld until Flush can decide whether it was ever an action block.
+			if start > 0 {
+				out = append(out, f.pending[:start])
+				f.pending = f.pending[start:]
+			}
+			return out
+		case end > 0:
+			if start > 0 {
+				out = append(out, f.pending[:start])
+			}
+			f.pending = f.pending[end:]
+		default:
+			safe := len(f.pending) - toolemulation.ActionOpenPrefixHold(f.pending)
+			if safe > 0 {
+				out = append(out, f.pending[:safe])
+				f.pending = f.pending[safe:]
+			}
+			return out
 		}
-		return []string{safe}
 	}
-	if looksLikeActionPrefix(f.buffer) {
-		return nil
-	}
-	return f.flushSafeTail(96)
 }
 
-// Flush returns whatever the filter withheld. Every caller invokes it only when
-// the turn produced no tool calls, so a block that looked like an action block
-// but did not parse was prose: it must go back to the client instead of being
-// dropped, which is what silently truncated replies containing inline JSON.
+// Flush returns whatever the filter withheld. An opening fence that never closed
+// is not an action block by the parser's own rules, so it is prose and has to go
+// back to the client instead of being dropped.
 func (f *toolStreamFilter) Flush() []string {
-	if f.buffer == "" {
+	if f.pending == "" {
 		return nil
 	}
-	out := f.buffer
-	f.buffer = ""
+	out := f.pending
+	f.pending = ""
 	return []string{out}
-}
-
-func (f *toolStreamFilter) flushSafeTail(tailRunes int) []string {
-	runes := []rune(f.buffer)
-	if len(runes) <= tailRunes {
-		return nil
-	}
-	safe := string(runes[:len(runes)-tailRunes])
-	f.buffer = string(runes[len(runes)-tailRunes:])
-	if safe == "" {
-		return nil
-	}
-	return []string{safe}
-}
-
-func actionBlockStartIndex(text string) int {
-	lower := strings.ToLower(text)
-	markers := []string{
-		"```json action",
-		"``` action",
-		"{\"tool\"",
-		"{\"name\"",
-	}
-	best := -1
-	for _, marker := range markers {
-		if idx := strings.Index(lower, marker); idx >= 0 && (best == -1 || idx < best) {
-			best = idx
-		}
-	}
-	return best
-}
-
-func looksLikeActionPrefix(text string) bool {
-	trimmed := strings.ToLower(strings.TrimLeft(text, " \t\r\n"))
-	if trimmed == "" {
-		return true
-	}
-	prefixes := []string{
-		"```json action",
-		"``` action",
-		"{\"tool\"",
-		"{\"name\"",
-	}
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(prefix, trimmed) || strings.HasPrefix(trimmed, prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 func truthyEnv(name string) bool {
