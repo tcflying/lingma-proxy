@@ -601,15 +601,22 @@ func (a *App) StartProxy() error {
 		runtime.EventsEmit(a.ctx, "usage:updated", a.GetTokenStats())
 	}
 
-	// Check if the port is available before claiming we're running
+	a.mu.Lock()
+	if a.running {
+		a.mu.Unlock()
+		return fmt.Errorf("proxy already running")
+	}
+	a.mu.Unlock()
+
+	// Bind here and serve on that listener: probing the port, closing it and
+	// calling ListenAndServe left a window where another process could take it.
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("port %s is already in use: %w", addr, err)
 	}
-	ln.Close()
 
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			runtime.LogErrorf(a.ctx, "server error: %v", err)
 			a.emitLog("error", fmt.Sprintf("Server error: %v", err))
 			a.mu.Lock()
@@ -621,10 +628,6 @@ func (a *App) StartProxy() error {
 	}()
 
 	a.mu.Lock()
-	if a.running {
-		a.mu.Unlock()
-		return fmt.Errorf("proxy already running")
-	}
 	a.server = server
 	a.addr = addr
 	a.running = true

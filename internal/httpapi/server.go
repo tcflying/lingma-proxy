@@ -12,6 +12,7 @@ import (
 	"image/jpeg"
 	_ "image/png"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -191,6 +192,12 @@ func NewServer(addr string, svc *service.Service) *Server {
 
 func (s *Server) ListenAndServe() error {
 	return s.http.ListenAndServe()
+}
+
+// Serve runs on a listener the caller already bound, so the port stays held
+// between the check and the first accept.
+func (s *Server) Serve(ln net.Listener) error {
+	return s.http.Serve(ln)
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
