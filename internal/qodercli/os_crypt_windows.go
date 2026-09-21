@@ -118,8 +118,13 @@ func cryptUnprotect(in []byte) ([]byte, error) {
 	if outBlob.data == nil || outBlob.size == 0 {
 		return nil, fmt.Errorf("CryptUnprotectData returned an empty blob")
 	}
-	defer procLocalFree.Call(uintptr(unsafe.Pointer(outBlob.data)))
-	return unsafe.Slice(outBlob.data, outBlob.size), nil
+	// The decrypted buffer belongs to DPAPI and must not outlive this call, so
+	// copy it before freeing: returning unsafe.Slice of it would hand the caller
+	// memory the allocator is about to reuse.
+	out := make([]byte, outBlob.size)
+	copy(out, unsafe.Slice(outBlob.data, outBlob.size))
+	procLocalFree.Call(uintptr(unsafe.Pointer(outBlob.data)))
+	return out, nil
 }
 
 // registryInstallRoots reads the uninstall entries the desktop app writes so a
