@@ -220,6 +220,7 @@ func New(cfg Config) *Service {
 	if cfg.SessionMode == "" {
 		cfg.SessionMode = SessionModeAuto
 	}
+	sweepImageTemps()
 	return &Service{cfg: cfg}
 }
 
@@ -1846,6 +1847,29 @@ func (s *Service) resolveSessionLocked(ctx context.Context, client *lingmaipc.Cl
 	return sessionID, nil
 }
 
+// imageTempHorizon is how long an IPC image file may still be needed. The IDE
+// resolves the qodercn:///agent/file?path= URI on its own schedule, so removing
+// the file when the request returns can cut off a slow fetch; anything past this
+// age cannot belong to a turn that is still live.
+const imageTempHorizon = 24 * time.Hour
+
+// sweepImageTemps removes image files left behind by earlier runs. New files are
+// exempt by age, so a running instance never loses what it just handed over.
+func sweepImageTemps() {
+	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "lingma-img-*"))
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-imageTempHorizon)
+	for _, path := range matches {
+		info, err := os.Stat(path)
+		if err != nil || info.IsDir() || info.ModTime().After(cutoff) {
+			continue
+		}
+		_ = os.Remove(path)
+	}
+}
+
 func (s *Service) runPromptLocked(
 	ctx context.Context,
 	client *lingmaipc.Client,
@@ -1880,7 +1904,7 @@ func (s *Service) runPromptLocked(
 				_ = tmpFile.Close()
 				data, _ := base64.StdEncoding.DecodeString(img.Data)
 				if len(data) > 0 {
-					_ = os.WriteFile(tmpPath, data, 0644)
+					_ = os.WriteFile(tmpPath, data, 0600)
 					if absPath, err := filepath.Abs(tmpPath); err == nil {
 						imageURI = fmt.Sprintf("%s:///agent/file?path=%s", imageScheme, url.QueryEscape(absPath))
 					}

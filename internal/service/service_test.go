@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -608,5 +610,43 @@ func TestMergeCLICatalogsSilentSiteFailsLouderThanAHalfList(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "没有返回模型列表") || !strings.Contains(err.Error(), boom.Error()) {
 		t.Fatalf("error must name the site and wrap the cause, got %v", err)
+	}
+}
+
+func TestSweepImageTempsRemovesOnlyStaleImages(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
+
+	stale := filepath.Join(dir, "lingma-img-stale.png")
+	fresh := filepath.Join(dir, "lingma-img-fresh.png")
+	foreign := filepath.Join(dir, "somebody-elses.png")
+	keptDir := filepath.Join(dir, "lingma-img-dir")
+	old := time.Now().Add(-2 * imageTempHorizon)
+
+	for _, path := range []string{stale, fresh, foreign} {
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(keptDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{stale, foreign} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	sweepImageTemps()
+
+	for _, path := range []string{fresh, foreign, keptDir} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("%s must survive the sweep: %v", filepath.Base(path), err)
+		}
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale image survived: %v", err)
 	}
 }
