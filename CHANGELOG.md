@@ -2,6 +2,11 @@
 
 ## Unreleased (target: v1.6.12)
 
+- Added a browser console to the desktop app: a token-gated control listener on the proxy port + 1 (`10095` -> `10096`) exposing the same reads and writes the Wails window has, with Go -> UI events bridged over SSE, so the existing views run unchanged in a browser. It listens apart from the proxy because saving a setting restarts the proxy.
+- Bound app-state persistence: request bodies are now capped on the way out as well as on the way in, so records saved before the recorder had a limit stop being re-written forever (one install's app state had grown to 214 MB and was re-read at every start; now ~3.4 MB). That file also holds the console token, so it is written `0600`.
+- 桌面版新增网页控制台：在代理端口 +1 上用一次性令牌开放同一套读写接口，事件经 SSE 转发，原 Vue 视图无需改动即可在浏览器使用；控制面独立监听，避免保存配置重启代理时把自己拆掉。
+- 收紧 app-state 持久化：请求体在写出时同样截断，早于上限落盘的旧记录不再被无限读回写回（一台实机从 214 MB 降到约 3.4 MB）；该文件含控制台令牌，改为 `0600` 写入。
+
 ## v1.6.12 - 2026-06-10
 
 - Fixed Linux Remote API login-cache auto-detection for QoderCN / Lingma config installs by scanning `.config/<App>/SharedClientCache` and corresponding XDG config roots, while also tolerating VS Code-family `User/globalStorage/alibaba-cloud.tongyi-lingma` layouts when present.

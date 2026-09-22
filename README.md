@@ -130,6 +130,29 @@ The desktop app wraps the proxy with a native-feeling control panel:
 - Keep the proxy running when the window is closed; quit explicitly from the app/menu.
 - Open the WebView inspector from the desktop app's right-click menu (`Inspect Element`) in local and release desktop builds.
 
+### Browser Console
+
+The same panel also serves a browser. The desktop app opens a second listener on
+`proxy port + 1` (`10095` -> `10096`, `8095` -> `8096`, `9095` -> `9096`) and the
+start-up log prints one line with the ready-to-open address:
+
+```
+Web 控制台：http://127.0.0.1:10096/#token=<per-install token>
+```
+
+- Reads at `GET /api/admin/{status,config,detection,models,requests,logs,stats,version,...}`
+  and writes at `POST /api/admin/{config,models/refresh,models/select,requests/clear,logs/clear,proxy/start,proxy/stop,proxy/restart}`,
+  so every action the window can take the browser can take too.
+- Go -> UI events are bridged as SSE at `/api/admin/events`, so the pages keep
+  updating without polling.
+- The token is generated once per install and stored in the app-state file
+  (`admin_token`, written `0600`); Settings also shows the address and token.
+  Requests without it get `401`.
+- It listens separately from the proxy on purpose: saving a setting restarts the
+  proxy, and a shared listener would drop the request that asked for it.
+- Native-only actions (file pickers, feedback export, opening a folder, window
+  controls) are refused in the browser instead of half-working.
+
 ### Screenshots
 
 Light mode:

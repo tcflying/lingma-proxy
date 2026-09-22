@@ -149,6 +149,20 @@ GitHub Actions 会在 Release 中产出：
 - **反馈导出**：支持导出脱敏后的反馈压缩包，包含应用日志、请求日志、配置摘要、运行环境与探测信息，便于提交 Issue 或离线反馈。
 - **右键检查元素**：本地包和正式 Release 桌面包都保留 Wails DevTools，可在应用里右键选择 `Inspect Element` 打开 WebView 控制台排查样式和运行时问题。
 
+### 网页控制台
+
+同一套面板也能在浏览器里用。桌面 App 会在**代理端口 +1** 上再开一个监听（`10095`→`10096`、`8095`→`8096`、`9095`→`9096`），启动日志里打印一行可直接打开的地址：
+
+```
+Web 控制台：http://127.0.0.1:10096/#token=<每台机器一次的令牌>
+```
+
+- 读接口 `GET /api/admin/{status,config,detection,models,requests,logs,stats,version,...}`，写接口 `POST /api/admin/{config,models/refresh,models/select,requests/clear,logs/clear,proxy/start,proxy/stop,proxy/restart}`，窗口能做的浏览器都能做。
+- Go → UI 的事件用 `/api/admin/events`（SSE）转发，页面不需要轮询。
+- 令牌首次启动随机生成，存在 app-state 的 `admin_token`（文件权限 `0600`）；设置页也会显示地址和令牌。不带令牌的请求返回 `401`。
+- 控制台**故意不复用代理监听**：保存配置会重启代理，同一个监听会把发起请求的连接一起拆掉。
+- 只在本机有意义的动作（选路径、导出反馈包、打开文件夹、窗口控制）在网页里会明确拒绝，而不是半死不活。
+
 ### 截图
 
 日间模式：
