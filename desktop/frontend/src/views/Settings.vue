@@ -6,6 +6,7 @@ const emit = defineEmits(['log', 'status-refresh'])
 
 const config = ref({})
 const detection = ref(null)
+const consoleInfo = ref(null)
 const saving = ref(false)
 const exportingBundle = ref(false)
 const bundlePickPolicy = ref('auto')
@@ -100,10 +101,23 @@ onMounted(async () => {
       ? config.value.RemoteFallbackModels.join('\n')
       : ''
     await refreshDetection()
+    await refreshConsoleInfo()
   } catch (e) {
     emit('log', 'error', '配置加载失败：' + (e.message || String(e)))
   }
 })
+
+// ConsoleInfo is a newer binding than the generated client in wailsjs, so it is
+// reached through the runtime bindings both Wails and the browser bridge install.
+async function refreshConsoleInfo() {
+  try {
+    if (window.go && window.go.main && window.go.main.App.ConsoleInfo) {
+      consoleInfo.value = await window.go.main.App.ConsoleInfo()
+    }
+  } catch (e) {
+    consoleInfo.value = null
+  }
+}
 
 async function refreshDetection() {
   try {
@@ -335,6 +349,13 @@ async function openBundleFolder() {
             <div>
               <dt>监听地址</dt>
               <dd>{{ detection.listenUrl || '未启动' }}</dd>
+            </div>
+            <div v-if="consoleInfo && consoleInfo.serving">
+              <dt>网页控制台</dt>
+              <dd>
+                {{ consoleInfo.url }}
+                <span class="muted-inline">令牌 {{ consoleInfo.token }}</span>
+              </dd>
             </div>
             <div>
               <dt>当前后端</dt>
