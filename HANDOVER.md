@@ -91,8 +91,13 @@ go build -o lingma-ipc-proxy ./cmd/lingma-ipc-proxy
 ```bash
 cd desktop/frontend && npm run build
 cd desktop && go run ./genicon -ico build/windows/icon.ico -out lpicon.syso
-cd desktop        && go build -tags production -o LingmaProxy.exe .
+cd desktop        && CGO_ENABLED=0 go build -tags production -o LingmaProxy.exe .
 ```
+
+5. **`CGO_ENABLED=0` 必须显式写**：Go 在检测到 C 工具链时会把它当默认 1。本机为跑
+   `go test -race` 装了 MinGW 之后，不带这个变量的构建就会**静默变成 cgo 构建**，
+   产物与 CI（`scripts/build.ps1` 显式设 0）不再一致。反过来，同一份测试想要 race
+   时要显式 `CGO_ENABLED=1 go test -race`。
 
 三个必踩的坑，先记下来：
 

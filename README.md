@@ -150,6 +150,9 @@ Web 控制台：http://127.0.0.1:10096/#token=<per-install token>
   Requests without it get `401`.
 - It listens separately from the proxy on purpose: saving a setting restarts the
   proxy, and a shared listener would drop the request that asked for it.
+- It binds `127.0.0.1` even when the proxy serves the network. Set
+  `LINGMA_CONSOLE_HOST` to the proxy host to allow LAN access; the console is
+  plain HTTP, so that token is the only gate.
 - Native-only actions (file pickers, feedback export, opening a folder, window
   controls) are refused in the browser instead of half-working.
 

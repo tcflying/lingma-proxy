@@ -2,6 +2,11 @@
 
 ## Unreleased (target: v1.6.12)
 
+- Hardened the browser console: it now binds `127.0.0.1` even when the proxy serves the network (`LINGMA_CONSOLE_HOST` opts into LAN access), the bearer token is compared in constant time, and `ConsoleInfo` reports the address actually bound. Added `desktop/console_test.go` covering the 401 paths, read routes, route enumeration, and a real SSE frame.
+- Stopped leaking IPC image temp files: image files older than 24 h are swept when the service starts (never ones a slow IDE fetch could still need), and they are written `0600` instead of `0644`.
+- 收紧网页控制台：默认只绑 `127.0.0.1`（代理对外监听时也不再跟着暴露，局域网访问需显式设 `LINGMA_CONSOLE_HOST`），令牌改为常量时间比较，`ConsoleInfo` 回报实际绑定地址；新增控制台 HTTP/事件测试。
+- 修掉 IPC 后端的图片临时文件泄漏：启动时清理超过 24 小时的 `lingma-img-*`（不会截断慢取图），写盘权限由 0644 收到 0600。
+
 - Added a browser console to the desktop app: a token-gated control listener on the proxy port + 1 (`10095` -> `10096`) exposing the same reads and writes the Wails window has, with Go -> UI events bridged over SSE, so the existing views run unchanged in a browser. It listens apart from the proxy because saving a setting restarts the proxy.
 - Bound app-state persistence: request bodies are now capped on the way out as well as on the way in, so records saved before the recorder had a limit stop being re-written forever (one install's app state had grown to 214 MB and was re-read at every start; now ~3.4 MB). That file also holds the console token, so it is written `0600`.
 - 桌面版新增网页控制台：在代理端口 +1 上用一次性令牌开放同一套读写接口，事件经 SSE 转发，原 Vue 视图无需改动即可在浏览器使用；控制面独立监听，避免保存配置重启代理时把自己拆掉。
