@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +39,7 @@ type console struct {
 	app     *App
 	token   string
 	statics http.Handler
+	addr    string
 
 	mu   sync.Mutex
 	subs map[chan consoleEvent]struct{}
@@ -182,10 +185,14 @@ func (c *console) authorized(r *http.Request) bool {
 	if c.token == "" {
 		return false
 	}
-	if got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer")); got == c.token {
+	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer"))
+	if subtle.ConstantTimeCompare([]byte(got), []byte(c.token)) == 1 {
 		return true
 	}
-	return r.URL.Path == "/api/admin/events" && r.URL.Query().Get("token") == c.token
+	if r.URL.Path != "/api/admin/events" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(r.URL.Query().Get("token")), []byte(c.token)) == 1
 }
 
 func decodeBody(r *http.Request, target any) error {
@@ -301,14 +308,15 @@ func (a *App) startConsole() {
 	a.mu.RUnlock()
 
 	c := &console{app: a, token: token, statics: http.FileServer(http.FS(statics))}
-	addr := net.JoinHostPort(consoleHost(host), strconv.Itoa(port+1))
+	addr := net.JoinHostPort(consoleBindHost(host), strconv.Itoa(port+1))
 	ln, err := c.listen(addr)
 	if err != nil {
 		a.emitLog("warn", "web console could not bind "+addr+": "+err.Error())
 		return
 	}
+	c.addr = ln.Addr().String()
 	a.console = c
-	a.emitLog("info", "Web 控制台：http://"+ln.Addr().String()+"/#token="+token)
+	a.emitLog("info", "Web 控制台：http://"+c.addr+"/#token="+token)
 }
 
 // ConsoleInfo backs the Settings page entry that shows the URL and token.
@@ -317,11 +325,7 @@ func (a *App) ConsoleInfo() ConsoleInfo {
 	if c == nil {
 		return ConsoleInfo{}
 	}
-	a.mu.RLock()
-	host, port := a.cfg.Host, a.cfg.Port
-	a.mu.RUnlock()
-	addr := net.JoinHostPort(consoleHost(host), strconv.Itoa(port+1))
-	return ConsoleInfo{URL: "http://" + addr + "/", Token: c.token, Addr: addr, Serving: true}
+	return ConsoleInfo{URL: "http://" + c.addr + "/", Token: c.token, Addr: c.addr, Serving: true}
 }
 
 // publishEvent mirrors a Wails broadcast to browsers watching the event stream.
@@ -346,7 +350,20 @@ func (a *App) ensureConsoleToken() (string, error) {
 	return token, nil
 }
 
-func consoleHost(host string) string {
+// consoleBindHost is where the control plane listens. It stays on loopback even
+// when the proxy serves the network: the console can rewrite config, restart the
+// proxy and read request bodies, and a bearer token over plain HTTP is not
+// something to hand to a LAN by accident. Set LINGMA_CONSOLE_HOST to the proxy
+// host to opt into that.
+func consoleBindHost(proxyHost string) string {
+	if value := strings.TrimSpace(os.Getenv("LINGMA_CONSOLE_HOST")); value != "" {
+		return consoleDisplayHost(value)
+	}
+	return "127.0.0.1"
+}
+
+// consoleDisplayHost turns a wildcard bind into an address one can actually open.
+func consoleDisplayHost(host string) string {
 	host = strings.TrimSpace(host)
 	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
 		return "127.0.0.1"
