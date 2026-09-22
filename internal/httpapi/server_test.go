@@ -836,12 +836,12 @@ func TestToolStreamFilterSuppressesXMLDialectCall(t *testing.T) {
 // TestTruncateRecordedStringBoundsRetention: the recorder keeps the last 200
 // bodies, so an uncapped SSE answer used to be retained in full forever.
 func TestTruncateRecordedStringBoundsRetention(t *testing.T) {
-	if got := truncateRecordedString("short"); got != "short" {
+	if got := TruncateRecordedString("short"); got != "short" {
 		t.Fatalf("short value changed: %q", got)
 	}
 
 	value := strings.Repeat("你", recordedBodyLimit) // 3x over the byte limit
-	got := truncateRecordedString(value)
+	got := TruncateRecordedString(value)
 	if len(got) >= len(value) {
 		t.Fatalf("value was not truncated: %d bytes", len(got))
 	}

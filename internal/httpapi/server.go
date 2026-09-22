@@ -2841,9 +2841,9 @@ func sanitizeRecordedBody(body []byte) string {
 	}
 	var value any
 	if err := json.Unmarshal(body, &value); err != nil {
-		return truncateRecordedString(string(body))
+		return TruncateRecordedString(string(body))
 	}
-	return truncateRecordedString(string(mustMarshalJSON(redactRecordedValue(value))))
+	return TruncateRecordedString(string(mustMarshalJSON(redactRecordedValue(value))))
 }
 
 func redactRecordedValue(value any) any {
@@ -2915,7 +2915,10 @@ func mustMarshalJSON(value any) []byte {
 // answers into hundreds of megabytes that never come back.
 const recordedBodyLimit = 8 << 10
 
-func truncateRecordedString(value string) string {
+// TruncateRecordedString caps one recorded body at recordedBodyLimit, on a rune
+// boundary. Exported because the desktop re-persists what it loaded: a fat
+// record saved before this bound existed would otherwise be rewritten forever.
+func TruncateRecordedString(value string) string {
 	if len(value) <= recordedBodyLimit {
 		return value
 	}

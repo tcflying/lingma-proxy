@@ -124,6 +124,10 @@ type App struct {
 
 	stateFlushTimer *time.Timer
 	stateFlushAt    time.Time
+
+	// console and consoleToken are written in startup before any reader exists.
+	console      *console
+	consoleToken string
 }
 
 // ModelInfo represents a model returned by /v1/models
@@ -235,6 +239,8 @@ func (a *App) startup(ctx context.Context) {
 			a.emitLog("info", "Proxy auto-started")
 		}
 	}()
+
+	a.startConsole()
 }
 
 // onDomReady is called when the frontend DOM is ready
@@ -368,6 +374,7 @@ func (a *App) emitLogWithSource(source string, level string, message string) {
 	a.saveAppStateLocked()
 	a.mu.Unlock()
 	runtime.EventsEmit(a.ctx, "log", entry)
+	a.publishEvent("log", entry)
 }
 
 // GetStatus returns the current proxy status
@@ -598,7 +605,10 @@ func (a *App) StartProxy() error {
 		a.saveAppStateLocked()
 		a.mu.Unlock()
 		runtime.EventsEmit(a.ctx, "requests:updated")
-		runtime.EventsEmit(a.ctx, "usage:updated", a.GetTokenStats())
+		a.publishEvent("requests:updated", nil)
+		stats := a.GetTokenStats()
+		runtime.EventsEmit(a.ctx, "usage:updated", stats)
+		a.publishEvent("usage:updated", stats)
 	}
 
 	a.mu.Lock()
@@ -730,7 +740,9 @@ func (a *App) ClearLogs() {
 	a.logs = nil
 	a.saveAppStateLocked()
 	a.mu.Unlock()
-	runtime.EventsEmit(a.ctx, "logs:updated", a.GetLogSummaries())
+	summaries := a.GetLogSummaries()
+	runtime.EventsEmit(a.ctx, "logs:updated", summaries)
+	a.publishEvent("logs:updated", summaries)
 }
 
 func (a *App) ChooseFeedbackExportPath() (string, error) {
@@ -967,7 +979,9 @@ func (a *App) StopProxy() error {
 	a.models = nil
 	a.mu.Unlock()
 
-	runtime.EventsEmit(a.ctx, "status:updated", a.GetStatus())
+	status := a.GetStatus()
+	runtime.EventsEmit(a.ctx, "status:updated", status)
+	a.publishEvent("status:updated", status)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1035,6 +1049,7 @@ func (a *App) ClearRequests() {
 	a.saveAppStateLocked()
 	a.mu.Unlock()
 	runtime.EventsEmit(a.ctx, "requests:updated")
+	a.publishEvent("requests:updated", nil)
 	a.emitLog("info", "Request history cleared")
 }
 
@@ -1187,6 +1202,7 @@ func (a *App) fetchModels(addr string, timeout time.Duration) ([]ModelInfo, erro
 
 	if changed {
 		runtime.EventsEmit(a.ctx, "models:updated", models)
+		a.publishEvent("models:updated", models)
 	}
 	if changed && len(models) > 0 {
 		a.emitLog("info", fmt.Sprintf("Loaded %d models", len(models)))
@@ -1236,10 +1252,11 @@ func formatPayloadSize(bytes int) string {
 }
 
 type appStateFile struct {
-	Requests []RequestRecord `json:"requests"`
-	Logs     []AppLog        `json:"logs"`
-	Stats    TokenStats      `json:"stats"`
-	Models   []ModelInfo     `json:"models,omitempty"`
+	Requests   []RequestRecord `json:"requests"`
+	Logs       []AppLog        `json:"logs"`
+	Stats      TokenStats      `json:"stats"`
+	Models     []ModelInfo     `json:"models,omitempty"`
+	AdminToken string          `json:"admin_token,omitempty"`
 }
 
 func (a *App) loadAppState() error {
@@ -1276,10 +1293,11 @@ func (a *App) loadAppState() error {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.requests = state.Requests
+	a.requests = trimPersistedRequests(state.Requests)
 	a.logs = state.Logs
 	a.stats = state.Stats
 	a.models = state.Models
+	a.consoleToken = state.AdminToken
 	if a.stats.ByModel == nil {
 		a.stats.ByModel = map[string]int{}
 	}
@@ -1322,18 +1340,22 @@ func (a *App) flushAppStateLocked() {
 		return
 	}
 	state := appStateFile{
-		Requests: trimPersistedRequests(a.requests),
-		Logs:     trimPersistedLogs(a.logs),
-		Stats:    a.stats,
-		Models:   a.models,
+		Requests:   trimPersistedRequests(a.requests),
+		Logs:       trimPersistedLogs(a.logs),
+		Stats:      a.stats,
+		Models:     a.models,
+		AdminToken: a.consoleToken,
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
 		runtime.LogWarningf(a.ctx, "marshal app state failed: %v", err)
 		return
 	}
-	if err := os.WriteFile(path, data, 0644); err != nil {
+	// The console bearer token lives here, so the file must not be world-readable.
+	if err := os.WriteFile(path, data, 0600); err != nil {
 		runtime.LogWarningf(a.ctx, "write app state failed: %v", err)
+	} else {
+		_ = os.Chmod(path, 0600)
 	}
 }
 
@@ -1347,6 +1369,10 @@ func trimPersistedRequests(records []RequestRecord) []RequestRecord {
 	}
 	out := make([]RequestRecord, 0, len(records)-start)
 	for _, record := range records[start:] {
+		// Records loaded from a state file written before the recorder had a
+		// bound would otherwise be re-saved at full size on every flush.
+		record.ReqBody = httpapi.TruncateRecordedString(record.ReqBody)
+		record.RespBody = httpapi.TruncateRecordedString(record.RespBody)
 		out = append(out, record)
 	}
 	return out

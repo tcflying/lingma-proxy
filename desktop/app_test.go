@@ -114,3 +114,17 @@ func TestGetLogDetailUsesIDForSameSecondLogs(t *testing.T) {
 		t.Fatalf("GetLogDetail returned wrong same-second log: %#v", got)
 	}
 }
+
+func TestTrimPersistedRequestsBoundsLoadedBodies(t *testing.T) {
+	fat := strings.Repeat("你", 4000) // 12000 bytes, over the recorder's 8 KiB bound
+	out := trimPersistedRequests([]RequestRecord{{ReqBody: fat, RespBody: fat}})
+	if len(out) != 1 {
+		t.Fatalf("got %d records", len(out))
+	}
+	if len(out[0].ReqBody) > 9<<10 || len(out[0].RespBody) > 9<<10 {
+		t.Fatalf("persisted body not bounded: %d bytes", len(out[0].ReqBody))
+	}
+	if !strings.Contains(out[0].ReqBody, "[truncated,") {
+		t.Fatal("missing truncation marker")
+	}
+}
