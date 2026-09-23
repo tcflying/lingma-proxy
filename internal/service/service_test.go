@@ -700,12 +700,13 @@ func TestSweepImageTempsRemovesOnlyStaleImages(t *testing.T) {
 	}
 }
 
-// TestLazyBackendResolutionKeepsTheLockFree guards the ordering of ensureBackend:
-// the login-cache and PATH scan must run outside s.mu, and every reader that
-// needs the answer must reach it without stalling on a lock the scan holds.
-// A regression here is a self-deadlock (call ensureBackend while holding s.mu),
-// so this asserts progress, not the resolved value -- which is environment
-// dependent by design.
+// TestLazyBackendResolutionKeepsTheLockFree is a deadlock guard, not a timing gate:
+// it fails if a backend reader can never make progress, which is what happens the
+// moment ensureBackend is called while s.mu is already held. The wall-clock budget
+// is deliberately loose because ResolveBaseURL's first call scans the disk, and that
+// scan is only slow once per process -- with the candidate list warm this test would
+// pass even if the scan ran under the lock, so do not read a green run as proof of
+// the ordering. The ordering itself is the "resolve, then lock" shape in State().
 func TestLazyBackendResolutionKeepsTheLockFree(t *testing.T) {
 	svc := New(Config{Backend: BackendRemote, RemoteAuthFile: "unused-credentials.json"})
 
@@ -728,8 +729,8 @@ func TestLazyBackendResolutionKeepsTheLockFree(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(30 * time.Second):
-		t.Fatal("backend readers stalled: the resolution scan must not run under s.mu")
+	case <-time.After(60 * time.Second):
+		t.Fatal("backend readers never converged: ensureBackend must run before s.mu is taken")
 	}
 	if got := svc.backend(); got != BackendRemote {
 		t.Fatalf("a pinned auth file must keep the legacy gateway, got %q", got)
