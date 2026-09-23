@@ -2,6 +2,15 @@
 
 ## Unreleased (target: v1.6.12)
 
+- The desktop app stopped resolving the backend before it binds, too: `startup()` ran it inside `defaultConfig()` ahead of `StartProxy()` and the console, and `UpdateConfig()` ran it on the UI thread, so saving a setting froze the window for as long as the credential and `PATH` scans take. The status and detection panels now report the backend the running service actually chose, so a config that still says `remote` no longer mislabels a proxy being served by the CLI.
+- `cacheSuccessfulBaseURL` no longer drops the candidate memo on every model list. A default install re-caches the domain it just used on each successful list, which invalidated the five-minute memo and put the multi-second disk scan straight back onto the request path; it now invalidates only when the domain actually changes.
+- `-export-server-bundle` records the configured default model rather than one rewritten by the exporting machine's login state (`"kmodel"` instead of `"Auto"`). The exported bundle pins `backend: remote` with its own credentials file, so the target machine decides for itself -- the old value leaked the exporter's environment into the bundle.
+- The signal handler is armed before warm-up, so a slow backend scan can no longer leave a listening proxy ignoring SIGTERM.
+- 桌面版也不再在绑定端口前解析后端：`startup()` 过去在 `defaultConfig()` 里同步解析一次（早于 `StartProxy()` 与控制台），`UpdateConfig()` 又在 UI 线程上解析一次，于是"保存设置"会按登录缓存与 `PATH` 扫描的耗时冻结窗口。状态页与检测面板改为回报运行中服务**实际选用**的后端，配置写 `remote` 而实际由 CLI 服务时不再标错。
+- `cacheSuccessfulBaseURL` 不再每次模型列表成功就作废候选记忆：默认配置下每次列表都会回写"刚刚用过的域名"，把五分钟的缓存打掉、又把那次数秒级磁盘扫描放回请求路径；现在只有域名真的变了才作废。
+- `-export-server-bundle` 导出的默认模型改为所配置的值（`"kmodel"` 而非 `"Auto"`）：导出的包本就钉住 `backend: remote` 并自带凭据文件，目标机自己判断即可，旧行为把导出机的登录态泄漏进了包里。
+- 信号处理器改到预热之前装载，后端扫描再慢也不会出现"端口在听、SIGTERM 被无视"的窗口。
+
 - The listen port now opens before anything reads the disk. `service.New()` and `loadConfig()` each resolved the remote/CLI backend, and resolving it opens the login cache and globs every `PATH` entry -- 40-50 s on a loaded Windows box, paid twice, before the socket was created. The service now makes that choice once, lazily, outside the mutex, and warm-up triggers it after the port is open.
 - A status read no longer holds the service mutex while it looks the remote base URL up on disk. That lookup opens roughly 3100 candidate IDE config and log files -- 245 MB and 2.1 s on a box with busy CLI log rotation, 8.5 s under `-race` -- and it repeated on every status call and every gateway client construction. The candidate list is now reused for five minutes and dropped the moment a probe learns a working domain, and the gateway client is built off the lock for the same reason.
 - 监听端口不再等磁盘。`service.New()` 与 `loadConfig()` 过去各自解析一次后端，而解析要打开登录缓存、遍历 `PATH` 上每个目录——一台满载 Windows 机上实测 40–50 秒，且在绑定端口**之前**付两遍。现改为服务内部惰性解析一次、在锁外完成，端口开后再由预热触发。
