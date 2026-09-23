@@ -153,6 +153,7 @@ type State struct {
 
 type Service struct {
 	cfg              Config
+	backendOnce      sync.Once
 	mu               sync.Mutex
 	connectMu        sync.Mutex // serialises the IPC handshake only; see ensureConnected
 	client           *lingmaipc.Client
@@ -215,16 +216,32 @@ func New(cfg Config) *Service {
 	}
 	// The pinned site set decides which backends are even considered available.
 	qodercli.SetEnabledSites(cfg.QoderCLISites)
-	// ponytail: resolving the backend here means New() touches the registry, globs
-	// every PATH entry and opens the login cache -- measured 40-50 s before the CLI
-	// bound its port on a loaded Windows box. Upgrade path: memoize ResolveBackend the
-	// same way cliSites() memoizes its scan, so construction stays allocation-only.
-	ResolveBackend(&cfg)
 	cfg.Model = normalizeModelForBackend(cfg.Backend, cfg.Model)
 	if cfg.SessionMode == "" {
 		cfg.SessionMode = SessionModeAuto
 	}
 	return &Service{cfg: cfg}
+}
+
+// ensureBackend makes the remote/CLI choice on first use rather than in New.
+// resolveRemoteBackend opens the login cache and, through qodercli.Available(),
+// globs every PATH entry -- 40-50 s on a loaded Windows box, and it used to run
+// before the listener was bound. The scan happens outside s.mu so it cannot
+// stall another user of the lock; every request path reads the backend through
+// backend(), so warm-up triggers it once right after the port opens.
+func (s *Service) ensureBackend() {
+	s.backendOnce.Do(func() {
+		s.mu.Lock()
+		resolved := s.cfg
+		s.mu.Unlock()
+		if !ResolveBackend(&resolved) {
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.cfg.Backend = resolved.Backend
+		s.cfg.Model = resolved.Model
+	})
 }
 
 // ResolveBackend switches a remote-configured service onto the Qoder CN CLI when
@@ -350,19 +367,21 @@ func (s *Service) chatClient(site qodercli.Site) (chatClient, error) {
 	case BackendQoderCLI:
 		return s.cliClientFor(site)
 	case BackendRemote:
-		return s.remoteClientLocked(), nil
+		return s.remoteAPI(), nil
 	default:
 		return nil, fmt.Errorf("backend %q does not support direct chat", s.backend())
 	}
 }
 
 func (s *Service) SetDefaultModel(model string) {
+	s.ensureBackend()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cfg.Model = normalizeModelForBackend(s.cfg.Backend, model)
 }
 
 func (s *Service) DefaultModel() string {
+	s.ensureBackend()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return strings.TrimSpace(s.cfg.Model)
@@ -373,7 +392,7 @@ func (s *Service) Warmup(ctx context.Context) error {
 		if s.backend() == BackendQoderCLI {
 			return s.warmCLISites(ctx)
 		}
-		return s.remoteClientLocked().Warmup(ctx)
+		return s.remoteAPI().Warmup(ctx)
 	}
 	_, err := s.ensureConnected(ctx)
 	return err
@@ -444,31 +463,44 @@ func describeIPCSetupError(operation string, err error) error {
 }
 
 func (s *Service) State() State {
+	s.ensureBackend()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cfg.Backend == BackendRemote || s.cfg.Backend == BackendQoderCLI {
-		endpoint := remote.ResolveBaseURL(s.cfg.RemoteBaseURL)
-		transport := "remote"
-		connected := s.remoteClient != nil
-		if s.cfg.Backend == BackendQoderCLI {
-			endpoint = ""
-			transport = "qodercli"
-			connected = len(s.cliClients) > 0
+	backend := s.cfg.Backend
+	configuredBaseURL := s.cfg.RemoteBaseURL
+	sessionMode := s.cfg.SessionMode
+	remoteConnected := s.remoteClient != nil
+	cliConnected := len(s.cliClients) > 0
+	pipePath := s.pipePath
+	endpoint := s.endpoint
+	transport := string(s.transport)
+	ipcConnected := s.client != nil
+	stickySessionID := s.stickySessionID
+	s.mu.Unlock()
+
+	if backend == BackendRemote || backend == BackendQoderCLI {
+		if backend == BackendQoderCLI {
+			return State{
+				Transport:   "qodercli",
+				Connected:   cliConnected,
+				SessionMode: sessionMode,
+			}
 		}
+		// An unconfigured base URL is looked up in the IDE config files on disk,
+		// so resolve it after releasing the lock.
 		return State{
-			Endpoint:    endpoint,
-			Transport:   transport,
-			Connected:   connected,
-			SessionMode: s.cfg.SessionMode,
+			Endpoint:    remote.ResolveBaseURL(configuredBaseURL),
+			Transport:   "remote",
+			Connected:   remoteConnected,
+			SessionMode: sessionMode,
 		}
 	}
 	return State{
-		PipePath:        s.pipePath,
-		Endpoint:        s.endpoint,
-		Transport:       string(s.transport),
-		Connected:       s.client != nil,
-		StickySessionID: s.stickySessionID,
-		SessionMode:     s.cfg.SessionMode,
+		PipePath:        pipePath,
+		Endpoint:        endpoint,
+		Transport:       transport,
+		Connected:       ipcConnected,
+		StickySessionID: stickySessionID,
+		SessionMode:     sessionMode,
 	}
 }
 
@@ -649,7 +681,7 @@ func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
 	}
 
 	if s.backend() == BackendRemote {
-		models, err := s.remoteClientLocked().ListModels(ctx)
+		models, err := s.remoteAPI().ListModels(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -1411,7 +1443,7 @@ func (s *Service) probeRemoteModel(ctx context.Context, model string) bool {
 	probeCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	temperature := 0.0
-	_, err := s.remoteClientLocked().Chat(probeCtx, remote.ChatRequest{
+	_, err := s.remoteAPI().Chat(probeCtx, remote.ChatRequest{
 		Model:       model,
 		Prompt:      "Reply with OK only.",
 		Messages:    []remote.Message{{Role: "user", Content: "Reply with OK only."}},
@@ -1566,6 +1598,7 @@ func (s *Service) generateLocked(
 }
 
 func (s *Service) backend() BackendMode {
+	s.ensureBackend()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.cfg.Backend == "" {
@@ -1574,17 +1607,28 @@ func (s *Service) backend() BackendMode {
 	return s.cfg.Backend
 }
 
-func (s *Service) remoteClientLocked() *remote.Client {
+func (s *Service) remoteAPI() *remote.Client {
+	s.mu.Lock()
+	existing := s.remoteClient
+	cfg := remote.Config{
+		BaseURL:     s.cfg.RemoteBaseURL,
+		AuthFile:    s.cfg.RemoteAuthFile,
+		ProxyURL:    s.cfg.RemoteProxyURL,
+		CosyVersion: s.cfg.RemoteVersion,
+		Timeout:     s.cfg.Timeout,
+	}
+	s.mu.Unlock()
+	if existing != nil {
+		return existing
+	}
+	// remote.New resolves an empty BaseURL by reading every candidate config file
+	// it can find -- seconds of IO that must not happen under s.mu. Publish the
+	// finished client only, and keep the first winner.
+	fresh := remote.New(cfg)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.remoteClient == nil {
-		s.remoteClient = remote.New(remote.Config{
-			BaseURL:     s.cfg.RemoteBaseURL,
-			AuthFile:    s.cfg.RemoteAuthFile,
-			ProxyURL:    s.cfg.RemoteProxyURL,
-			CosyVersion: s.cfg.RemoteVersion,
-			Timeout:     s.cfg.Timeout,
-		})
+		s.remoteClient = fresh
 	}
 	return s.remoteClient
 }

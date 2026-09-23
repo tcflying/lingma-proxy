@@ -214,7 +214,31 @@ func ResolveBaseURLWithSource(explicit string) BaseURLHint {
 	return BaseURLHint{URL: DefaultBaseURL, Source: "default"}
 }
 
+// The candidate scan opens every IDE config and log file it can find: measured
+// 2.1 s over 3099 files and 245 MB on a box with busy CLI log rotation, and it sat
+// behind every status read and every model-list fallback. These hints move when an
+// operator reconfigures an IDE, so reuse them for a few minutes; a probe that
+// learns a working domain invalidates the cache immediately.
+const baseURLCandidatesTTL = 5 * time.Minute
+
+var (
+	baseURLHintsMu    sync.Mutex
+	baseURLHintsValue []BaseURLHint
+	baseURLHintsAt    time.Time
+)
+
 func ResolveBaseURLCandidates() []BaseURLHint {
+	baseURLHintsMu.Lock()
+	defer baseURLHintsMu.Unlock()
+	if len(baseURLHintsValue) > 0 && time.Since(baseURLHintsAt) < baseURLCandidatesTTL {
+		return baseURLHintsValue
+	}
+	hints := scanBaseURLCandidates()
+	baseURLHintsValue, baseURLHintsAt = hints, time.Now()
+	return hints
+}
+
+func scanBaseURLCandidates() []BaseURLHint {
 	hints := make([]BaseURLHint, 0)
 	for _, path := range candidateConfigFiles() {
 		if value := readBaseURLHint(path); value != "" {
@@ -269,7 +293,12 @@ func cacheSuccessfulBaseURL(raw string) {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(path, data, 0644)
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return
+	}
+	baseURLHintsMu.Lock()
+	baseURLHintsValue = nil
+	baseURLHintsMu.Unlock()
 }
 
 func baseURLCachePath() (string, error) {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -696,5 +697,41 @@ func TestSweepImageTempsRemovesOnlyStaleImages(t *testing.T) {
 	}
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Fatalf("stale image survived: %v", err)
+	}
+}
+
+// TestLazyBackendResolutionKeepsTheLockFree guards the ordering of ensureBackend:
+// the login-cache and PATH scan must run outside s.mu, and every reader that
+// needs the answer must reach it without stalling on a lock the scan holds.
+// A regression here is a self-deadlock (call ensureBackend while holding s.mu),
+// so this asserts progress, not the resolved value -- which is environment
+// dependent by design.
+func TestLazyBackendResolutionKeepsTheLockFree(t *testing.T) {
+	svc := New(Config{Backend: BackendRemote, RemoteAuthFile: "unused-credentials.json"})
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		for i := 0; i < 8; i++ {
+			for _, read := range []func(){
+				func() { _ = svc.backend() },
+				func() { _ = svc.State() },
+				func() { svc.SetDefaultModel("Auto"); _ = svc.DefaultModel() },
+			} {
+				wg.Add(1)
+				go func(read func()) { defer wg.Done(); read() }(read)
+			}
+		}
+		wg.Wait()
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("backend readers stalled: the resolution scan must not run under s.mu")
+	}
+	if got := svc.backend(); got != BackendRemote {
+		t.Fatalf("a pinned auth file must keep the legacy gateway, got %q", got)
 	}
 }

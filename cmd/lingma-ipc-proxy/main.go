@@ -200,7 +200,9 @@ func loadConfig() (service.Config, string) {
 		configPath = ""
 	}
 
-	service.ResolveBackend(&cfg)
+	// The remote/CLI choice is deliberately not made here: it reads the login
+	// cache and globs PATH, which is slow enough to keep the port unbound. The
+	// service resolves it once, lazily, after the listener is open.
 	return cfg, configPath
 }
 
