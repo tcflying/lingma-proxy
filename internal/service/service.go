@@ -215,6 +215,10 @@ func New(cfg Config) *Service {
 	}
 	// The pinned site set decides which backends are even considered available.
 	qodercli.SetEnabledSites(cfg.QoderCLISites)
+	// ponytail: resolving the backend here means New() touches the registry, globs
+	// every PATH entry and opens the login cache -- measured 40-50 s before the CLI
+	// bound its port on a loaded Windows box. Upgrade path: memoize ResolveBackend the
+	// same way cliSites() memoizes its scan, so construction stays allocation-only.
 	ResolveBackend(&cfg)
 	cfg.Model = normalizeModelForBackend(cfg.Backend, cfg.Model)
 	if cfg.SessionMode == "" {
@@ -513,14 +517,15 @@ func (s *Service) setCLICatalog(site qodercli.Site, names []string, expiresAt ti
 // listCLIMergedModels lists the models of every served site. The international
 // catalog is namespaced because both sites expose models under the same names.
 //
-// Do not serialise these probes behind a mutex. It looks like the tidy way to stop
-// the startup warm-up and the first client request from each spawning a desktop
-// runtime, but the lock holder can be stuck in cmd.Wait() for its whole budget (the
-// grandchild-pipe case noted in cmd/lingma-ipc-proxy/main.go), and then every queued
-// caller times out with it. Measured on a loaded LAN box: with a probe mutex two
-// /v1/models calls failed at 108 s and 120 s, while letting them race one build on
-// the same box answered 31 models in 13 s and served two real completions. The probe
-// budgets bound this, not a lock.
+// Do not add a mutex here to stop the startup warm-up and a client request from
+// spawning the desktop runtime at once. It cannot be justified: the lock holder can
+// itself sit in cmd.Wait() for its whole budget (the grandchild-pipe case noted in
+// cmd/lingma-ipc-proxy/main.go) and then every queued caller times out with it, and
+// the overlap it prevents was never shown to be why a probe fails -- A/B'd on the LAN
+// box, the build that had answered 31 models in 220 ms an hour earlier failed
+// /v1/models exactly the same way once the box's own Qoder session went busy, mutex
+// or not. The probe budgets and the catalog TTL are what bound this. If concurrent
+// probes ever measure as the cost, fix cmd.Wait() to kill the whole process tree.
 func (s *Service) listCLIMergedModels(ctx context.Context) ([]Model, error) {
 	sites := s.cliSites()
 	now := time.Now()

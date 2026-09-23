@@ -83,9 +83,8 @@ func main() {
 	// the output pipe after the context has killed the direct child. Warming before
 	// the listener meant such a wedged child silently left the proxy with no port at
 	// all -- measured on a LAN box: process alive, 0.02 s of CPU, no listener, no log.
-	// The short budget is deliberate: warm-up is a cache priming, and a longer one
-	// only widens the window where it overlaps client requests. Giving it a minute on
-	// that same loaded box turned one slow first request into three failures.
+	// The budget is only a cache-priming bound now; a request path that finds nothing
+	// cached probes for itself, so lengthening it buys nothing a client can see.
 	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := svc.Warmup(warmupCtx); err != nil {
 		log.Printf("warmup failed: %v", err)
