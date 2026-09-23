@@ -282,6 +282,15 @@ func cacheSuccessfulBaseURL(raw string) {
 	if url == "" {
 		return
 	}
+	// A default install re-caches the domain it just used on every model list, so
+	// check before dropping the candidate memo: invalidating it for the value it
+	// already has on top puts the seconds-long disk scan back on the request path.
+	baseURLHintsMu.Lock()
+	alreadyKnown := len(baseURLHintsValue) > 0 && baseURLHintsValue[0].URL == url
+	baseURLHintsMu.Unlock()
+	if alreadyKnown {
+		return
+	}
 	path, err := baseURLCachePath()
 	if err != nil {
 		return

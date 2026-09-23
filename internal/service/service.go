@@ -42,6 +42,9 @@ const (
 
 const ipcSetupTimeout = 15 * time.Second
 
+// Config is read by every request path. Backend and Model are the only fields a
+// Service may change after construction -- and only under its mutex -- because
+// callers hold a copy. Keep every other field immutable once New() returns.
 type Config struct {
 	Host                  string
 	Port                  int
@@ -1606,6 +1609,10 @@ func (s *Service) backend() BackendMode {
 	}
 	return s.cfg.Backend
 }
+
+// Backend reports the mode requests are actually served with, which can differ
+// from the configured value until the lazy remote/CLI choice has been made.
+func (s *Service) Backend() BackendMode { return s.backend() }
 
 func (s *Service) remoteAPI() *remote.Client {
 	s.mu.Lock()

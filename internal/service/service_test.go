@@ -702,37 +702,48 @@ func TestSweepImageTempsRemovesOnlyStaleImages(t *testing.T) {
 
 // TestLazyBackendResolutionKeepsTheLockFree is a deadlock guard, not a timing gate:
 // it fails if a backend reader can never make progress, which is what happens the
-// moment ensureBackend is called while s.mu is already held. The wall-clock budget
-// is deliberately loose because ResolveBaseURL's first call scans the disk, and that
-// scan is only slow once per process -- with the candidate list warm this test would
-// pass even if the scan ran under the lock, so do not read a green run as proof of
-// the ordering. The ordering itself is the "resolve, then lock" shape in State().
+// moment ensureBackend is called while s.mu is already held. Each entry point gets
+// its own Service so that its own goroutines are the ones that fire the one-shot
+// resolution -- sharing one instance would let whichever reader happens to win the
+// race mask a deadlock at another entry point. The env points at an empty directory
+// so the resolution really runs its scans instead of short-circuiting.
 func TestLazyBackendResolutionKeepsTheLockFree(t *testing.T) {
-	svc := New(Config{Backend: BackendRemote, RemoteAuthFile: "unused-credentials.json"})
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		var wg sync.WaitGroup
-		for i := 0; i < 8; i++ {
-			for _, read := range []func(){
-				func() { _ = svc.backend() },
-				func() { _ = svc.State() },
-				func() { svc.SetDefaultModel("Auto"); _ = svc.DefaultModel() },
-			} {
-				wg.Add(1)
-				go func(read func()) { defer wg.Done(); read() }(read)
-			}
-		}
-		wg.Wait()
-	}()
-
-	select {
-	case <-done:
-	case <-time.After(60 * time.Second):
-		t.Fatal("backend readers never converged: ensureBackend must run before s.mu is taken")
+	entryPoints := map[string]func(*Service){
+		"backend":      func(s *Service) { _ = s.backend() },
+		"State":        func(s *Service) { _ = s.State() },
+		"SetDefault":   func(s *Service) { s.SetDefaultModel("Auto") },
+		"DefaultModel": func(s *Service) { _ = s.DefaultModel() },
 	}
-	if got := svc.backend(); got != BackendRemote {
-		t.Fatalf("a pinned auth file must keep the legacy gateway, got %q", got)
+
+	for name, read := range entryPoints {
+		t.Run(name, func(t *testing.T) {
+			empty := t.TempDir()
+			for _, key := range []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "APPDATA", "LOCALAPPDATA", "ProgramData"} {
+				t.Setenv(key, empty)
+			}
+			svc := New(Config{Backend: BackendRemote})
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				var wg sync.WaitGroup
+				for i := 0; i < 8; i++ {
+					wg.Add(1)
+					go func() { defer wg.Done(); read(svc) }()
+				}
+				wg.Wait()
+			}()
+
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("%s never converged: ensureBackend must run before s.mu is taken", name)
+			}
+			// With no login cache and no CLI host in the sandbox, nothing may switch
+			// the configured backend out from under the reader.
+			if got := svc.backend(); got != BackendRemote {
+				t.Fatalf("backend = %q on a machine with no credentials, want %q", got, BackendRemote)
+			}
+		})
 	}
 }

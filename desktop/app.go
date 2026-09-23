@@ -112,6 +112,7 @@ type App struct {
 	mu        sync.RWMutex
 	cfg       service.Config
 	server    *httpapi.Server
+	svc       *service.Service
 	running   bool
 	quitting  bool
 	addr      string
@@ -382,19 +383,35 @@ func (a *App) emitLogWithSource(source string, level string, message string) {
 // GetStatus returns the current proxy status
 func (a *App) GetStatus() ProxyStatus {
 	a.mu.RLock()
-	defer a.mu.RUnlock()
 	startedAt := ""
 	if !a.startedAt.IsZero() {
 		startedAt = a.startedAt.Format(time.RFC3339)
 	}
-	return ProxyStatus{
+	svc := a.svc
+	configured := a.cfg.Backend
+	status := ProxyStatus{
 		Running:   a.running,
 		Addr:      a.addr,
-		Backend:   string(a.cfg.Backend),
+		Backend:   string(configured),
 		Models:    len(a.models),
 		Model:     a.cfg.Model,
 		StartedAt: startedAt,
 	}
+	a.mu.RUnlock()
+	status.Backend = string(a.resolvedBackend(svc, configured))
+	return status
+}
+
+// resolvedBackend reports the backend the proxy is actually serving with. A
+// configured "remote" can be served by the CLI after the lazy credential check,
+// and the UI reads this value first, so it has to come from the running service.
+// Call it without a.mu held: Service.Backend() takes the service mutex, and a
+// request handler already holds that one while it logs back through App.
+func (a *App) resolvedBackend(svc *service.Service, configured service.BackendMode) service.BackendMode {
+	if svc == nil {
+		return configured
+	}
+	return svc.Backend()
 }
 
 // GetConfig returns the current configuration.
@@ -412,18 +429,20 @@ func (a *App) GetConfig() service.Config {
 func (a *App) GetDetectionInfo() DetectionInfo {
 	a.mu.RLock()
 	cfg := a.cfg
+	svc := a.svc
 	addr := a.addr
 	a.mu.RUnlock()
 
 	if strings.TrimSpace(addr) == "" {
 		addr = fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	}
+	backend := a.resolvedBackend(svc, cfg.Backend)
 	baseURL := remote.ResolveBaseURLWithSource(cfg.RemoteBaseURL)
 	proxyURL, proxySource := remote.ProxySource(cfg.RemoteProxyURL)
 	info := DetectionInfo{
 		ListenURL:           "http://" + addr,
-		Backend:             string(cfg.Backend),
-		BackendLabel:        backendLabel(cfg.Backend),
+		Backend:             string(backend),
+		BackendLabel:        backendLabel(backend),
 		RemoteBaseURL:       baseURL.URL,
 		RemoteBaseURLSource: baseURL.Source,
 		RemoteProxyURL:      proxyURL,
@@ -481,7 +500,10 @@ func (a *App) UpdateConfig(cfg service.Config) error {
 	if cfg.WarmupTimeout <= 0 {
 		cfg.WarmupTimeout = proxyWarmupTimeout
 	}
-	service.ResolveBackend(&cfg)
+	// The remote/CLI choice is not made here. It reads the login cache and globs
+	// PATH, and UpdateConfig runs on the UI thread, so resolving it would freeze
+	// the window for as long as that takes. The service resolves it lazily, and
+	// GetStatus reports whatever it settled on.
 
 	a.mu.Lock()
 	wasRunning := a.running
@@ -636,6 +658,7 @@ func (a *App) StartProxy() error {
 			a.emitLog("error", fmt.Sprintf("Server error: %v", err))
 			a.mu.Lock()
 			a.running = false
+			a.svc = nil
 			a.addr = ""
 			a.startedAt = time.Time{}
 			a.mu.Unlock()
@@ -644,6 +667,7 @@ func (a *App) StartProxy() error {
 
 	a.mu.Lock()
 	a.server = server
+	a.svc = svc
 	a.addr = addr
 	a.running = true
 	a.startedAt = time.Now()
@@ -666,8 +690,10 @@ func (a *App) StartProxy() error {
 			}
 			return
 		}
-		runtime.LogInfof(a.ctx, "%s warmup completed", backendLabel(cfg.Backend))
-		a.emitLog("info", fmt.Sprintf("%s warmup completed", backendLabel(cfg.Backend)))
+		// cfg.Backend is what the user configured; the model fetch above is what
+		// makes the service resolve a "remote" config onto the CLI.
+		runtime.LogInfof(a.ctx, "%s warmup completed", backendLabel(svc.Backend()))
+		a.emitLog("info", fmt.Sprintf("%s warmup completed", backendLabel(svc.Backend())))
 		_ = models
 	}()
 
@@ -978,6 +1004,7 @@ func (a *App) StopProxy() error {
 
 	server := a.server
 	a.server = nil
+	a.svc = nil
 	a.running = false
 	a.addr = ""
 	a.startedAt = time.Time{}
@@ -2241,7 +2268,9 @@ func defaultConfig() service.Config {
 
 	// A pinned site set decides which backends count as available.
 	qodercli.SetEnabledSites(cfg.QoderCLISites)
-	service.ResolveBackend(&cfg)
+	// No ResolveBackend here: startup() calls this synchronously before the proxy
+	// binds its port and before the console opens, and the resolution reads the
+	// login cache plus every PATH entry. The service does it lazily instead.
 	return cfg
 }
 
