@@ -1299,7 +1299,7 @@ func (a *App) loadAppState() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.requests = trimPersistedRequests(state.Requests)
-	a.logs = state.Logs
+	a.logs = trimPersistedLogs(state.Logs)
 	a.stats = state.Stats
 	a.models = state.Models
 	a.consoleToken = state.AdminToken
@@ -1393,6 +1393,11 @@ func trimPersistedLogs(records []AppLog) []AppLog {
 	}
 	out := make([]AppLog, len(records)-start)
 	copy(out, records[start:])
+	// Older builds logged the console URL with its token, so the persisted ring
+	// can carry it even though new entries never do.
+	for i := range out {
+		out[i].Message = redactPlainText(out[i].Message)
+	}
 	return out
 }
 

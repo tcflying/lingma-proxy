@@ -128,3 +128,17 @@ func TestTrimPersistedRequestsBoundsLoadedBodies(t *testing.T) {
 		t.Fatal("missing truncation marker")
 	}
 }
+
+func TestTrimPersistedLogsRedactsTheConsoleToken(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	out := trimPersistedLogs([]AppLog{{
+		Level:   "info",
+		Message: "Web 控制台：http://127.0.0.1:10096/#token=" + secret,
+	}})
+	if strings.Contains(out[0].Message, secret) {
+		t.Fatalf("console token survived the load: %q", out[0].Message)
+	}
+	if !strings.Contains(out[0].Message, "10096") {
+		t.Fatalf("the address should stay readable: %q", out[0].Message)
+	}
+}
