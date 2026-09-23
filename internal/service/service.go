@@ -155,7 +155,6 @@ type Service struct {
 	cfg              Config
 	mu               sync.Mutex
 	connectMu        sync.Mutex // serialises the IPC handshake only; see ensureConnected
-	cliProbeMu       sync.Mutex // one CLI catalog probe at a time; see listCLIMergedModels
 	client           *lingmaipc.Client
 	pipePath         string
 	endpoint         string
@@ -511,12 +510,22 @@ func (s *Service) setCLICatalog(site qodercli.Site, names []string, expiresAt ti
 	s.cliCatalog[site.Normalized()] = cliCatalogEntry{names: names, expiresAt: expiresAt}
 }
 
-// freshCLICatalogListings splits the served sites into the ones whose cached
-// catalog still answers and the ones that need a probe.
-func (s *Service) freshCLICatalogListings(sites []qodercli.Site) ([]cliSiteListing, []int) {
+// listCLIMergedModels lists the models of every served site. The international
+// catalog is namespaced because both sites expose models under the same names.
+//
+// Do not serialise these probes behind a mutex. It looks like the tidy way to stop
+// the startup warm-up and the first client request from each spawning a desktop
+// runtime, but the lock holder can be stuck in cmd.Wait() for its whole budget (the
+// grandchild-pipe case noted in cmd/lingma-ipc-proxy/main.go), and then every queued
+// caller times out with it. Measured on a loaded LAN box: with a probe mutex two
+// /v1/models calls failed at 108 s and 120 s, while letting them race one build on
+// the same box answered 31 models in 13 s and served two real completions. The probe
+// budgets bound this, not a lock.
+func (s *Service) listCLIMergedModels(ctx context.Context) ([]Model, error) {
+	sites := s.cliSites()
+	now := time.Now()
 	listings := make([]cliSiteListing, len(sites))
 	var pending []int
-	now := time.Now()
 	for i, site := range sites {
 		entry := s.cliCatalogEntry(site)
 		if entry.names != nil && now.Before(entry.expiresAt) {
@@ -524,24 +533,6 @@ func (s *Service) freshCLICatalogListings(sites []qodercli.Site) ([]cliSiteListi
 			continue
 		}
 		pending = append(pending, i)
-	}
-	return listings, pending
-}
-
-// listCLIMergedModels lists the models of every served site. The international
-// catalog is namespaced because both sites expose models under the same names.
-func (s *Service) listCLIMergedModels(ctx context.Context) ([]Model, error) {
-	sites := s.cliSites()
-	listings, pending := s.freshCLICatalogListings(sites)
-	if len(pending) > 0 {
-		// One cold probe at a time. The startup warm-up and the first client request
-		// each spawn the desktop runtime, and doing that at once doubles the cost on a
-		// loaded box until both blow the probe budget -- measured as /health answering
-		// in 7 ms while /v1/models failed twice and the completion it gated returned 400.
-		// Whoever queues behind re-reads the cache the in-flight probe fills.
-		s.cliProbeMu.Lock()
-		defer s.cliProbeMu.Unlock()
-		listings, pending = s.freshCLICatalogListings(sites)
 	}
 
 	var wg sync.WaitGroup
