@@ -133,11 +133,12 @@ The desktop app wraps the proxy with a native-feeling control panel:
 ### Browser Console
 
 The same panel also serves a browser. The desktop app opens a second listener on
-`proxy port + 1` (`10095` -> `10096`, `8095` -> `8096`, `9095` -> `9096`) and the
-start-up log prints one line with the ready-to-open address:
+`proxy port + 1` (`10095` -> `10096`, `8095` -> `8096`, `9095` -> `9096`). Start
+it from a terminal and stdout prints one line with the ready-to-open address;
+started by double-click, Settings shows the same address and token.
 
 ```
-Web 控制台：http://127.0.0.1:10096/#token=<per-install token>
+Web console: http://127.0.0.1:10096/#token=<per-install token>
 ```
 
 - Reads at `GET /api/admin/{status,config,detection,models,requests,logs,stats,version,...}`
@@ -146,15 +147,21 @@ Web 控制台：http://127.0.0.1:10096/#token=<per-install token>
 - Go -> UI events are bridged as SSE at `/api/admin/events`, so the pages keep
   updating without polling.
 - The token is generated once per install and stored in the app-state file
-  (`admin_token`, written `0600`); Settings also shows the address and token.
-  Requests without it get `401`.
+  (`admin_token`); requests without it get `401`. It is deliberately kept out of
+  the in-app log ring, which the console can read and the feedback export ships.
 - It listens separately from the proxy on purpose: saving a setting restarts the
   proxy, and a shared listener would drop the request that asked for it.
 - It binds `127.0.0.1` even when the proxy serves the network. Set
-  `LINGMA_CONSOLE_HOST` to the proxy host to allow LAN access; the console is
-  plain HTTP, so that token is the only gate.
+  `LINGMA_CONSOLE_HOST` to the address the console should bind (`0.0.0.0`, or a
+  LAN IP) to allow other machines; a wildcard bind is shown as `127.0.0.1`
+  because that is the address you can actually open. The console is plain HTTP,
+  so that token is the only gate.
 - Native-only actions (file pickers, feedback export, opening a folder, window
   controls) are refused in the browser instead of half-working.
+- The data plane's inspection endpoints (`/debug/requests`, `/debug/app-logs`,
+  `/api/requests`, `/api/logs`, …) return recorded conversation bodies, so they
+  answer loopback peers only. Set `LINGMA_ALLOW_REMOTE_DEBUG=1` on a deployed
+  server to open them up as well.
 
 ### Screenshots
 
