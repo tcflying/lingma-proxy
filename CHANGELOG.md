@@ -2,6 +2,11 @@
 
 ## Unreleased (target: v1.6.12)
 
+- The listen port now opens before anything reads the disk. `service.New()` and `loadConfig()` each resolved the remote/CLI backend, and resolving it opens the login cache and globs every `PATH` entry -- 40-50 s on a loaded Windows box, paid twice, before the socket was created. The service now makes that choice once, lazily, outside the mutex, and warm-up triggers it after the port is open.
+- A status read no longer holds the service mutex while it looks the remote base URL up on disk. That lookup opens roughly 3100 candidate IDE config and log files -- 245 MB and 2.1 s on a box with busy CLI log rotation, 8.5 s under `-race` -- and it repeated on every status call and every gateway client construction. The candidate list is now reused for five minutes and dropped the moment a probe learns a working domain, and the gateway client is built off the lock for the same reason.
+- 监听端口不再等磁盘。`service.New()` 与 `loadConfig()` 过去各自解析一次后端，而解析要打开登录缓存、遍历 `PATH` 上每个目录——一台满载 Windows 机上实测 40–50 秒，且在绑定端口**之前**付两遍。现改为服务内部惰性解析一次、在锁外完成，端口开后再由预热触发。
+- 状态读取不再持服务互斥锁去磁盘上查远端 base URL：那次查询要打开约 3100 个候选 IDE 配置与日志文件（一台 CLI 日志高频轮转的机器上实测 245 MB、原生 2.1 秒、`-race` 下 8.5 秒），而且每次读状态、每次建网关客户端都重来一遍。现在候选结果复用五分钟，一旦探测学到可用域名就立即作废，网关客户端同样在锁外构建。
+
 - `/health` is now a liveness probe: it stopped reading backend state, which is guarded by the same mutex the CLI site scan uses. It used to hang for 15-35 s behind that work; `GET /` still reports state.
 - The Qoder CLI site scan no longer runs under the service mutex. Detecting a site reads the Windows registry, globs every install root on `PATH`, and opens the login cache, and it was done while holding the lock that `/v1/models`, `GET /` and the web console all wait on -- measured on a loaded box as a 180 s `/v1/models` timeout next to a 143 ms `/health`. Detection now happens once per process outside the lock, which only publishes the result.
 - Further console hardening: `POST /api/admin/config` rejects a port outside `1-65535` (an empty body used to move the proxy to a random port and persist it), the bearer token no longer enters the persisted log ring, request bodies are capped at 1 MiB, the cross-origin shim for a dev server is gone (the console is same-origin), and `LINGMA_CONSOLE_HOST` now binds exactly what you set instead of folding `0.0.0.0` back to loopback.
