@@ -296,4 +296,9 @@ GitHub Release（tag 故意不带 `v` 前缀，避开 `release.yml` 的 `on: pus
 `gh` 的两个坑：建 tag 需要 `workflow` scope → 改用 `git tag` + `git push` 推 tag，再
 `gh release create --verify-tag`；而且**必须显式 `-R tcflying/lingma-proxy`**，
 否则 gh 会解析到 upstream `Lutiancheng1/lingma-proxy` 并报 tag 不存在。
-覆盖已有资产用 `gh release upload <tag> <files> --clobber`。
+覆盖已有资产用 `gh release upload <tag> <files> --clobber`，但注意：`--clobber` 要**先删后传**，
+而 GitHub 对刚上传的资产有**分钟级可见性延迟**——传完立刻查会读到 `assets=0`、按数字 id 删会 404，
+此时 `--clobber` 必然失败。等几分钟再读就正常了（2026-09-23 为这事白删重建过一次 release）。
+验收优先看 `gh api repos/…/releases/tags/<tag>` 里每个资产的 `digest: sha256:…`（GitHub 服务端自己
+算的摘要，与本机 zip 的 sha256 相同即可，比下载回读更省事）；仓库是私有的，匿名 curl/WebFetch 打
+这些下载 URL 一律 404，属正常隐藏。
