@@ -382,36 +382,36 @@ func (a *App) emitLogWithSource(source string, level string, message string) {
 
 // GetStatus returns the current proxy status
 func (a *App) GetStatus() ProxyStatus {
+	return a.statusSnapshot()
+}
+
+// statusSnapshot reads the App-guarded fields, then asks the running service what
+// it actually settled on. A configured "remote" can be served by the CLI once the
+// lazy credential check runs, and the dashboard reads this value first, so the
+// configured field alone would be a lie. Service.Backend() may run that one-shot
+// scan, which takes seconds, so it must happen after a.mu is released: every UI
+// binding, emitLog and the request recorder wait on that mutex.
+func (a *App) statusSnapshot() ProxyStatus {
 	a.mu.RLock()
 	startedAt := ""
 	if !a.startedAt.IsZero() {
 		startedAt = a.startedAt.Format(time.RFC3339)
 	}
 	svc := a.svc
-	configured := a.cfg.Backend
 	status := ProxyStatus{
 		Running:   a.running,
 		Addr:      a.addr,
-		Backend:   string(configured),
+		Backend:   string(a.cfg.Backend),
 		Models:    len(a.models),
 		Model:     a.cfg.Model,
 		StartedAt: startedAt,
 	}
 	a.mu.RUnlock()
-	status.Backend = string(a.resolvedBackend(svc, configured))
-	return status
-}
-
-// resolvedBackend reports the backend the proxy is actually serving with. A
-// configured "remote" can be served by the CLI after the lazy credential check,
-// and the UI reads this value first, so it has to come from the running service.
-// Call it without a.mu held: Service.Backend() takes the service mutex, and a
-// request handler already holds that one while it logs back through App.
-func (a *App) resolvedBackend(svc *service.Service, configured service.BackendMode) service.BackendMode {
-	if svc == nil {
-		return configured
+	if svc != nil {
+		status.Backend = string(svc.Backend())
+		status.Model = svc.DefaultModel()
 	}
-	return svc.Backend()
+	return status
 }
 
 // GetConfig returns the current configuration.
@@ -436,7 +436,10 @@ func (a *App) GetDetectionInfo() DetectionInfo {
 	if strings.TrimSpace(addr) == "" {
 		addr = fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	}
-	backend := a.resolvedBackend(svc, cfg.Backend)
+	backend := cfg.Backend
+	if svc != nil {
+		backend = svc.Backend()
+	}
 	baseURL := remote.ResolveBaseURLWithSource(cfg.RemoteBaseURL)
 	proxyURL, proxySource := remote.ProxySource(cfg.RemoteProxyURL)
 	info := DetectionInfo{
@@ -826,15 +829,8 @@ func (a *App) ExportFeedbackBundle(options FeedbackExportOptions) (FeedbackExpor
 	requests := cloneRequests(a.requests)
 	stats := a.stats
 	cfg := a.cfg
-	status := ProxyStatus{
-		Running:   a.running,
-		Addr:      a.addr,
-		Backend:   string(a.cfg.Backend),
-		Models:    len(a.models),
-		Model:     a.cfg.Model,
-		StartedAt: a.startedAt.Format(time.RFC3339),
-	}
 	a.mu.RUnlock()
+	status := a.statusSnapshot()
 
 	filteredLogs := filterLogsByRange(logs, startAt, endAt)
 	filteredRequests := filterRequestsByRange(requests, startAt, endAt)

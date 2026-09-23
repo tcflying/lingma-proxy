@@ -228,10 +228,12 @@ func New(cfg Config) *Service {
 
 // ensureBackend makes the remote/CLI choice on first use rather than in New.
 // resolveRemoteBackend opens the login cache and, through qodercli.Available(),
-// globs every PATH entry -- 40-50 s on a loaded Windows box, and it used to run
-// before the listener was bound. The scan happens outside s.mu so it cannot
-// stall another user of the lock; every request path reads the backend through
-// backend(), so warm-up triggers it once right after the port opens.
+// globs every PATH entry -- about a second on an idle Windows box, and it used to
+// run before the listener was bound. A sidecar that pins "backend": "qodercli"
+// short-circuits ResolveBackend, so this is insurance for the default remote
+// config, not the fix for a box that already pins one. The scan happens outside
+// s.mu so it cannot stall another user of the lock; every request path reads the
+// backend through backend(), so warm-up triggers it once after the port opens.
 func (s *Service) ensureBackend() {
 	s.backendOnce.Do(func() {
 		s.mu.Lock()

@@ -283,12 +283,10 @@ func cacheSuccessfulBaseURL(raw string) {
 		return
 	}
 	// A default install re-caches the domain it just used on every model list, so
-	// check before dropping the candidate memo: invalidating it for the value it
-	// already has on top puts the seconds-long disk scan back on the request path.
-	baseURLHintsMu.Lock()
-	alreadyKnown := len(baseURLHintsValue) > 0 && baseURLHintsValue[0].URL == url
-	baseURLHintsMu.Unlock()
-	if alreadyKnown {
+	// skip the write when the file already records it. Skipping also skips dropping
+	// the candidate memo, and that is what keeps the multi-second scan off the
+	// request path. Compare against the file, not against a position in the memo.
+	if cached := cachedBaseURLHint(); cached.URL == url {
 		return
 	}
 	path, err := baseURLCachePath()

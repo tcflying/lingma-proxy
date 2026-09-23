@@ -706,7 +706,10 @@ func TestSweepImageTempsRemovesOnlyStaleImages(t *testing.T) {
 // its own Service so that its own goroutines are the ones that fire the one-shot
 // resolution -- sharing one instance would let whichever reader happens to win the
 // race mask a deadlock at another entry point. The env points at an empty directory
-// so the resolution really runs its scans instead of short-circuiting.
+// so the resolution really runs its scans instead of short-circuiting; the sandbox is
+// not total (ProgramFiles, the registry and LINGMA_QODERCLI_BIN stay visible), so what
+// keeps the CLI host unavailable here is that its profile directory resolves inside
+// the redirected HOME/APPDATA.
 func TestLazyBackendResolutionKeepsTheLockFree(t *testing.T) {
 	entryPoints := map[string]func(*Service){
 		"backend":      func(s *Service) { _ = s.backend() },

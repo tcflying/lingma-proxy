@@ -78,13 +78,6 @@ func main() {
 		}
 	}()
 
-	// Arm the signal handler before warming up. The backend choice is resolved on
-	// the first read after the port opens and that scan is not bounded by the
-	// warm-up context, so on a slow box this process would otherwise sit with a
-	// live listener, ignoring SIGTERM, with nothing left to shut it down.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
 	// Warm up only once the port is open. Minting a CLI job token spawns the
 	// desktop runtime, and os/exec can go on waiting for a grandchild that inherited
 	// the output pipe after the context has killed the direct child. Warming before
@@ -99,6 +92,9 @@ func main() {
 		log.Printf("Lingma IPC warmup completed")
 	}
 	warmupCancel()
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	select {
 	case err := <-errCh:
@@ -204,9 +200,10 @@ func loadConfig() (service.Config, string) {
 		configPath = ""
 	}
 
-	// The remote/CLI choice is deliberately not made here: it reads the login
-	// cache and globs PATH, which is slow enough to keep the port unbound. The
-	// service resolves it once, lazily, after the listener is open.
+	// The remote/CLI choice is deliberately not made here: it opens the login cache
+	// and globs PATH, and doing it in the loader put it before the listener for no
+	// reason the request path needed. The service resolves it once, lazily, after
+	// the port is open.
 	return cfg, configPath
 }
 
