@@ -240,8 +240,9 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.URL.Path == "/health" {
-		// Liveness only: State() waits for the lock a running turn holds for the
-		// whole model response, which made /health time out under load.
+		// Liveness only: State() takes the same mutex the CLI site scan uses, and
+		// that scan reads the registry and globs install roots -- seconds of it on a
+		// loaded box, which used to make /health time out.
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "lingma-proxy"})
 		return
 	}
