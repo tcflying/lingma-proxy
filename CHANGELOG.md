@@ -5,6 +5,7 @@
 - `/health` is now a liveness probe: it stopped reading backend state, which is guarded by the lock a running turn holds for the whole model response. It used to hang for 15-35 s while a chat was streaming; `GET /` still reports state.
 - Further console hardening: `POST /api/admin/config` rejects a port outside `1-65535` (an empty body used to move the proxy to a random port and persist it), the bearer token no longer enters the persisted log ring, request bodies are capped at 1 MiB, the cross-origin shim for a dev server is gone (the console is same-origin), and `LINGMA_CONSOLE_HOST` now binds exactly what you set instead of folding `0.0.0.0` back to loopback.
 - The data plane's inspection endpoints (`/debug/requests`, `/debug/app-logs`, `/api/requests`, `/api/logs`, …) return recorded conversation bodies, so they answer loopback peers unless `LINGMA_ALLOW_REMOTE_DEBUG=1` is set.
+- Console bearer token is scrubbed from the persisted log ring as it loads back into memory, so old entries written by earlier builds stop being served to the browser console and the Settings log panel.
 - Fixed a data race in the desktop app: the console pointer and token are read by the proxy the startup goroutine spawns, so both are now guarded by the app mutex.
 - Qoder CN IPC requests no longer spool the user's image into the temp directory. The shipped worker reads the inline `data` field and never resolves the `agent/file` URI, so the file was pure leakage; only the legacy Lingma host still gets a path, and `SweepImageTemps` (now called once per process, not per service) cleans up after both.
 - `scripts/repackage-desktop.ps1` stops only the instance it is replacing (the variant folders share one exe name) and writes each zip beside the original and swaps it in only after reading the hash back.
@@ -14,6 +15,7 @@
 - 控制台再加一道加固：`POST /api/admin/config` 拒绝 `1-65535` 之外的端口（空请求体会把代理挪到随机端口并落盘）、令牌不再进入持久日志环、请求体上限 1 MiB、去掉面向 dev server 的跨域放行（控制台本就同源），`LINGMA_CONSOLE_HOST` 按所设地址监听，不再把 `0.0.0.0` 折回环回。
 - 收紧网页控制台：默认只绑 `127.0.0.1`（代理对外监听时也不再跟着暴露，局域网访问需显式设 `LINGMA_CONSOLE_HOST`），令牌改为常量时间比较，`ConsoleInfo` 回报实际绑定地址；新增控制台 HTTP/事件测试。
 - 数据面的检视接口（`/debug/requests`、`/api/requests`、`/api/logs` 等）含录制的对话正文，改为只回应答环回地址，远程部署确有需要再设 `LINGMA_ALLOW_REMOTE_DEBUG=1`。
+- 控制台令牌在日志**读回内存**时就脱敏：早期版本写进 app-state 的那几条不再被网页控制台与日志面板端出去。
 - 修掉桌面版数据竞争：启动协程拉起的代理会读取控制台指针与令牌，现改由 App 互斥锁保护。
 - Qoder CN 的 IPC 请求不再把用户图片写入临时目录：实际读取端只用内联 `data`，从不解析 `agent/file` URI，落盘纯属泄漏；只有旧 Lingma 宿主仍拿到路径，`SweepImageTemps` 改为每进程一次而非每次建服务。
 - `scripts/repackage-desktop.ps1` 只停它要替换的那个实例（三个变体共用一个 exe 名），zip 先写在旁边、读回哈希校验通过才顶替原文件。

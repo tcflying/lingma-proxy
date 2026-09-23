@@ -64,7 +64,8 @@ foreach ($variant in @('both', 'cn', 'intl')) {
   Copy-Item (Join-Path $probe 'lingma-proxy.json') (Join-Path $stage 'lingma-proxy.json')
   # Build the replacement beside the original and only swap it in once it reads
   # back correctly: a failed Compress-Archive must not cost the variant zip.
-  $fresh = "$zip.new"
+  # Compress-Archive insists on a .zip suffix, hence the staging name.
+  $fresh = Join-Path $TargetDir "lp-stage-$variant.zip"
   if (Test-Path $fresh) { Remove-Item -Force $fresh }
   Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $fresh -CompressionLevel Optimal
   Expand-Archive -Path $fresh -DestinationPath $probe -Force
