@@ -220,7 +220,6 @@ func New(cfg Config) *Service {
 	if cfg.SessionMode == "" {
 		cfg.SessionMode = SessionModeAuto
 	}
-	sweepImageTemps()
 	return &Service{cfg: cfg}
 }
 
@@ -1847,15 +1846,17 @@ func (s *Service) resolveSessionLocked(ctx context.Context, client *lingmaipc.Cl
 	return sessionID, nil
 }
 
-// imageTempHorizon is how long an IPC image file may still be needed. The IDE
-// resolves the qodercn:///agent/file?path= URI on its own schedule, so removing
-// the file when the request returns can cut off a slow fetch; anything past this
-// age cannot belong to a turn that is still live.
+// imageTempHorizon is how long a spooled IPC image file may still be needed. The
+// legacy Lingma host resolves the lingma:///agent/file?path= URI on its own
+// schedule, so removing the file when the request returns can cut off a slow
+// fetch; anything past this age cannot belong to a turn that is still live.
 const imageTempHorizon = 24 * time.Hour
 
-// sweepImageTemps removes image files left behind by earlier runs. New files are
-// exempt by age, so a running instance never loses what it just handed over.
-func sweepImageTemps() {
+// SweepImageTemps removes image files the legacy Lingma IPC path spooled into
+// the temp directory, plus the leftovers of builds that spooled them for Qoder CN
+// too. Call it once at process start: building a Service is not a reason to touch
+// the filesystem.
+func SweepImageTemps() {
 	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "lingma-img-*"))
 	if err != nil {
 		return
@@ -1889,40 +1890,11 @@ func (s *Service) runPromptLocked(
 
 	imageScheme := s.ipcImageURIScheme()
 	for _, img := range images {
-		if img.Data == "" && img.URL == "" {
+		item, ok := imagePromptItem(imageScheme, img)
+		if !ok {
 			continue
 		}
-		mediaType := img.MediaType
-		if mediaType == "" {
-			mediaType = "image/jpeg"
-		}
-
-		var imageURI string
-		if img.Data != "" {
-			if tmpFile, err := os.CreateTemp("", "lingma-img-*"+imageExtension(mediaType)); err == nil {
-				tmpPath := tmpFile.Name()
-				_ = tmpFile.Close()
-				data, _ := base64.StdEncoding.DecodeString(img.Data)
-				if len(data) > 0 {
-					_ = os.WriteFile(tmpPath, data, 0600)
-					if absPath, err := filepath.Abs(tmpPath); err == nil {
-						imageURI = fmt.Sprintf("%s:///agent/file?path=%s", imageScheme, url.QueryEscape(absPath))
-					}
-				}
-			}
-		}
-		if img.URL != "" {
-			imageURI = img.URL
-		}
-		if imageURI == "" {
-			continue
-		}
-		promptItems = append(promptItems, map[string]any{
-			"type":     "image",
-			"mimeType": mediaType,
-			"data":     img.Data,
-			"uri":      imageURI,
-		})
+		promptItems = append(promptItems, item)
 	}
 
 	params := map[string]any{
@@ -2004,6 +1976,47 @@ func (s *Service) runPromptLocked(
 			}
 		}
 	}
+}
+
+// imagePromptItem builds one session/prompt image item. Qoder CN reads the
+// inline data field and never resolves the agent/file URI, so only the legacy
+// Lingma host still gets a spooled file; writing the user's image to the temp
+// directory for a reader that ignores it just leaked it.
+func imagePromptItem(imageScheme string, img Image) (map[string]any, bool) {
+	if img.Data == "" && img.URL == "" {
+		return nil, false
+	}
+	mediaType := img.MediaType
+	if mediaType == "" {
+		mediaType = "image/jpeg"
+	}
+
+	var imageURI string
+	if img.Data != "" && imageScheme != "qodercn" {
+		if tmpFile, err := os.CreateTemp("", "lingma-img-*"+imageExtension(mediaType)); err == nil {
+			tmpPath := tmpFile.Name()
+			_ = tmpFile.Close()
+			data, _ := base64.StdEncoding.DecodeString(img.Data)
+			if len(data) > 0 {
+				_ = os.WriteFile(tmpPath, data, 0600)
+				if absPath, err := filepath.Abs(tmpPath); err == nil {
+					imageURI = fmt.Sprintf("%s:///agent/file?path=%s", imageScheme, url.QueryEscape(absPath))
+				}
+			}
+		}
+	}
+	if img.URL != "" {
+		imageURI = img.URL
+	}
+	if imageURI == "" && img.Data == "" {
+		return nil, false
+	}
+	return map[string]any{
+		"type":     "image",
+		"mimeType": mediaType,
+		"data":     img.Data,
+		"uri":      imageURI,
+	}, true
 }
 
 func (s *Service) ipcImageURIScheme() string {

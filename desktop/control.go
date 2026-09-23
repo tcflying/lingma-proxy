@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
@@ -10,12 +9,13 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"lingma-ipc-proxy/internal/service"
 )
@@ -40,6 +40,7 @@ type console struct {
 	token   string
 	statics http.Handler
 	addr    string
+	url     string
 
 	mu   sync.Mutex
 	subs map[chan consoleEvent]struct{}
@@ -68,20 +69,7 @@ func (c *console) listen(addr string) (net.Listener, error) {
 	return ln, nil
 }
 
-func (c *console) close() {
-	if c.srv == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	_ = c.srv.Shutdown(ctx)
-}
-
 func (c *console) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if allowDevOrigin(w, r) && r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
 	if !strings.HasPrefix(r.URL.Path, "/api/admin/") {
 		c.statics.ServeHTTP(w, r)
 		return
@@ -197,7 +185,7 @@ func (c *console) authorized(r *http.Request) bool {
 
 func decodeBody(r *http.Request, target any) error {
 	defer r.Body.Close()
-	decoder := json.NewDecoder(r.Body)
+	decoder := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
 		return fmt.Errorf("invalid request body: %w", err)
@@ -289,9 +277,7 @@ func newConsoleToken() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// startConsole binds the browser control plane one port above the proxy. It
-// runs from startup before the window exists, so console and consoleToken are
-// never raced by a reader.
+// startConsole binds the browser control plane one port above the proxy.
 func (a *App) startConsole() {
 	token, err := a.ensureConsoleToken()
 	if err != nil {
@@ -304,38 +290,55 @@ func (a *App) startConsole() {
 		return
 	}
 	a.mu.RLock()
-	host, port := a.cfg.Host, a.cfg.Port
+	port := a.cfg.Port
 	a.mu.RUnlock()
 
+	portPart := strconv.Itoa(port + 1)
+	bind := consoleBindHost()
 	c := &console{app: a, token: token, statics: http.FileServer(http.FS(statics))}
-	addr := net.JoinHostPort(consoleBindHost(host), strconv.Itoa(port+1))
-	ln, err := c.listen(addr)
+	ln, err := c.listen(net.JoinHostPort(bind, portPart))
 	if err != nil {
-		a.emitLog("warn", "web console could not bind "+addr+": "+err.Error())
+		a.emitLog("warn", "web console could not bind "+bind+":"+portPart+": "+err.Error())
 		return
 	}
 	c.addr = ln.Addr().String()
+	c.url = "http://" + net.JoinHostPort(consoleDisplayHost(bind), portPart) + "/"
+	a.mu.Lock()
 	a.console = c
-	a.emitLog("info", "Web 控制台：http://"+c.addr+"/#token="+token)
+	a.mu.Unlock()
+	if bind != "127.0.0.1" {
+		a.emitLog("warn", "web console is reachable from the network at "+c.addr+" over plain HTTP; the bearer token is sent in the clear")
+	}
+	// The token stays out of the persisted log ring: stdout carries it for a
+	// terminal start, the Settings page for a double-click start.
+	runtime.LogInfof(a.ctx, "Web console: %s/#token=%s", c.url, token)
+	a.emitLog("info", "Web 控制台："+c.url+"（令牌见设置页或 app-state 的 admin_token）")
 }
 
 // ConsoleInfo backs the Settings page entry that shows the URL and token.
 func (a *App) ConsoleInfo() ConsoleInfo {
+	a.mu.RLock()
 	c := a.console
+	a.mu.RUnlock()
 	if c == nil {
 		return ConsoleInfo{}
 	}
-	return ConsoleInfo{URL: "http://" + c.addr + "/", Token: c.token, Addr: c.addr, Serving: true}
+	return ConsoleInfo{URL: c.url, Token: c.token, Addr: c.addr, Serving: true}
 }
 
 // publishEvent mirrors a Wails broadcast to browsers watching the event stream.
 func (a *App) publishEvent(name string, data any) {
-	if c := a.console; c != nil {
+	a.mu.RLock()
+	c := a.console
+	a.mu.RUnlock()
+	if c != nil {
 		c.publish(name, data)
 	}
 }
 
 func (a *App) ensureConsoleToken() (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.consoleToken != "" {
 		return a.consoleToken, nil
 	}
@@ -344,20 +347,18 @@ func (a *App) ensureConsoleToken() (string, error) {
 		return "", err
 	}
 	a.consoleToken = token
-	a.mu.Lock()
 	a.flushAppStateLocked()
-	a.mu.Unlock()
 	return token, nil
 }
 
 // consoleBindHost is where the control plane listens. It stays on loopback even
 // when the proxy serves the network: the console can rewrite config, restart the
 // proxy and read request bodies, and a bearer token over plain HTTP is not
-// something to hand to a LAN by accident. Set LINGMA_CONSOLE_HOST to the proxy
-// host to opt into that.
-func consoleBindHost(proxyHost string) string {
+// something to hand to a LAN by accident. Set LINGMA_CONSOLE_HOST to opt into
+// another address.
+func consoleBindHost() string {
 	if value := strings.TrimSpace(os.Getenv("LINGMA_CONSOLE_HOST")); value != "" {
-		return consoleDisplayHost(value)
+		return value
 	}
 	return "127.0.0.1"
 }
@@ -371,23 +372,6 @@ func consoleDisplayHost(host string) string {
 	return host
 }
 
-// allowDevOrigin lets `npm run dev` on another localhost port drive the same
-// control plane. Packaged builds are same-origin and never reach this.
-func allowDevOrigin(w http.ResponseWriter, r *http.Request) bool {
-	origin := strings.TrimSpace(r.Header.Get("Origin"))
-	if origin == "" {
-		return false
-	}
-	parsed, err := url.Parse(origin)
-	if err != nil {
-		return false
-	}
-	host := parsed.Hostname()
-	if host != "localhost" && !strings.HasPrefix(host, "127.") {
-		return false
-	}
-	w.Header().Set("Access-Control-Allow-Origin", origin)
-	w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	return true
-}
+// The console page and its API share one origin, so no CORS is needed: a foreign
+// localhost port is a different app and must not get cross-origin write access to
+// config, restart and recorded request bodies.

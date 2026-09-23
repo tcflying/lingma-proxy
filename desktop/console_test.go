@@ -18,7 +18,7 @@ func testConsole() (*console, *httptest.Server) {
 	}
 	app.running = true
 	app.addr = "127.0.0.1:10095"
-	c := &console{app: app, token: "tok-" + strings.Repeat("x", 12), statics: http.NotFoundHandler(), addr: "127.0.0.1:10096"}
+	c := &console{app: app, token: "tok-" + strings.Repeat("x", 12), statics: http.NotFoundHandler(), addr: "127.0.0.1:10096", url: "http://127.0.0.1:10096/"}
 	return c, httptest.NewServer(c)
 }
 
@@ -110,7 +110,7 @@ func TestConsoleInfoReportsTheBoundAddress(t *testing.T) {
 	if !got.Serving || got.Addr != c.addr || got.Token != c.token {
 		t.Fatalf("got %#v", got)
 	}
-	if got.URL != "http://"+c.addr+"/" {
+	if got.URL != c.url {
 		t.Fatalf("url %q", got.URL)
 	}
 	if empty := (&App{}).ConsoleInfo(); empty.Serving {
@@ -161,15 +161,18 @@ func TestConsoleStreamDeliversPublishedEvents(t *testing.T) {
 }
 
 func TestConsoleStaysOnLoopbackUnlessToldOtherwise(t *testing.T) {
-	if got := consoleBindHost("0.0.0.0"); got != "127.0.0.1" {
+	if got := consoleBindHost(); got != "127.0.0.1" {
 		t.Fatalf("default bind %q, want 127.0.0.1 even when the proxy is public", got)
 	}
 	t.Setenv("LINGMA_CONSOLE_HOST", "0.0.0.0")
-	if got := consoleBindHost("127.0.0.1"); got != "127.0.0.1" {
-		t.Fatalf("opt-in wildcard should still display as loopback, got %q", got)
+	if got := consoleBindHost(); got != "0.0.0.0" {
+		t.Fatalf("opt-in wildcard must actually bind the wildcard, got %q", got)
+	}
+	if got := consoleDisplayHost("0.0.0.0"); got != "127.0.0.1" {
+		t.Fatalf("wildcard should display as loopback, got %q", got)
 	}
 	t.Setenv("LINGMA_CONSOLE_HOST", "192.168.50.9")
-	if got := consoleBindHost("127.0.0.1"); got != "192.168.50.9" {
+	if got := consoleBindHost(); got != "192.168.50.9" {
 		t.Fatalf("opt-in bind %q", got)
 	}
 }

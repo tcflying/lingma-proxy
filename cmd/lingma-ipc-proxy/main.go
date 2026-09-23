@@ -59,6 +59,7 @@ func main() {
 	}
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 
+	service.SweepImageTemps()
 	svc := service.New(cfg)
 	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	if err := svc.Warmup(warmupCtx); err != nil {

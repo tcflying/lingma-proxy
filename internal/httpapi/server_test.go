@@ -100,6 +100,33 @@ func TestCapabilitiesAdvertiseAgentCompatibility(t *testing.T) {
 	}
 }
 
+func TestDebugEndpointsAreLoopbackOnlyUnlessOptedIn(t *testing.T) {
+	server := NewServer("", service.New(service.Config{
+		Model:   "Qwen3-Coder",
+		Timeout: time.Second,
+	}))
+	serve := func(path, remoteAddr string) int {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.RemoteAddr = remoteAddr
+		rec := httptest.NewRecorder()
+		server.http.Handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	for _, path := range []string{"/debug/requests", "/debug/app-logs", "/api/requests", "/api/logs"} {
+		if code := serve(path, "192.168.50.7:54321"); code != http.StatusForbidden {
+			t.Fatalf("%s from a LAN peer = %d, want 403", path, code)
+		}
+		if code := serve(path, "[::1]:54321"); code == http.StatusForbidden {
+			t.Fatalf("%s from loopback = 403, want it served", path)
+		}
+	}
+	t.Setenv("LINGMA_ALLOW_REMOTE_DEBUG", "1")
+	if code := serve("/debug/requests", "192.168.50.7:54321"); code == http.StatusForbidden {
+		t.Fatal("LINGMA_ALLOW_REMOTE_DEBUG=1 should open the debug endpoints")
+	}
+}
+
 func TestDebugAppLogsUsesProviderAndSkipsRecorder(t *testing.T) {
 	server := NewServer("", service.New(service.Config{
 		Model:   "Qwen3-Coder",
@@ -121,6 +148,7 @@ func TestDebugAppLogsUsesProviderAndSkipsRecorder(t *testing.T) {
 	}
 
 	req := httptest.NewRequest(http.MethodGet, "/debug/app-logs?limit=7&source=app", nil)
+	req.RemoteAddr = "127.0.0.1:54321"
 	rec := httptest.NewRecorder()
 	server.http.Handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {

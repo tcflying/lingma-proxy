@@ -239,6 +239,12 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
+	if r.URL.Path == "/health" {
+		// Liveness only: State() waits for the lock a running turn holds for the
+		// whole model response, which made /health time out under load.
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "lingma-proxy"})
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
@@ -250,7 +256,28 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+const debugAccessMessage = "debug inspection endpoints are loopback-only; set LINGMA_ALLOW_REMOTE_DEBUG=1 to expose them"
+
+// debugAccessAllowed gates the request-inspection endpoints: they return recorded
+// conversation bodies, so a proxy bound to 0.0.0.0 must not hand them to the
+// network just because the API itself is reachable.
+func debugAccessAllowed(r *http.Request) bool {
+	if strings.TrimSpace(os.Getenv("LINGMA_ALLOW_REMOTE_DEBUG")) != "" {
+		return true
+	}
+	host := r.RemoteAddr
+	if colon := strings.LastIndex(host, ":"); colon >= 0 {
+		host = host[:colon]
+	}
+	ip := net.ParseIP(strings.Trim(strings.Trim(host, "[]"), "%"))
+	return ip != nil && ip.IsLoopback()
+}
+
 func (s *Server) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
+	if !debugAccessAllowed(r) {
+		http.Error(w, debugAccessMessage, http.StatusForbidden)
+		return
+	}
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -289,6 +316,10 @@ func (s *Server) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDebugLogs(w http.ResponseWriter, r *http.Request) {
+	if !debugAccessAllowed(r) {
+		http.Error(w, debugAccessMessage, http.StatusForbidden)
+		return
+	}
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return
@@ -328,6 +359,10 @@ func (s *Server) handleDebugLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleDebugAppLogs(w http.ResponseWriter, r *http.Request) {
+	if !debugAccessAllowed(r) {
+		http.Error(w, debugAccessMessage, http.StatusForbidden)
+		return
+	}
 	if r.Method == http.MethodOptions {
 		w.WriteHeader(http.StatusNoContent)
 		return

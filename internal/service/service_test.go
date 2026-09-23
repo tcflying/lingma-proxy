@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"os"
 	"path/filepath"
@@ -613,6 +614,53 @@ func TestMergeCLICatalogsSilentSiteFailsLouderThanAHalfList(t *testing.T) {
 	}
 }
 
+func TestImagePromptItemKeepsQoderCNImagesOutOfTempDir(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("TMP", dir)
+	t.Setenv("TEMP", dir)
+
+	payload := base64.StdEncoding.EncodeToString([]byte("a-picture"))
+	if _, ok := imagePromptItem("qodercn", Image{}); ok {
+		t.Fatal("empty image should be dropped")
+	}
+
+	qoderItem, ok := imagePromptItem("qodercn", Image{Data: payload, MediaType: "image/png"})
+	if !ok {
+		t.Fatal("qodercn image should be sent")
+	}
+	if qoderItem["data"] != payload {
+		t.Fatalf("qodercn must carry inline data, got %v", qoderItem["data"])
+	}
+	if qoderItem["uri"] != "" {
+		t.Fatalf("qodercn must not reference a spooled file, got %v", qoderItem["uri"])
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("qodercn leaked %d file(s) into the temp dir", len(entries))
+	}
+
+	// The legacy Lingma host is the only reader that may resolve agent/file, so it
+	// still gets a path.
+	legacyItem, ok := imagePromptItem("lingma", Image{Data: payload, MediaType: "image/png"})
+	if !ok {
+		t.Fatal("legacy image should be sent")
+	}
+	if uri, _ := legacyItem["uri"].(string); !strings.HasPrefix(uri, "lingma:///agent/file?path=") {
+		t.Fatalf("legacy host should get a lingma file URI, got %q", uri)
+	}
+	entries, err = os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("legacy host should spool exactly one file, got %d", len(entries))
+	}
+}
+
 func TestSweepImageTempsRemovesOnlyStaleImages(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("TMPDIR", dir)
@@ -633,13 +681,13 @@ func TestSweepImageTempsRemovesOnlyStaleImages(t *testing.T) {
 	if err := os.Mkdir(keptDir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{stale, foreign} {
+	for _, path := range []string{stale, foreign, keptDir} {
 		if err := os.Chtimes(path, old, old); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	sweepImageTemps()
+	SweepImageTemps()
 
 	for _, path := range []string{fresh, foreign, keptDir} {
 		if _, err := os.Stat(path); err != nil {

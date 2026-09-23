@@ -125,7 +125,8 @@ type App struct {
 	stateFlushTimer *time.Timer
 	stateFlushAt    time.Time
 
-	// console and consoleToken are written in startup before any reader exists.
+	// console and consoleToken are guarded by mu; startup publishes both before
+	// any binding can read them, but the proxy it spawns already can.
 	console      *console
 	consoleToken string
 }
@@ -221,6 +222,7 @@ func NewApp() *App {
 // startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
+	service.SweepImageTemps()
 	a.cfg = defaultConfig()
 	if err := a.loadAppState(); err != nil {
 		runtime.LogWarningf(a.ctx, "failed to load app state: %v", err)
@@ -463,6 +465,9 @@ func (a *App) GetDetectionInfo() DetectionInfo {
 // UpdateConfig updates the configuration, saves to file, and restarts the proxy if running.
 // Frontend sends Timeout in seconds; we convert to time.Duration.
 func (a *App) UpdateConfig(cfg service.Config) error {
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return fmt.Errorf("invalid listen port %d: keep the value the clients are configured with", cfg.Port)
+	}
 	if err := remote.ValidateProxyURL(cfg.RemoteProxyURL); err != nil {
 		return err
 	}

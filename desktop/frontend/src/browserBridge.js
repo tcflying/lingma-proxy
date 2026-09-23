@@ -27,7 +27,6 @@ const writes = {
   ClearLogs: ['logs/clear', () => ({})],
   StartProxy: ['proxy/start', () => ({})],
   StopProxy: ['proxy/stop', () => ({})],
-  RestartProxy: ['proxy/restart', () => ({})],
 }
 
 // desktopOnly has no browser meaning: native dialogs, file paths and windows.

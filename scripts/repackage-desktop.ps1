@@ -30,7 +30,15 @@ function Swap-In($from, $to) {
 
 if (-not (Test-Path $TargetDir)) { throw "target dir not found: $TargetDir" }
 
-$running = Get-Process -Name LingmaProxy -ErrorAction SilentlyContinue
+# Only this folder's instance: cn/intl/both and dev builds share the exe name, and
+# stopping a sibling would take down a serving proxy without restarting it.
+function Get-Installed {
+  @(Get-Process -Name LingmaProxy -ErrorAction SilentlyContinue | Where-Object {
+    try { $_.Path -eq $installed } catch { $false }
+  })
+}
+
+$running = Get-Installed
 if ($running) {
   Write-Output ("STOP pid=" + (($running | ForEach-Object { $_.Id }) -join ','))
   $running | Stop-Process -Force
@@ -54,14 +62,18 @@ foreach ($variant in @('both', 'cn', 'intl')) {
   Expand-Archive -Path $zip -DestinationPath $probe -Force
   Copy-Item $installed (Join-Path $stage $exeName)
   Copy-Item (Join-Path $probe 'lingma-proxy.json') (Join-Path $stage 'lingma-proxy.json')
-  Remove-Item -Force $zip
-  Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip -CompressionLevel Optimal
-  Remove-Item -Recurse -Force $probe
-  Expand-Archive -Path $zip -DestinationPath $probe -Force
+  # Build the replacement beside the original and only swap it in once it reads
+  # back correctly: a failed Compress-Archive must not cost the variant zip.
+  $fresh = "$zip.new"
+  if (Test-Path $fresh) { Remove-Item -Force $fresh }
+  Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $fresh -CompressionLevel Optimal
+  Expand-Archive -Path $fresh -DestinationPath $probe -Force
   $inside = (Get-FileHash -Algorithm SHA256 (Join-Path $probe $exeName)).Hash
-  if ($inside -ne $want) { throw "$variant zip holds $inside, expected $want" }
+  if ($inside -ne $want) { Remove-Item -Recurse -Force $stage, $probe, $fresh; throw "$variant zip holds $inside, expected $want" }
+  Move-Item -Force $fresh $zip
+  Remove-Item -Recurse -Force $probe
   Write-Output ("ZIP $variant size=$((Get-Item $zip).Length) exe_sha=$inside ok=True")
-  Remove-Item -Recurse -Force $stage, $probe
+  Remove-Item -Recurse -Force $stage
 }
 
 if ($SkipRun) { Write-Output 'RUN skipped'; exit 0 }
