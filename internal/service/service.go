@@ -167,7 +167,7 @@ type Service struct {
 	cliModels        map[qodercli.Site][]string
 	cliCatalog       map[qodercli.Site]cliCatalogEntry
 	detectedCLISites []qodercli.Site
-	cliSitesResolved bool
+	cliSitesOnce     sync.Once
 	remoteProbeCache map[string]remoteModelProbeEntry
 }
 
@@ -274,17 +274,15 @@ func resolveRemoteBackend(cfg Config) (BackendMode, bool) {
 const cliGlobalPrefix = "intl/"
 
 // cliSites returns the sites this machine can serve, resolved once per process.
+// The scan globs the install roots and reads login state, so it runs outside mu:
+// holding the exclusive lock across it made every other reader -- /health,
+// /v1/models, the web console -- wait for the disk.
 func (s *Service) cliSites() []qodercli.Site {
+	s.cliSitesOnce.Do(func() {
+		s.detectedCLISites = qodercli.UsableSites()
+	})
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.cliSitesLocked()
-}
-
-func (s *Service) cliSitesLocked() []qodercli.Site {
-	if !s.cliSitesResolved {
-		s.detectedCLISites = qodercli.UsableSites()
-		s.cliSitesResolved = true
-	}
 	if len(s.detectedCLISites) == 0 {
 		// Nothing is installed or signed in. Reporting the enabled sites keeps the
 		// concrete per-site failure in play instead of an empty list.
@@ -296,18 +294,27 @@ func (s *Service) cliSitesLocked() []qodercli.Site {
 // cliClientFor returns the client that drives one site's installed CLI.
 func (s *Service) cliClientFor(site qodercli.Site) (*qodercli.Client, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.cliClients == nil {
-		s.cliClients = map[qodercli.Site]*qodercli.Client{}
-	}
 	if client, ok := s.cliClients[site]; ok {
+		s.mu.Unlock()
 		return client, nil
 	}
+	timeout := s.cfg.Timeout
+	s.mu.Unlock()
+
 	loc, ok := qodercli.DetectSite(site)
 	if !ok || loc.ProfileDir == "" {
 		return nil, fmt.Errorf("%s 桌面端未安装或未登录，无法使用它的 CLI 后端", site.Label())
 	}
-	client := qodercli.NewClient(loc, s.cfg.Timeout)
+	client := qodercli.NewClient(loc, timeout)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cliClients == nil {
+		s.cliClients = map[qodercli.Site]*qodercli.Client{}
+	}
+	if existing, ok := s.cliClients[site]; ok {
+		return existing, nil
+	}
 	s.cliClients[site] = client
 	return client, nil
 }

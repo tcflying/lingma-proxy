@@ -2,7 +2,8 @@
 
 ## Unreleased (target: v1.6.12)
 
-- `/health` is now a liveness probe: it stopped reading backend state, which is guarded by the lock a running turn holds for the whole model response. It used to hang for 15-35 s while a chat was streaming; `GET /` still reports state.
+- `/health` is now a liveness probe: it stopped reading backend state, which is guarded by the same mutex the CLI site scan uses. It used to hang for 15-35 s behind that work; `GET /` still reports state.
+- The Qoder CLI site scan no longer runs under the service mutex. Detecting a site reads the Windows registry, globs every install root on `PATH`, and opens the login cache, and it was done while holding the lock that `/v1/models`, `GET /` and the web console all wait on -- measured on a loaded box as a 180 s `/v1/models` timeout next to a 143 ms `/health`. Detection now happens once per process outside the lock, which only publishes the result.
 - Further console hardening: `POST /api/admin/config` rejects a port outside `1-65535` (an empty body used to move the proxy to a random port and persist it), the bearer token no longer enters the persisted log ring, request bodies are capped at 1 MiB, the cross-origin shim for a dev server is gone (the console is same-origin), and `LINGMA_CONSOLE_HOST` now binds exactly what you set instead of folding `0.0.0.0` back to loopback.
 - The data plane's inspection endpoints (`/debug/requests`, `/debug/app-logs`, `/api/requests`, `/api/logs`, …) return recorded conversation bodies, so they answer loopback peers unless `LINGMA_ALLOW_REMOTE_DEBUG=1` is set.
 - Console bearer token is scrubbed from the persisted log ring as it loads back into memory, so old entries written by earlier builds stop being served to the browser console and the Settings log panel.
@@ -11,7 +12,8 @@
 - `scripts/repackage-desktop.ps1` stops only the instance it is replacing (the variant folders share one exe name) and writes each zip beside the original and swaps it in only after reading the hash back.
 - Hardened the browser console: it now binds `127.0.0.1` even when the proxy serves the network (`LINGMA_CONSOLE_HOST` opts into LAN access), the bearer token is compared in constant time, and `ConsoleInfo` reports the address actually bound. Added `desktop/console_test.go` covering the 401 paths, read routes, route enumeration, and a real SSE frame.
 - Stopped leaking IPC image temp files: image files older than 24 h are swept at process start (never ones a slow IDE fetch could still need), and they are written `0600` instead of `0644`.
-- `/health` 回归存活探针：它不再读后端状态——那份状态由整轮对话持有的锁保护，此前代理在流式回答时会把探针卡住 15–35 秒；`GET /` 仍然回报状态。
+- `/health` 回归存活探针：它不再读后端状态——那份状态与 CLI 站点探测共用同一把互斥锁，此前会被排在探测后面卡住 15–35 秒；`GET /` 仍然回报状态。
+- Qoder CLI 站点探测不再持有服务互斥锁：检测一个站点要查 Windows 注册表、遍历 `PATH` 上每个安装根目录、再打开登录缓存，而 `/v1/models`、`GET /` 与网页控制台都在同一把锁后面等它。一台满载实机的实测是 `/health` 143ms 正常、`/v1/models` 180 秒超时。现改为每进程只探测一次、且在锁外完成，锁内只发布结果。
 - 控制台再加一道加固：`POST /api/admin/config` 拒绝 `1-65535` 之外的端口（空请求体会把代理挪到随机端口并落盘）、令牌不再进入持久日志环、请求体上限 1 MiB、去掉面向 dev server 的跨域放行（控制台本就同源），`LINGMA_CONSOLE_HOST` 按所设地址监听，不再把 `0.0.0.0` 折回环回。
 - 收紧网页控制台：默认只绑 `127.0.0.1`（代理对外监听时也不再跟着暴露，局域网访问需显式设 `LINGMA_CONSOLE_HOST`），令牌改为常量时间比较，`ConsoleInfo` 回报实际绑定地址；新增控制台 HTTP/事件测试。
 - 数据面的检视接口（`/debug/requests`、`/api/requests`、`/api/logs` 等）含录制的对话正文，改为只回应答环回地址，远程部署确有需要再设 `LINGMA_ALLOW_REMOTE_DEBUG=1`。
