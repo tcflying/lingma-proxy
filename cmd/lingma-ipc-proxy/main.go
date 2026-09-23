@@ -61,14 +61,6 @@ func main() {
 
 	service.SweepImageTemps()
 	svc := service.New(cfg)
-	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := svc.Warmup(warmupCtx); err != nil {
-		log.Printf("warmup failed: %v", err)
-	} else {
-		log.Printf("Lingma IPC warmup completed")
-	}
-	warmupCancel()
-
 	server := httpapi.NewServer(addr, svc)
 
 	log.Printf("lingma-proxy listening on http://%s", addr)
@@ -85,6 +77,19 @@ func main() {
 			errCh <- err
 		}
 	}()
+
+	// Warm up only once the port is open. Minting a CLI job token spawns the
+	// desktop runtime, and os/exec can go on waiting for a grandchild that inherited
+	// the output pipe after the context has killed the direct child. Warming before
+	// the listener meant such a wedged child silently left the proxy with no port at
+	// all -- measured on a LAN box: process alive, 0.02 s of CPU, no listener, no log.
+	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := svc.Warmup(warmupCtx); err != nil {
+		log.Printf("warmup failed: %v", err)
+	} else {
+		log.Printf("Lingma IPC warmup completed")
+	}
+	warmupCancel()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

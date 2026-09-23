@@ -1469,7 +1469,7 @@ func (s *Service) generateLocked(
 		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
-		_ = s.deleteSessionLocked(cleanupCtx, ipcClient, sessionID)
+		_ = s.deleteSession(cleanupCtx, ipcClient, sessionID)
 	}()
 
 	if strings.TrimSpace(req.Model) == "" {
@@ -1764,10 +1764,51 @@ func (s *Service) resetConnection() {
 	_ = s.closeClientLocked()
 }
 
+// resolveSession returns the session this turn should use, creating one when the
+// sticky slot is empty or the caller asked for a fresh session. The IPC round trip
+// runs outside mu: a session/new over the plugin pipe takes seconds, and holding
+// the exclusive lock across it stopped /v1/models, the status page and the console.
+// Two requests that both find the slot empty now get their own session instead of
+// queueing on each other -- the later one takes the sticky slot, each turn keeps
+// the session it created.
 func (s *Service) resolveSession(ctx context.Context, client *lingmaipc.Client, mode SessionMode) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.resolveSessionLocked(ctx, client, mode)
+	if mode == SessionModeReuse {
+		s.mu.Lock()
+		sticky := strings.TrimSpace(s.stickySessionID)
+		s.mu.Unlock()
+		if sticky != "" {
+			return sticky, nil
+		}
+	}
+
+	var created struct {
+		SessionID string `json:"sessionId"`
+		ID        string `json:"id"`
+	}
+	if err := client.Request(ctx, "session/new", map[string]any{
+		"cwd":        s.cfg.Cwd,
+		"mcpServers": []any{},
+		"_meta":      map[string]any{},
+		"timestamp":  time.Now().UnixMilli(),
+	}, &created); err != nil {
+		return "", err
+	}
+
+	sessionID := strings.TrimSpace(created.SessionID)
+	if sessionID == "" {
+		sessionID = strings.TrimSpace(created.ID)
+	}
+	if sessionID == "" {
+		return "", errors.New("Lingma IPC did not return a sessionId")
+	}
+
+	if mode == SessionModeReuse {
+		s.mu.Lock()
+		s.stickySessionID = sessionID
+		s.stickyModelID = ""
+		s.mu.Unlock()
+	}
+	return sessionID, nil
 }
 
 func (s *Service) invalidateStickySession() {
@@ -1818,39 +1859,6 @@ func (s *Service) currentTransport() lingmaipc.Transport {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.transport
-}
-
-func (s *Service) resolveSessionLocked(ctx context.Context, client *lingmaipc.Client, mode SessionMode) (string, error) {
-	if mode == SessionModeReuse && strings.TrimSpace(s.stickySessionID) != "" {
-		return s.stickySessionID, nil
-	}
-
-	var created struct {
-		SessionID string `json:"sessionId"`
-		ID        string `json:"id"`
-	}
-	if err := client.Request(ctx, "session/new", map[string]any{
-		"cwd":        s.cfg.Cwd,
-		"mcpServers": []any{},
-		"_meta":      map[string]any{},
-		"timestamp":  time.Now().UnixMilli(),
-	}, &created); err != nil {
-		return "", err
-	}
-
-	sessionID := strings.TrimSpace(created.SessionID)
-	if sessionID == "" {
-		sessionID = strings.TrimSpace(created.ID)
-	}
-	if sessionID == "" {
-		return "", errors.New("Lingma IPC did not return a sessionId")
-	}
-
-	if mode == SessionModeReuse {
-		s.stickySessionID = sessionID
-		s.stickyModelID = ""
-	}
-	return sessionID, nil
 }
 
 // imageTempHorizon is how long a spooled IPC image file may still be needed. The
@@ -2034,7 +2042,7 @@ func (s *Service) ipcImageURIScheme() string {
 	return lingmaipc.DefaultImageURIScheme(s.cfg.Pipe, s.cfg.WebSocketURL)
 }
 
-func (s *Service) deleteSessionLocked(ctx context.Context, client *lingmaipc.Client, sessionID string) error {
+func (s *Service) deleteSession(ctx context.Context, client *lingmaipc.Client, sessionID string) error {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return nil
