@@ -1,6 +1,14 @@
 # Deploy a freshly built LingmaProxy.exe and repackage the three site zips,
 # asserting by read-back hash at every step. A zip name matching means nothing;
 # only the exe inside it does.
+#
+# Build the exe first with the production tag (this is what `wails build` passes
+# for you). Without it Wails links the dev-mode app shell, which never invokes
+# OnStartup, so the process sits there alive, logging nothing, binding no port:
+#   $env:CGO_ENABLED = '0'
+#   go build -tags production -trimpath -ldflags '-s -w -H windowsgui -X main.devtoolsBuild=true' `
+#     -o desktop/build/bin/LingmaProxy.exe ./desktop
+# The health probe below is the backstop: it fails a build that dropped the tag.
 param(
   [Parameter(Mandatory = $true)][string]$Exe,
   [string]$TargetDir = "$env:USERPROFILE\Desktop\qoder fan",

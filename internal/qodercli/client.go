@@ -277,7 +277,16 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	}
 
 	name, argv := c.commandArgs(args)
+	guard := newTreeGuard()
+	defer guard.release()
 	cmd := exec.CommandContext(runCtx, name, argv...)
+	cmd.Cancel = func() error {
+		// Kill the tree, not just the child: exec only reaps the process it started,
+		// and a descendant that inherited the stdout write end is exactly what keeps
+		// the scan below parked past its deadline.
+		guard.release()
+		return cmd.Process.Kill()
+	}
 	cmd.Env = c.environment(credential)
 	var stdout, stderr bytes.Buffer
 	if stdin == nil {
@@ -302,18 +311,21 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 		}
 	}
 	startErr := cmd.Start()
+	if startErr == nil {
+		// Assign before it can fork: descendants join the job at creation, so this is
+		// the only point that can cover the whole tree.
+		guard.assign(cmd.Process)
+	}
 	if startErr == nil && pipe != nil {
-		// ponytail: this read is the one unbounded wait in the backend. exec only
-		// closes the read end inside Wait, and Wait is unreachable from the read it is
-		// waiting for, so a grandchild that inherited the write end outranks the
-		// context deadline -- measured at 15.03s to return only when the holder exited
-		// (a timer-driven pipe.Close does not help: Windows leaves a parked pipe read
-		// alone, and a read end made with os.Pipe here never saw EOF at all). The real
-		// CLI is not known to fork such a child, and a streamed turn finished in 13.6s
-		// on this code, so the ceiling is theoretical for now. Upgrade path: point the
-		// child's stdout at a temporary file (a file read cannot be wedged by another
-		// holder), or bound the process tree with a Windows job object / Setpgid plus
-		// kill(-pgid).
+		// ponytail: this read has no deadline of its own -- Windows leaves a parked
+		// pipe read alone (measured: a timer-driven pipe.Close came back 15.03s later,
+		// exactly when the write-end holder exited, and a read end made with os.Pipe
+		// here never saw EOF at all). What bounds it is cmd.Cancel: the deadline
+		// releases the job guard, which kills every process in the tree and closes the
+		// write end with them. Off Windows the guard is a no-op, so a wedged
+		// grandchild still pins this read to the child's own exit; upgrade path there
+		// is a temporary file for stdout (a file read cannot be wedged by another
+		// holder) or setpgid plus kill(-pgid).
 		scanner := bufio.NewScanner(pipe)
 		scanner.Buffer(make([]byte, 0, 64*1024), maxCLIOutputLineBytes)
 		var scanErr error
