@@ -1530,3 +1530,36 @@ func TestWriteOpenAIResponseGatesReasoningOnTheRequest(t *testing.T) {
 		t.Fatalf("the thought leaked to a client that did not ask for it: %s", notAsked.Body.String())
 	}
 }
+
+// A saturated execution gate used to park the request with no bytes at all, which
+// a client cannot tell apart from a dead upstream: the Qoder SDK's 60s
+// first-payload timeout fired and the caller's agent turn died. The gate now has
+// to refuse inside that window, and refusing means a retryable 429, not a wait.
+func TestFullQueueRefusesInsteadOfGoingSilent(t *testing.T) {
+	server := NewServer("", service.New(service.Config{Model: "kmodel", Timeout: time.Second}))
+	for i := 0; i < cap(server.sem); i++ {
+		server.sem <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < cap(server.sem); i++ {
+			<-server.sem
+		}
+	}()
+
+	previous := slotQueueWait
+	slotQueueWait = 20 * time.Millisecond
+	defer func() { slotQueueWait = previous }()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(`{"model":"kmodel","messages":[{"role":"user","content":"hi"}]}`))
+	rec := httptest.NewRecorder()
+	started := time.Now()
+	server.http.Handler.ServeHTTP(rec, req)
+
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("a full queue waited %s instead of refusing", elapsed)
+	}
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusTooManyRequests, rec.Body.String())
+	}
+}

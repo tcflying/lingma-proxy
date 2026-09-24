@@ -675,11 +675,16 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	if !s.acquire(r.Context()) {
+	switch s.acquire(r.Context()) {
+	case slotAcquired:
+		defer s.release()
+	case slotClientGone:
 		writeAnthropicError(w, http.StatusRequestTimeout, "timeout_error", "request was cancelled while waiting for a proxy execution slot")
 		return
+	default:
+		writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error", s.queueFullMessage())
+		return
 	}
-	defer s.release()
 
 	var req anthropicRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -755,11 +760,16 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	if !s.acquire(r.Context()) {
+	switch s.acquire(r.Context()) {
+	case slotAcquired:
+		defer s.release()
+	case slotClientGone:
 		writeOpenAIError(w, http.StatusRequestTimeout, "timeout_error", "request was cancelled while waiting for a proxy execution slot")
 		return
+	default:
+		writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", s.queueFullMessage())
+		return
 	}
-	defer s.release()
 
 	var req openAIChatRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -797,11 +807,16 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	if !s.acquire(r.Context()) {
+	switch s.acquire(r.Context()) {
+	case slotAcquired:
+		defer s.release()
+	case slotClientGone:
 		writeOpenAIError(w, http.StatusRequestTimeout, "timeout_error", "request was cancelled while waiting for a proxy execution slot")
 		return
+	default:
+		writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_error", s.queueFullMessage())
+		return
 	}
-	defer s.release()
 
 	var req openAIResponsesRequest
 	if err := decodeJSON(r, &req); err != nil {
@@ -1375,10 +1390,21 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 	var final *service.ChatResult
 	var finalErr error
 
+	// The tool filter withholds an action block until it is sure where the prose
+	// ends, and the qodercli backend is silent until its subprocess speaks, so a
+	// live turn can produce no bytes for minutes. Clients read that as a dead
+	// stream (the SDK's idle timeout is 300s); comments keep the socket honest.
+	keepalive := time.NewTicker(streamKeepaliveInterval)
+	defer keepalive.Stop()
+
 	for eventsCh != nil || doneCh != nil {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-keepalive.C:
+			if err := writeSSEComment(w, flusher, "keepalive"); err != nil {
+				return
+			}
 		case event, ok := <-eventsCh:
 			if !ok {
 				eventsCh = nil
@@ -3192,13 +3218,44 @@ func maxConcurrentRequests() int {
 	return n
 }
 
-func (s *Server) acquire(ctx context.Context) bool {
+// slotQueueWait bounds how long a request may sit behind the concurrency gate.
+// A queued request writes no bytes, and clients cannot tell that from a dead
+// connection: the Qoder SDK abandons a response with no first payload after 60s
+// and kills the turn, which is how a fan-out of agents loses workers. Refusing
+// inside that window hands the client a retryable answer instead.
+// Var so the httpapi test can shrink it and still cover the refusal path.
+var slotQueueWait = 45 * time.Second
+
+type slotOutcome int
+
+const (
+	slotAcquired slotOutcome = iota
+	slotQueueFull
+	slotClientGone
+)
+
+func (s *Server) acquire(ctx context.Context) slotOutcome {
 	select {
 	case s.sem <- struct{}{}:
-		return true
+		return slotAcquired
+	case <-time.After(slotQueueWait):
 	case <-ctx.Done():
-		return false
+		return slotClientGone
 	}
+	// The wait is up: take a slot only if one opened at this instant, otherwise
+	// blocking here would put the silent queue back.
+	select {
+	case s.sem <- struct{}{}:
+		return slotAcquired
+	case <-ctx.Done():
+		return slotClientGone
+	default:
+		return slotQueueFull
+	}
+}
+
+func (s *Server) queueFullMessage() string {
+	return fmt.Sprintf("proxy is serving its maximum of %d concurrent requests; retry shortly", cap(s.sem))
 }
 
 func (s *Server) release() {
