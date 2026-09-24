@@ -181,12 +181,7 @@ func TestSortBaseURLHintsPrefersCustomEnterpriseEndpoint(t *testing.T) {
 }
 
 func TestResolveBaseURLCandidatesPreferCachedSuccess(t *testing.T) {
-	tempDir := t.TempDir()
-	t.Setenv("HOME", tempDir)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tempDir, ".config"))
-	t.Setenv("APPDATA", filepath.Join(tempDir, "AppData", "Roaming"))
-	t.Setenv("LOCALAPPDATA", filepath.Join(tempDir, "AppData", "Local"))
-	t.Setenv("ProgramData", filepath.Join(tempDir, "ProgramData"))
+	sandboxCandidateEnv(t)
 	cacheSuccessfulBaseURL("https://lingma.asiainfo.com/algo/api/v2/model/list")
 
 	hints := ResolveBaseURLCandidates()

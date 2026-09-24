@@ -311,7 +311,7 @@ func (a *App) startConsole() {
 	}
 	// The token stays out of the persisted log ring: stdout carries it for a
 	// terminal start, the Settings page for a double-click start.
-	runtime.LogInfof(a.ctx, "Web console: %s/#token=%s", c.url, token)
+	runtime.LogInfof(a.wailsCtx(), "Web console: %s/#token=%s", c.url, token)
 	a.emitLog("info", "Web 控制台："+c.url+"（令牌见设置页或 app-state 的 admin_token）")
 }
 

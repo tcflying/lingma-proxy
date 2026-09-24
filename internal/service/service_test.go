@@ -446,6 +446,32 @@ func TestExtractLastUserImagesFindsPreviousImageTurn(t *testing.T) {
 	}
 }
 
+// TestExtractModelsIsStableWhenScenesShareAName pins S5. The walk visited map keys in
+// Go's random order and let whichever scene came last overwrite the entry, so the
+// internal id behind a model name -- and therefore what /v1/chat routed to -- changed
+// between refreshes.
+func TestExtractModelsIsStableWhenScenesShareAName(t *testing.T) {
+	raw := map[string]any{
+		"quest": map[string]any{"models": []any{
+			map[string]any{"id": "internal-quest", "name": "Qwen3-Coder"},
+		}},
+		"chat": map[string]any{"models": []any{
+			map[string]any{"id": "internal-chat", "name": "Qwen3-Coder"},
+		}},
+	}
+	// One pass proves nothing: 200 identical walks are what fails when the winner
+	// depends on iteration order.
+	for i := 0; i < 200; i++ {
+		models := extractModels(raw)
+		if len(models) != 1 || models[0].ID != "Qwen3-Coder" {
+			t.Fatalf("run %d returned %v, want the one shared name", i, models)
+		}
+		if models[0].InternalID != "internal-chat" {
+			t.Fatalf("run %d routed to %q, want the first entry in key order", i, models[0].InternalID)
+		}
+	}
+}
+
 func TestRequestWithImageContextRemovesImagesAndAppendsContext(t *testing.T) {
 	req := ChatRequest{
 		Messages: []ChatMessage{

@@ -250,11 +250,10 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"service": "lingma-proxy",
-		"state":   s.svc.State(),
-	})
+	// "/" answers the same minimal payload as /health. The full state carries
+	// PipePath/Endpoint/StickySessionID and must not reach unauthenticated peers;
+	// it stays on the gated debug routes.
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "lingma-proxy"})
 }
 
 const debugAccessMessage = "debug inspection endpoints are loopback-only; set LINGMA_ALLOW_REMOTE_DEBUG=1 to expose them"
@@ -263,7 +262,13 @@ const debugAccessMessage = "debug inspection endpoints are loopback-only; set LI
 // conversation bodies, so a proxy bound to 0.0.0.0 must not hand them to the
 // network just because the API itself is reachable.
 func debugAccessAllowed(r *http.Request) bool {
-	if strings.TrimSpace(os.Getenv("LINGMA_ALLOW_REMOTE_DEBUG")) != "" {
+	// A browser sends Origin on every fetch from another page, curl does not, so
+	// refusing a foreign Origin closes "any local webpage can read the recorded
+	// conversations" without breaking CLI tooling or the same-origin console.
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && !sameDebugOrigin(r, origin) {
+		return false
+	}
+	if truthyEnv("LINGMA_ALLOW_REMOTE_DEBUG") {
 		return true
 	}
 	host := r.RemoteAddr
@@ -272,6 +277,11 @@ func debugAccessAllowed(r *http.Request) bool {
 	}
 	ip := net.ParseIP(strings.Trim(strings.Trim(host, "[]"), "%"))
 	return ip != nil && ip.IsLoopback()
+}
+
+func sameDebugOrigin(r *http.Request, origin string) bool {
+	u, err := url.Parse(origin)
+	return err == nil && strings.EqualFold(u.Host, r.Host)
 }
 
 func (s *Server) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
@@ -757,7 +767,7 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	normalized, err := normalizeOpenAIRequest(req)
+	normalized, err := normalizeOpenAIRequest(r.Context(), req)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -799,12 +809,12 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	chatReq, err := responsesRequestToChatRequest(req)
+	chatReq, err := responsesRequestToChatRequest(r.Context(), req)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	normalized, err := normalizeOpenAIRequest(chatReq)
+	normalized, err := normalizeOpenAIRequest(r.Context(), chatReq)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
@@ -821,7 +831,7 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIUpstreamError(w, err)
 		return
 	}
-	writeOpenAIResponse(w, result)
+	writeOpenAIResponse(w, result, normalized)
 }
 
 func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, req service.ChatRequest) {
@@ -986,7 +996,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 	doneCh := done
 	var final *service.ChatResult
 	var finalErr error
-	thinkingEnabled := strings.TrimSpace(req.ReasoningEffort) != ""
+	thinkingEnabled := thinkingRequested(req.ReasoningEffort)
 	thinkingOpen := false
 	textOpen := false
 	textIndex := 0
@@ -1508,7 +1518,6 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 	responseID := fmt.Sprintf("resp_%d", time.Now().UnixNano())
 	messageID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	created := time.Now().Unix()
-	messageStarted := false
 	streamingHeaders(w)
 	emitter := newOpenAIResponseStreamEmitter(w, flusher, responseID)
 	if err := emitter.Event("response.created", map[string]any{
@@ -1527,18 +1536,22 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 	if shouldAggregateToolStream(req) {
 		result, err := s.svc.Generate(r.Context(), req)
 		if err != nil {
-			_ = emitter.Event("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}})
+			_ = emitter.Event("error", map[string]any{"type": "error", "error": openAIStreamErrorObject(err)})
 			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			return
 		}
-		writeOpenAIResponseStreamCompleted(emitter, responseID, created, model, result, messageID, false, shouldEmitResponsesReasoning(req, result))
+		writeOpenAIResponseStreamCompleted(emitter, responseID, created, model, result, messageID, false, shouldEmitResponsesReasoning(req, result), "")
 		return
 	}
 
 	events, done, err := s.svc.GenerateStream(r.Context(), req)
 	if err != nil {
-		writeOpenAIUpstreamError(w, err)
+		// The 200 and text/event-stream headers are already on the wire, so a JSON
+		// error body here would be parsed by clients as a malformed stream frame.
+		_ = emitter.Event("error", map[string]any{"type": "error", "error": openAIStreamErrorObject(err)})
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
 		return
 	}
 
@@ -1547,15 +1560,72 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 	doneCh := done
 	var final *service.ChatResult
 	var finalErr error
-	pendingText := make([]string, 0, 16)
-	pendingThought := make([]string, 0, 16)
-	reasoningEnabled := strings.TrimSpace(req.ReasoningEffort) != ""
-	reasoningEmitted := false
+
+	// Reserve output_index 1 for the message up front, on the request alone, so
+	// thinking can stream into index 0 instead of being buffered until the final
+	// frame decides. This mirrors the Anthropic path's block indexing.
+	// ponytail: when reasoning is requested but the backend produces none, the
+	// streamed message sits at index 1 while response.completed's single-item
+	// output array implies 0. Upgrade path: emit an empty reasoning item.
+	reasoningReserved := thinkingRequested(req.ReasoningEffort)
+	reasoning := newResponseReasoningWriter(emitter, "rs_"+responseID, 0)
+	textOutputIndex := 0
+	if reasoningReserved {
+		textOutputIndex = 1
+	}
+	messageOpened := false
+	var streamedText strings.Builder
+
+	// Tool emulation can hold back the whole visible answer while it looks for an
+	// action block, so the first delta may arrive long after the request. A
+	// comment line keeps intermediaries and first-token timeouts happy without
+	// inventing an event type the Responses protocol does not define.
+	keepalive := time.NewTicker(streamKeepaliveInterval)
+	defer keepalive.Stop()
+
+	// emitText streams already-filtered deltas, closing an open reasoning item and
+	// announcing the message item on the first one. Reports false once the client
+	// is gone, which is the caller's signal to stop writing. Mirrors the emitText
+	// closure in the Anthropic path so the two streams open and close alike.
+	emitText := func(deltas []string) bool {
+		for _, delta := range deltas {
+			if delta == "" {
+				continue
+			}
+			if !messageOpened {
+				if err := reasoning.Close(); err != nil {
+					return false
+				}
+				if err := writeOpenAIResponseMessageStarted(emitter, messageID, textOutputIndex); err != nil {
+					return false
+				}
+				messageOpened = true
+			}
+			if err := emitter.Event("response.output_text.delta", map[string]any{
+				"type":          "response.output_text.delta",
+				"item_id":       messageID,
+				"output_index":  textOutputIndex,
+				"content_index": 0,
+				"delta":         delta,
+			}); err != nil {
+				return false
+			}
+			streamedText.WriteString(delta)
+		}
+		return true
+	}
 
 	for eventsCh != nil || doneCh != nil {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-keepalive.C:
+			if messageOpened || reasoning.Opened() {
+				continue
+			}
+			if err := writeSSEComment(w, flusher, "keepalive"); err != nil {
+				return
+			}
 		case event, ok := <-eventsCh:
 			if !ok {
 				eventsCh = nil
@@ -1563,15 +1633,15 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 			}
 			switch event.Type {
 			case service.StreamEventThinking:
-				if reasoningEnabled && strings.TrimSpace(event.Delta) != "" {
-					pendingThought = append(pendingThought, event.Delta)
+				if !reasoningReserved || strings.TrimSpace(event.Delta) == "" {
+					continue
+				}
+				if err := reasoning.Delta(event.Delta); err != nil {
+					return
 				}
 			default:
-				for _, delta := range filter.Push(event.Delta) {
-					if delta == "" {
-						continue
-					}
-					pendingText = append(pendingText, delta)
+				if !emitText(filter.Push(event.Delta)) {
+					return
 				}
 			}
 		case result, ok := <-doneCh:
@@ -1586,51 +1656,34 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 	}
 
 	if finalErr != nil {
-		_ = emitter.Event("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": finalErr.Error()}})
+		_ = reasoning.Close()
+		_ = emitter.Event("error", map[string]any{"type": "error", "error": openAIStreamErrorObject(finalErr)})
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
 	}
 	if final == nil {
+		_ = reasoning.Close()
 		_ = emitter.Event("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": "stream finished without a final result"}})
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
 	}
-	reasoningEnabled = shouldEmitResponsesReasoning(req, final)
-	if reasoningEnabled && len(pendingThought) > 0 {
-		reasoningText := strings.Join(pendingThought, "")
-		if err := writeOpenAIResponseReasoning(emitter, "rs_"+responseID, 0, reasoningText); err != nil {
-			return
-		}
-		reasoningEmitted = true
+	// The filter holds back everything after an unclosed fence or XML opening, and
+	// at end of turn it is the only one that knows whether that was an action block
+	// or prose the client never got. Both sibling streams drain it; skipping this
+	// silently truncated the answer in the delta stream while response.completed
+	// carried the full text.
+	if !emitText(filter.Flush()) {
+		return
 	}
-	pendingText = append(pendingText, filter.Flush()...)
-	for _, delta := range pendingText {
-		if delta == "" {
-			continue
-		}
-		outputIndex := 0
-		if reasoningEmitted {
-			outputIndex = 1
-		}
-		if !messageStarted {
-			if err := writeOpenAIResponseMessageStarted(emitter, messageID, outputIndex); err != nil {
-				return
-			}
-			messageStarted = true
-		}
-		if err := emitter.Event("response.output_text.delta", map[string]any{
-			"type":          "response.output_text.delta",
-			"item_id":       messageID,
-			"output_index":  outputIndex,
-			"content_index": 0,
-			"delta":         delta,
-		}); err != nil {
-			return
-		}
+	// A backend that reports the thought only in the final frame gets no streamed
+	// item; response.completed still carries it, which is the only honest place
+	// left once the message item has been announced.
+	if err := reasoning.Close(); err != nil {
+		return
 	}
-	writeOpenAIResponseStreamCompleted(emitter, responseID, created, model, final, messageID, messageStarted, reasoningEmitted)
+	writeOpenAIResponseStreamCompleted(emitter, responseID, created, model, final, messageID, messageOpened, reasoningReserved, streamedText.String())
 }
 
 func shouldAggregateToolStream(req service.ChatRequest) bool {
@@ -1643,7 +1696,7 @@ func shouldAggregateToolStream(req service.ChatRequest) bool {
 // consume, and never loses text the parser is going to keep.
 type toolStreamFilter struct {
 	enabled bool
-	tools   []toolemulation.ToolDef
+	scan    *toolemulation.ActionBlockScanner
 	pending string
 }
 
@@ -1651,7 +1704,7 @@ func newToolStreamFilter(req service.ChatRequest) *toolStreamFilter {
 	// tool_choice:"none" also disables suppression: applyToolEmulation leaves such
 	// blocks in the text, so withholding them here would drop prose the client keeps.
 	enabled := len(req.Tools) > 0 && req.ToolChoice.Mode != "none"
-	return &toolStreamFilter{enabled: enabled, tools: req.Tools}
+	return &toolStreamFilter{enabled: enabled, scan: toolemulation.NewActionBlockScanner(req.Tools)}
 }
 
 func (f *toolStreamFilter) Push(delta string) []string {
@@ -1664,13 +1717,14 @@ func (f *toolStreamFilter) Push(delta string) []string {
 	f.pending += delta
 	var out []string
 	for {
-		start, end, unterminated := toolemulation.FindActionBlockSpan(f.pending, f.tools)
+		start, end, unterminated := f.scan.FindSpan(f.pending)
 		switch {
 		case unterminated:
 			// A block has opened but not closed. Its prose is safe; the rest is
 			// withheld until Flush can decide whether it was ever an action block.
 			if start > 0 {
 				out = append(out, f.pending[:start])
+				f.scan.Discard(start)
 				f.pending = f.pending[start:]
 			}
 			return out
@@ -1678,11 +1732,13 @@ func (f *toolStreamFilter) Push(delta string) []string {
 			if start > 0 {
 				out = append(out, f.pending[:start])
 			}
+			f.scan.Discard(end)
 			f.pending = f.pending[end:]
 		default:
 			safe := len(f.pending) - toolemulation.ActionOpenPrefixHold(f.pending)
 			if safe > 0 {
 				out = append(out, f.pending[:safe])
+				f.scan.Discard(safe)
 				f.pending = f.pending[safe:]
 			}
 			return out
@@ -1905,7 +1961,7 @@ func normalizeAnthropicRequest(req anthropicRequest) (service.ChatRequest, error
 	}, nil
 }
 
-func normalizeOpenAIRequest(req openAIChatRequest) (service.ChatRequest, error) {
+func normalizeOpenAIRequest(ctx context.Context, req openAIChatRequest) (service.ChatRequest, error) {
 	messages := make([]service.ChatMessage, 0, len(req.Messages))
 	systemParts := make([]string, 0, 2)
 	for _, message := range req.Messages {
@@ -1918,7 +1974,7 @@ func normalizeOpenAIRequest(req openAIChatRequest) (service.ChatRequest, error) 
 			}
 		case "user":
 			text := strings.TrimSpace(extractText(message.Content))
-			images := extractOpenAIImages(message.Content)
+			images := extractOpenAIImages(ctx, message.Content)
 			if text != "" || len(images) > 0 {
 				messages = append(messages, service.ChatMessage{Role: role, Text: text, Images: images})
 			}
@@ -1996,8 +2052,8 @@ func extractResponseFormat(rf any) string {
 	return stringFromAny(m["type"])
 }
 
-func responsesRequestToChatRequest(req openAIResponsesRequest) (openAIChatRequest, error) {
-	messages, err := responsesInputToMessages(req.Input)
+func responsesRequestToChatRequest(ctx context.Context, req openAIResponsesRequest) (openAIChatRequest, error) {
+	messages, err := responsesInputToMessages(ctx, req.Input)
 	if err != nil {
 		return openAIChatRequest{}, err
 	}
@@ -2022,7 +2078,7 @@ func responsesRequestToChatRequest(req openAIResponsesRequest) (openAIChatReques
 	}, nil
 }
 
-func responsesInputToMessages(input any) ([]rawMessage, error) {
+func responsesInputToMessages(ctx context.Context, input any) ([]rawMessage, error) {
 	switch typed := input.(type) {
 	case nil:
 		return nil, fmt.Errorf("input is required")
@@ -2055,7 +2111,7 @@ func responsesInputToMessages(input any) ([]rawMessage, error) {
 				role = "user"
 			}
 			content := normalizeResponsesContent(m["content"])
-			if text := strings.TrimSpace(extractText(content)); text == "" && len(extractOpenAIImages(content)) == 0 {
+			if text := strings.TrimSpace(extractText(content)); text == "" && len(extractOpenAIImages(ctx, content)) == 0 {
 				continue
 			}
 			messages = append(messages, rawMessage{Role: role, Content: content})
@@ -2079,7 +2135,7 @@ func responsesInputToMessages(input any) ([]rawMessage, error) {
 		if role == "" {
 			role = "user"
 		}
-		if content := normalizeResponsesContent(typed); strings.TrimSpace(extractText(content)) != "" || len(extractOpenAIImages(content)) > 0 {
+		if content := normalizeResponsesContent(typed); strings.TrimSpace(extractText(content)) != "" || len(extractOpenAIImages(ctx, content)) > 0 {
 			return []rawMessage{{Role: role, Content: content}}, nil
 		}
 	}
@@ -2323,6 +2379,12 @@ func decodeJSON(r *http.Request, out any) error {
 	return nil
 }
 
+// errorReadCloser replays a read error to whoever reads the body next.
+type errorReadCloser struct{ err error }
+
+func (e errorReadCloser) Read([]byte) (int, error) { return 0, e.err }
+func (e errorReadCloser) Close() error             { return nil }
+
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -2370,6 +2432,17 @@ func writeOpenAIUpstreamError(w http.ResponseWriter, err error) {
 	writeOpenAIError(w, status, "api_error", err.Error())
 }
 
+// openAIStreamErrorObject renders a generation failure for a stream whose 200 and
+// text/event-stream headers are already committed, where the 503 above is no
+// longer reachable. The retryable hint is what the status code used to carry.
+func openAIStreamErrorObject(err error) map[string]any {
+	out := map[string]any{"type": "api_error", "message": err.Error()}
+	if errors.Is(err, remote.ErrTransientUpstream) {
+		out["code"] = "transient_upstream"
+	}
+	return out
+}
+
 func writeOpenAIChatCompletion(w http.ResponseWriter, result *service.ChatResult) {
 	created := time.Now().Unix()
 	message := map[string]any{
@@ -2411,10 +2484,14 @@ func writeOpenAIChatCompletion(w http.ResponseWriter, result *service.ChatResult
 	})
 }
 
-func writeOpenAIResponse(w http.ResponseWriter, result *service.ChatResult) {
+// writeOpenAIResponse answers a non-streaming /v1/responses request. req carries
+// the reasoning the client asked for: without it a client that explicitly
+// disabled thinking still got a reasoning item whenever the backend leaked
+// ThoughtText -- the fourth call site H5 was supposed to close.
+func writeOpenAIResponse(w http.ResponseWriter, result *service.ChatResult, req service.ChatRequest) {
 	responseID := fmt.Sprintf("resp_%d", time.Now().UnixNano())
 	created := time.Now().Unix()
-	writeJSON(w, http.StatusOK, buildOpenAIResponseBody(responseID, created, result.Model, result, "", strings.TrimSpace(result.ThoughtText) != ""))
+	writeJSON(w, http.StatusOK, buildOpenAIResponseBody(responseID, created, result.Model, result, "", shouldEmitResponsesReasoning(req, result)))
 }
 
 func buildOpenAIResponseMessageItem(messageID string, text string, status string) map[string]any {
@@ -2543,69 +2620,116 @@ func buildOpenAIResponseReasoningItem(itemID string, reasoningText string, statu
 	}
 }
 
-func writeOpenAIResponseReasoning(emitter *openAIResponseStreamEmitter, itemID string, outputIndex int, reasoningText string) error {
-	if err := emitter.Event("response.output_item.added", map[string]any{
-		"type":         "response.output_item.added",
-		"output_index": outputIndex,
-		"item":         buildOpenAIResponseReasoningItem(itemID, "", "in_progress"),
-	}); err != nil {
+// responseReasoningWriter streams one OpenAI Responses reasoning item. The
+// announce events fire on the first delta, so a request that asked for reasoning
+// but got none emits nothing.
+type responseReasoningWriter struct {
+	emitter   *openAIResponseStreamEmitter
+	itemID    string
+	outputIdx int
+	opened    bool
+	closed    bool
+	text      strings.Builder
+}
+
+func newResponseReasoningWriter(emitter *openAIResponseStreamEmitter, itemID string, outputIdx int) *responseReasoningWriter {
+	return &responseReasoningWriter{emitter: emitter, itemID: itemID, outputIdx: outputIdx}
+}
+
+func (r *responseReasoningWriter) Opened() bool { return r.opened }
+
+func (r *responseReasoningWriter) Delta(delta string) error {
+	if !r.opened {
+		if err := r.emitter.Event("response.output_item.added", map[string]any{
+			"type":         "response.output_item.added",
+			"output_index": r.outputIdx,
+			"item":         buildOpenAIResponseReasoningItem(r.itemID, "", "in_progress"),
+		}); err != nil {
+			return err
+		}
+		if err := r.emitter.Event("response.reasoning_summary_part.added", map[string]any{
+			"type":          "response.reasoning_summary_part.added",
+			"item_id":       r.itemID,
+			"output_index":  r.outputIdx,
+			"summary_index": 0,
+			"part": map[string]any{
+				"type": "summary_text",
+				"text": "",
+			},
+		}); err != nil {
+			return err
+		}
+		r.opened = true
+	}
+	if _, err := r.text.WriteString(delta); err != nil {
 		return err
 	}
-	if err := emitter.Event("response.reasoning_summary_part.added", map[string]any{
-		"type":          "response.reasoning_summary_part.added",
-		"item_id":       itemID,
-		"output_index":  outputIndex,
-		"summary_index": 0,
-		"part": map[string]any{
-			"type": "summary_text",
-			"text": "",
-		},
-	}); err != nil {
-		return err
-	}
-	if err := emitter.Event("response.reasoning_summary_text.delta", map[string]any{
+	return r.emitter.Event("response.reasoning_summary_text.delta", map[string]any{
 		"type":          "response.reasoning_summary_text.delta",
-		"item_id":       itemID,
-		"output_index":  outputIndex,
+		"item_id":       r.itemID,
+		"output_index":  r.outputIdx,
 		"summary_index": 0,
-		"delta":         reasoningText,
-	}); err != nil {
-		return err
-	}
-	if err := emitter.Event("response.reasoning_summary_text.done", map[string]any{
-		"type":          "response.reasoning_summary_text.done",
-		"item_id":       itemID,
-		"output_index":  outputIndex,
-		"summary_index": 0,
-		"text":          reasoningText,
-	}); err != nil {
-		return err
-	}
-	if err := emitter.Event("response.reasoning_summary_part.done", map[string]any{
-		"type":          "response.reasoning_summary_part.done",
-		"item_id":       itemID,
-		"output_index":  outputIndex,
-		"summary_index": 0,
-		"part": map[string]any{
-			"type": "summary_text",
-			"text": reasoningText,
-		},
-	}); err != nil {
-		return err
-	}
-	return emitter.Event("response.output_item.done", map[string]any{
-		"type":         "response.output_item.done",
-		"output_index": outputIndex,
-		"item":         buildOpenAIResponseReasoningItem(itemID, reasoningText, "completed"),
+		"delta":         delta,
 	})
 }
 
-func writeOpenAIResponseStreamCompleted(emitter *openAIResponseStreamEmitter, responseID string, created int64, model string, result *service.ChatResult, messageID string, messageStarted bool, reasoningEmitted bool) {
+func (r *responseReasoningWriter) Close() error {
+	if !r.opened || r.closed {
+		return nil
+	}
+	r.closed = true
+	summary := r.text.String()
+	if err := r.emitter.Event("response.reasoning_summary_text.done", map[string]any{
+		"type":          "response.reasoning_summary_text.done",
+		"item_id":       r.itemID,
+		"output_index":  r.outputIdx,
+		"summary_index": 0,
+		"text":          summary,
+	}); err != nil {
+		return err
+	}
+	if err := r.emitter.Event("response.reasoning_summary_part.done", map[string]any{
+		"type":          "response.reasoning_summary_part.done",
+		"item_id":       r.itemID,
+		"output_index":  r.outputIdx,
+		"summary_index": 0,
+		"part": map[string]any{
+			"type": "summary_text",
+			"text": summary,
+		},
+	}); err != nil {
+		return err
+	}
+	return r.emitter.Event("response.output_item.done", map[string]any{
+		"type":         "response.output_item.done",
+		"output_index": r.outputIdx,
+		"item":         buildOpenAIResponseReasoningItem(r.itemID, summary, "completed"),
+	})
+}
+
+func writeOpenAIResponseReasoning(emitter *openAIResponseStreamEmitter, itemID string, outputIndex int, reasoningText string) error {
+	r := newResponseReasoningWriter(emitter, itemID, outputIndex)
+	if err := r.Delta(reasoningText); err != nil {
+		return err
+	}
+	return r.Close()
+}
+
+func writeOpenAIResponseStreamCompleted(emitter *openAIResponseStreamEmitter, responseID string, created int64, model string, result *service.ChatResult, messageID string, messageStarted bool, reasoningEmitted bool, streamedText string) {
 	outputIndex := 0
 	if reasoningEmitted {
 		outputIndex++
 	}
 	text := responseTextForResponses(result)
+	if text == "" && messageStarted {
+		// An item already announced with output_text.delta events has to be
+		// closed with the text the client actually saw. The final frame can drop
+		// the prose once a tool call wins, which used to leave the item open
+		// forever on the client side. Not trimmed: a model that streams " " before
+		// its action block opened the item, so closing it with "" would skip the
+		// done events and resurrect the same dangling item.
+		text = streamedText
+	}
 	if text != "" {
 		if !messageStarted {
 			_ = writeOpenAIResponseMessageStarted(emitter, messageID, outputIndex)
@@ -2684,12 +2808,24 @@ func writeOpenAIResponseStreamCompleted(emitter *openAIResponseStreamEmitter, re
 	emitter.flusher.Flush()
 }
 
+// thinkingRequested reports whether the client actually asked for reasoning.
+// "none" is what an explicit thinking:{"type":"disabled"} normalises to, so it
+// must not reserve a content-block index or emit a thinking block either.
+func thinkingRequested(effort string) bool {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "", "none":
+		return false
+	default:
+		return true
+	}
+}
+
 func shouldEmitAnthropicThinking(req service.ChatRequest, result *service.ChatResult) bool {
-	return strings.TrimSpace(req.ReasoningEffort) != "" && result != nil && strings.TrimSpace(result.ThoughtText) != ""
+	return thinkingRequested(req.ReasoningEffort) && result != nil && strings.TrimSpace(result.ThoughtText) != ""
 }
 
 func shouldEmitResponsesReasoning(req service.ChatRequest, result *service.ChatResult) bool {
-	if strings.TrimSpace(req.ReasoningEffort) == "" {
+	if !thinkingRequested(req.ReasoningEffort) {
 		return false
 	}
 	if result == nil {
@@ -2721,6 +2857,17 @@ func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, pa
 	return nil
 }
 
+// writeSSEComment emits a line the SSE spec defines but that carries no event,
+// so every conforming parser skips it. Used to hold a stream open before the
+// first delta without inventing an event type the protocol does not define.
+func writeSSEComment(w http.ResponseWriter, flusher http.Flusher, text string) error {
+	if _, err := fmt.Fprintf(w, ": %s\n\n", text); err != nil {
+		return err
+	}
+	flusher.Flush()
+	return nil
+}
+
 func writeOpenAIChunk(w http.ResponseWriter, flusher http.Flusher, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -2738,6 +2885,8 @@ type recordingResponseWriter struct {
 	statusCode int
 	body       []byte
 	wrote      bool
+	truncated  bool
+	total      int
 }
 
 func (rw *recordingResponseWriter) WriteHeader(code int) {
@@ -2750,7 +2899,14 @@ func (rw *recordingResponseWriter) Write(b []byte) (int, error) {
 	if !rw.wrote {
 		rw.WriteHeader(http.StatusOK)
 	}
-	rw.body = append(rw.body, b...)
+	rw.total += len(b)
+	// Stop retaining past the recording cap: an SSE answer used to be buffered in
+	// full here, so the 8 KiB limit only ever applied after the memory was spent.
+	// The client-facing stream is untouched.
+	if !rw.truncated && len(rw.body) <= recordedBodyLimit {
+		rw.body = append(rw.body, b...)
+		rw.truncated = len(rw.body) > recordedBodyLimit
+	}
 	return rw.ResponseWriter.Write(b)
 }
 
@@ -2769,11 +2925,30 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 
 		start := time.Now()
 
+		// Cap the body once, here, before any handler can read it: an uncapped
+		// ReadAll let a handful of huge POSTs OOM the proxy ahead of the
+		// concurrency semaphore. Reading past the limit surfaces to handlers as
+		// the existing decodeJSON 400 exit.
+		//
+		// The honest ceiling is this cap times the number of open sockets, NOT
+		// times LINGMA_PROXY_MAX_CONCURRENT: this read still happens before
+		// acquire, and net/http bounds neither connections nor a total body
+		// budget here. Tightening it for real means draining the body inside the
+		// acquired slot.
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+
 		// Read request body for recording, then restore for downstream handler
 		var reqBody string
 		if r.Body != nil && r.Body != http.NoBody {
-			body, _ := io.ReadAll(r.Body)
-			r.Body = io.NopCloser(bytes.NewReader(body))
+			body, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				// Hand the capped reader's error to the decoder too, so an
+				// oversized body answers "too large" instead of a misleading
+				// JSON-syntax error about the partial bytes that arrived.
+				r.Body = errorReadCloser{err: readErr}
+			} else {
+				r.Body = io.NopCloser(bytes.NewReader(body))
+			}
 			reqBody = sanitizeRecordedBody(body)
 		}
 
@@ -2789,6 +2964,14 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 		}
 
 		respBody := sanitizeRecordedBody(rw.body)
+		if rw.truncated {
+			// The retained prefix stopped growing at the cap, so restate the
+			// true total rather than the count TruncateRecordedString saw.
+			if i := strings.Index(respBody, "…[truncated,"); i >= 0 {
+				respBody = respBody[:i]
+			}
+			respBody += fmt.Sprintf("…[truncated, %d bytes total]", rw.total)
+		}
 
 		s.recordRequest(r.Method, r.URL.Path, rw.statusCode, duration, reqBody, respBody)
 		if s.OnRequest != nil {
@@ -2875,6 +3058,16 @@ func sanitizeRecordedBody(body []byte) string {
 	if len(body) == 0 {
 		return ""
 	}
+	// Redacting the tree costs an unmarshal, a deep copy and a re-marshal of a body
+	// that can be tens of megabytes -- and the result is thrown down to
+	// recordedBodyLimit right after. Past this ceiling cut first: the parse then
+	// fails and the existing fallback shows the raw prefix, a bounded preview in an
+	// operator-only view. Widening maxRequestBytes for inline images made the
+	// uncapped cost proportionally worse, so the ceiling is what keeps the request
+	// path O(recorded) instead of O(body).
+	if len(body) > recordedBodySanitizeCeiling {
+		body = body[:recordedBodySanitizeCeiling]
+	}
 	var value any
 	if err := json.Unmarshal(body, &value); err != nil {
 		return TruncateRecordedString(string(body))
@@ -2950,6 +3143,20 @@ func mustMarshalJSON(value any) []byte {
 // list holds the last 200 requests, so an uncapped body turns a few long SSE
 // answers into hundreds of megabytes that never come back.
 const recordedBodyLimit = 8 << 10
+
+// recordedBodySanitizeCeiling bounds how much of a request body is ever parsed
+// for the debug record. See sanitizeRecordedBody.
+const recordedBodySanitizeCeiling = 64 << 10
+
+// maxRequestBytes is the request-body ceiling enforced once in withRecorder.
+// It has to stay above what this proxy's own image policy admits: images travel
+// as `data:` URLs (base64 grows a 20 MiB image to ~27 MB of JSON), so a cap
+// sized for a plain chat request silently 400s every screenshot a client sends.
+// The desktop console keeps its own, much smaller, 1 MiB limit for admin routes.
+// ponytail: worst case resident body is this cap times the request concurrency,
+// because withRecorder buffers before the semaphore is taken. Upgrade path: read
+// the body inside the acquired slot instead of widening the ceiling.
+const maxRequestBytes = 32 << 20
 
 // TruncateRecordedString caps one recorded body at recordedBodyLimit, on a rune
 // boundary. Exported because the desktop re-persists what it loaded: a fat
@@ -3133,7 +3340,7 @@ func extractAnthropicAssistantContent(content any) (string, []toolemulation.Tool
 	return text, calls
 }
 
-func extractOpenAIImages(content any) []service.Image {
+func extractOpenAIImages(ctx context.Context, content any) []service.Image {
 	items, ok := content.([]any)
 	if !ok {
 		return nil
@@ -3151,11 +3358,11 @@ func extractOpenAIImages(content any) []service.Image {
 		if !ok {
 			continue
 		}
-		url := stringFromAny(imageURL["url"])
-		if url == "" {
+		rawURL := stringFromAny(imageURL["url"])
+		if rawURL == "" {
 			continue
 		}
-		img := parseImageURL(url)
+		img := parseImageURL(ctx, rawURL)
 		if img != nil {
 			images = append(images, *img)
 		}
@@ -3197,14 +3404,14 @@ func extractAnthropicImages(content any) []service.Image {
 	return images
 }
 
-func parseImageURL(url string) *service.Image {
-	if strings.HasPrefix(url, "data:") {
-		return normalizeImage(parseDataURL(url))
+func parseImageURL(ctx context.Context, raw string) *service.Image {
+	if strings.HasPrefix(raw, "data:") {
+		return normalizeImage(parseDataURL(raw))
 	}
-	if img := parseLocalImagePath(url); img != nil {
+	if img := parseLocalImagePath(raw); img != nil {
 		return normalizeImage(img)
 	}
-	img, err := fetchImageAsBase64(url)
+	img, err := fetchImageAsBase64(ctx, raw)
 	if err != nil {
 		return nil
 	}
@@ -3246,23 +3453,42 @@ func parseLocalImagePath(raw string) *service.Image {
 	if !filepath.IsAbs(path) {
 		return nil
 	}
-
+	// Attaching a local screenshot is the feature; attaching an arbitrary file is
+	// not. Without this gate any client -- or a prompt-injected agent -- could send
+	// image_url "/etc/passwd" and have its contents base64'd and labelled
+	// image/jpeg straight into the model prompt.
+	mediaType := mediaTypeForImagePath(path)
+	if mediaType == "" {
+		return nil
+	}
+	// Regular-file only also rejects directories and device nodes, so `/dev/zero`
+	// cannot stream an unbounded read into memory, and the size gate matches the
+	// cap the remote fetch already enforces.
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() <= 0 || info.Size() > maxImageFetchBytes {
+		return nil
+	}
 	data, err := os.ReadFile(path)
 	if err != nil || len(data) == 0 {
 		return nil
 	}
 	return &service.Image{
-		MediaType: mediaTypeForImagePath(path),
+		MediaType: mediaType,
 		Data:      base64.StdEncoding.EncodeToString(data),
 		URL:       raw,
 	}
 }
 
+// mediaTypeForImagePath maps the extensions this proxy is willing to read off
+// disk, and returns "" for anything else so the caller rejects it rather than
+// defaulting an arbitrary file to image/jpeg.
 func mediaTypeForImagePath(path string) string {
 	lower := strings.ToLower(path)
 	switch {
 	case strings.HasSuffix(lower, ".png"):
 		return "image/png"
+	case strings.HasSuffix(lower, ".jpg"), strings.HasSuffix(lower, ".jpeg"):
+		return "image/jpeg"
 	case strings.HasSuffix(lower, ".gif"):
 		return "image/gif"
 	case strings.HasSuffix(lower, ".webp"):
@@ -3270,7 +3496,7 @@ func mediaTypeForImagePath(path string) string {
 	case strings.HasSuffix(lower, ".bmp"):
 		return "image/bmp"
 	default:
-		return "image/jpeg"
+		return ""
 	}
 }
 
@@ -3300,8 +3526,77 @@ func parseDataURL(url string) *service.Image {
 	}
 }
 
-func fetchImageAsBase64(url string) (*service.Image, error) {
-	resp, err := http.Get(url)
+// maxImageFetchBytes bounds one remote image download. The old code had no cap
+// and no client timeout, so a slow-drip endpoint could hold proxy slots open
+// indefinitely.
+const maxImageFetchBytes = 20 << 20
+
+// imageFetchClient bounds remote image fetches. CheckRedirect re-applies the
+// guard so a redirect cannot walk an allowed public URL into the metadata range,
+// and Control applies it to the address that is actually dialled, after DNS --
+// otherwise a public name that resolves to 169.254.169.254 gets through.
+var imageFetchClient = &http.Client{
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return imageURLAllowed(req.URL)
+	},
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			if err := imageAddressAllowed(address); err != nil {
+				return nil, err
+			}
+			var d net.Dialer
+			return d.DialContext(ctx, network, address)
+		},
+	},
+}
+
+// imageHostBlocked is the address policy for image fetches. Link-local is where
+// the cloud metadata services live; multicast and the unspecified address have
+// no business being an image origin. Loopback and private ranges stay allowed on
+// purpose: self-hosted image servers on the LAN and on this box are a real use,
+// and local file paths have their own reader above.
+func imageHostBlocked(ip net.IP) bool {
+	return ip == nil || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsMulticast() || ip.IsUnspecified()
+}
+
+// imageAddressAllowed checks the resolved host:port the transport is about to
+// connect to. By dial time the host is always a literal IP.
+func imageAddressAllowed(address string) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+	if ip := net.ParseIP(host); ip == nil || imageHostBlocked(ip) {
+		return fmt.Errorf("image URL host %q not allowed (link-local/metadata)", host)
+	}
+	return nil
+}
+
+func imageURLAllowed(u *url.URL) error {
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("image URL scheme %q not allowed", u.Scheme)
+	}
+	if ip := net.ParseIP(u.Hostname()); ip != nil && imageHostBlocked(ip) {
+		return fmt.Errorf("image URL host %q not allowed (link-local/metadata)", u.Hostname())
+	}
+	return nil
+}
+
+func fetchImageAsBase64(ctx context.Context, rawURL string) (*service.Image, error) {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return nil, err
+	}
+	if err := imageURLAllowed(u); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := imageFetchClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -3311,9 +3606,12 @@ func fetchImageAsBase64(url string) (*service.Image, error) {
 		return nil, fmt.Errorf("fetch image failed: %s", resp.Status)
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxImageFetchBytes+1))
 	if err != nil {
 		return nil, err
+	}
+	if len(data) > maxImageFetchBytes {
+		return nil, fmt.Errorf("fetch image failed: response over %d bytes", maxImageFetchBytes)
 	}
 
 	mediaType := resp.Header.Get("Content-Type")

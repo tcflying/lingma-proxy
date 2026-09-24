@@ -453,3 +453,117 @@ func TestFindActionBlockSpanHandlesTheXMLDialect(t *testing.T) {
 		t.Fatal("an unterminated block must hold the streamer back")
 	}
 }
+
+// TestActionBlockScannerMatchesOneShotSpan is the "keep the parse results
+// identical" gate: a scanner-driven feed (what toolStreamFilter.Push does) must
+// emit exactly what the stateless FindActionBlockSpan feed emits, delta by
+// delta, for prose, fenced blocks, rejected blocks, the XML dialect, split
+// fences and unterminated tails.
+func TestActionBlockScannerMatchesOneShotSpan(t *testing.T) {
+	tools := xmlTools()
+	rejected := "```json action\n" + `{"tool":"NotATool","parameters":{"x":1}}` + "\n```"
+	fenceInString := "```json action\n" +
+		"{\"tool\":\"Bash\",\"parameters\":{\"command\":\"echo ``` \\\"quoted\\\"\"}}" +
+		"\n```"
+	deltas := [][]string{
+		{"just prose, no fence"},
+		{"先看", "```json act", "ion\n{\"tool\":\"Bash\",\"parameters\":{\"command\":\"pwd\"}}", "\n```", "之后"},
+		{"a ", rejected, " b ", "```json action\n" + `{"tool":"Bash","parameters":{"command":"pwd"}}` + "\n```", " c"},
+		{"x ", xCall("Bash", xParam("command", "ls")), " y"},
+		{fenceInString},
+		{"开头", xOpen + "\n" + xFuncOpen + "Bash>\n" + xParam("command", "ls"), "\n" + xFuncClose + "\n" + xClose, "尾"},
+		{"tail ", "```json act"},
+		{"fence ``` inside prose stays ", "```json action\n{\"tool\":\"Bash\",\"parameters\":{\"command\":\"pwd\"}}\n```"},
+	}
+	// One long scenario fed two bytes at a time stresses every split boundary.
+	var bytewise []string
+	combined := "序" + rejected + "中" + xCall("Bash", xParam("command", "pwd")) + "```json action\n" + `{"tool":"Bash","parameters":{"command":"pwd"}}` + "\n```尾"
+	for i := 0; i < len(combined); i += 2 {
+		end := i + 2
+		if end > len(combined) {
+			end = len(combined)
+		}
+		bytewise = append(bytewise, combined[i:end])
+	}
+	deltas = append(deltas, bytewise)
+
+	for i, feed := range deltas {
+		scanner := NewActionBlockScanner(tools)
+		scanPending, oneShotPending := "", ""
+		var scanOut, oneShotOut strings.Builder
+
+		pushScanner := func(delta string) {
+			scanPending += delta
+			for {
+				start, end, unterminated := scanner.FindSpan(scanPending)
+				switch {
+				case unterminated:
+					if start > 0 {
+						scanOut.WriteString(scanPending[:start])
+						scanner.Discard(start)
+						scanPending = scanPending[start:]
+					}
+					return
+				case end > 0:
+					if start > 0 {
+						scanOut.WriteString(scanPending[:start])
+					}
+					scanner.Discard(end)
+					scanPending = scanPending[end:]
+				default:
+					safe := len(scanPending) - ActionOpenPrefixHold(scanPending)
+					if safe > 0 {
+						scanOut.WriteString(scanPending[:safe])
+						scanner.Discard(safe)
+						scanPending = scanPending[safe:]
+					}
+					return
+				}
+			}
+		}
+		pushOneShot := func(delta string) {
+			oneShotPending += delta
+			for {
+				start, end, unterminated := FindActionBlockSpan(oneShotPending, tools)
+				switch {
+				case unterminated:
+					if start > 0 {
+						oneShotOut.WriteString(oneShotPending[:start])
+						oneShotPending = oneShotPending[start:]
+					}
+					return
+				case end > 0:
+					if start > 0 {
+						oneShotOut.WriteString(oneShotPending[:start])
+					}
+					oneShotPending = oneShotPending[end:]
+				default:
+					safe := len(oneShotPending) - ActionOpenPrefixHold(oneShotPending)
+					if safe > 0 {
+						oneShotOut.WriteString(oneShotPending[:safe])
+						oneShotPending = oneShotPending[safe:]
+					}
+					return
+				}
+			}
+		}
+
+		for _, d := range feed {
+			pushScanner(d)
+			pushOneShot(d)
+			if scanOut.String() != oneShotOut.String() {
+				t.Fatalf("scenario %d after delta %q: scanner emitted %q, one-shot emitted %q",
+					i, d, scanOut.String(), oneShotOut.String())
+			}
+			if scanPending != oneShotPending {
+				t.Fatalf("scenario %d after delta %q: scanner holds %q, one-shot holds %q",
+					i, d, scanPending, oneShotPending)
+			}
+		}
+		scanOut.WriteString(scanPending)
+		oneShotOut.WriteString(oneShotPending)
+		if scanOut.String() != oneShotOut.String() {
+			t.Fatalf("scenario %d after flush: scanner=%q one-shot=%q", i, scanOut.String(), oneShotOut.String())
+		}
+	}
+}

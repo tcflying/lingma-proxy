@@ -777,10 +777,7 @@ type actionMatch struct {
 // FindActionBlockSpan and ParseActionBlocks both go through here, so a streamer
 // can never withhold text the parser would have kept, or the other way round.
 func matchActionBlock(text string, pos int, toolNameMap map[string]string, toolSchemaMap map[string]map[string]any) actionMatch {
-	contentStart := pos
-	if i := strings.Index(text[pos:], "\n"); i >= 0 {
-		contentStart = pos + i + 1
-	}
+	contentStart := fenceBodyStart(text, pos)
 	closing := findClosingFence(text, contentStart)
 	if closing < 0 {
 		return actionMatch{start: pos, closed: false}
@@ -837,12 +834,117 @@ func matchBlockAt(text string, pos int, names map[string]string, schemas map[str
 	return matchActionBlock(text, pos, names, schemas)
 }
 
-// findBlockOpenings merges both dialects' openings in position order.
-func findBlockOpenings(text string) []int {
-	out := findActionOpenings(text)
-	out = append(out, findXMLOpenings(text)...)
-	sort.Ints(out)
-	return out
+// fenceBodyStart returns where an action block's JSON body begins: the byte
+// after the first newline following the opening fence. Sharing it keeps the
+// one-shot matcher and the resumable scanner in lockstep.
+func fenceBodyStart(text string, pos int) int {
+	if i := strings.Index(text[pos:], "\n"); i >= 0 {
+		return pos + i + 1
+	}
+	return pos
+}
+
+// ActionBlockScanner is the incremental counterpart of FindActionBlockSpan for
+// streaming callers: the tool lookup maps are built once, and while one block
+// is open the scan resumes from the stored closing-fence position instead of
+// re-reading the whole withheld buffer on every delta. The caller shows the same
+// buffer and calls Discard with exactly the prefix it removes, keeping every
+// offset FindSpan returned valid against it.
+type ActionBlockScanner struct {
+	names   map[string]string
+	schemas map[string]map[string]any
+
+	pending    int // opening awaiting its close, -1 while none is open
+	pendingXML bool
+	// Resumable closing-fence state, valid while a fenced block is pending:
+	closeAt  int
+	inString bool
+	escape   bool
+}
+
+func NewActionBlockScanner(tools []ToolDef) *ActionBlockScanner {
+	names, schemas := toolLookupMaps(tools)
+	return &ActionBlockScanner{names: names, schemas: schemas, pending: -1}
+}
+
+// FindSpan returns exactly what FindActionBlockSpan would for the same buffer:
+// the first accepted block's span, or pending=true with start at the opening
+// that is still unterminated.
+func (s *ActionBlockScanner) FindSpan(text string) (start, end int, pending bool) {
+	if s.pending >= 0 && s.pending < len(text) {
+		pos := s.pending
+		if s.pendingXML {
+			// ponytail: an open XML block still re-runs its matcher each delta;
+			// make scanXMLBlock resumable if that ever shows in a profile.
+			m := matchXMLBlock(text, pos, s.names, s.schemas)
+			if !m.closed {
+				return pos, 0, true
+			}
+			s.pending, s.pendingXML = -1, false
+			if m.call.Name != "" {
+				return m.start, m.end, false
+			}
+			return s.scanFrom(text, pos+1)
+		}
+		// A fenced block becomes decidable the moment its closing fence shows
+		// up, so between deltas only the new bytes are looked at.
+		if scanClosingFence(text, &s.closeAt, &s.inString, &s.escape) < 0 {
+			return pos, 0, true
+		}
+		m := matchActionBlock(text, pos, s.names, s.schemas)
+		s.pending, s.pendingXML = -1, false
+		if !m.closed {
+			s.setPending(text, pos) // unreachable once the fence is found; re-park anyway
+			return pos, 0, true
+		}
+		if m.call.Name != "" {
+			return m.start, m.end, false
+		}
+		return s.scanFrom(text, pos+1)
+	}
+	s.pending, s.pendingXML = -1, false
+	return s.scanFrom(text, 0)
+}
+
+// scanFrom mirrors FindActionBlockSpan's decision loop for openings after from.
+func (s *ActionBlockScanner) scanFrom(text string, from int) (int, int, bool) {
+	for _, pos := range findBlockOpenings(text) {
+		if pos < from {
+			continue
+		}
+		m := matchBlockAt(text, pos, s.names, s.schemas)
+		if !m.closed {
+			s.setPending(text, pos)
+			return pos, 0, true
+		}
+		if m.call.Name != "" {
+			return m.start, m.end, false
+		}
+	}
+	return 0, 0, false
+}
+
+func (s *ActionBlockScanner) setPending(text string, pos int) {
+	s.pending = pos
+	s.pendingXML = strings.HasPrefix(text[pos:], xmlBlockOpen)
+	if !s.pendingXML {
+		s.closeAt, s.inString, s.escape = fenceBodyStart(text, pos), false, false
+	}
+}
+
+// Discard shifts the remembered offset after the caller trimmed n bytes off the
+// front of the buffer.
+func (s *ActionBlockScanner) Discard(n int) {
+	if n <= 0 {
+		return
+	}
+	if s.pending >= 0 {
+		s.pending -= n
+		s.closeAt -= n
+		if s.pending < 0 {
+			s.pending, s.pendingXML, s.closeAt = -1, false, 0
+		}
+	}
 }
 
 // The models behind the Qoder CLI were trained on a second, XML tool-call
@@ -1098,6 +1200,14 @@ func FindActionBlockSpan(text string, tools []ToolDef) (start, end int, pending 
 	return 0, 0, false
 }
 
+// findBlockOpenings merges both dialects' openings in position order.
+func findBlockOpenings(text string) []int {
+	out := findActionOpenings(text)
+	out = append(out, findXMLOpenings(text)...)
+	sort.Ints(out)
+	return out
+}
+
 func findActionOpenings(text string) []int {
 	out := make([]int, 0)
 	searches := actionOpenNeedles
@@ -1125,30 +1235,38 @@ func findActionOpenings(text string) []int {
 }
 
 func findClosingFence(text string, from int) int {
-	inString := false
-	escape := false
-	for i := from; i < len(text)-2; i++ {
-		ch := text[i]
-		if inString {
-			if escape {
-				escape = false
+	i := from
+	inString, escape := false, false
+	return scanClosingFence(text, &i, &inString, &escape)
+}
+
+// scanClosingFence is the resumable form of findClosingFence: the caller keeps
+// the cursor and the string state, so a streamer can continue where the last
+// delta ended instead of re-reading the whole block body. After a -1 return the
+// state points just past the bytes examined so far.
+func scanClosingFence(text string, i *int, inString, escape *bool) int {
+	for ; *i < len(text)-2; *i++ {
+		ch := text[*i]
+		if *inString {
+			if *escape {
+				*escape = false
 				continue
 			}
 			if ch == '\\' {
-				escape = true
+				*escape = true
 				continue
 			}
 			if ch == '"' {
-				inString = false
+				*inString = false
 			}
 			continue
 		}
 		if ch == '"' {
-			inString = true
+			*inString = true
 			continue
 		}
-		if text[i:i+3] == "```" {
-			return i
+		if text[*i:*i+3] == "```" {
+			return *i
 		}
 	}
 	return -1

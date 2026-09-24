@@ -33,6 +33,11 @@ type Client struct {
 // CreateProcess limit Windows enforces on the whole argv.
 const maxSystemPromptArgChars = 20000
 
+// maxCLIOutputLineBytes caps a single JSONL frame: the terminal result frame
+// carries the whole answer, and 8 MB is far above any measured turn. A var so the
+// oversized-line regression test can reach the ceiling without shipping 8 MB.
+var maxCLIOutputLineBytes = 8 * 1024 * 1024
+
 // partialStreamUnsupported latches after a CLI install refuses
 // --include-partial-messages, so one old build does not fail every streamed turn.
 var partialStreamUnsupported atomic.Bool
@@ -153,7 +158,9 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 	stdout, runErr := c.runWithStdinData(ctx, frame, onLine, args...)
 	if runErr != nil && partial && !streamed && strings.Contains(runErr.Error(), "include-partial-messages") {
 		partialStreamUnsupported.Store(true)
-		args = args[:len(args)-1]
+		// args ends with "--tools", "" so dropping the last element would orphan
+		// --tools and keep the flag the CLI just rejected.
+		args = withoutArg(args, "--include-partial-messages")
 		stdout, runErr = c.runWithStdinData(ctx, frame, nil, args...)
 	}
 	result, sawResult, parseErr := parseResult(stdout, request.Model, c.label(), c.loc.Site.Normalized())
@@ -290,12 +297,23 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	startErr := cmd.Start()
 	if startErr == nil && pipe != nil {
 		scanner := bufio.NewScanner(pipe)
-		scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+		scanner.Buffer(make([]byte, 0, 64*1024), maxCLIOutputLineBytes)
 		for scanner.Scan() {
 			line := scanner.Text()
 			stdout.WriteString(line)
 			stdout.WriteByte('\n')
 			onLine(line)
+		}
+		if scanErr := scanner.Err(); scanErr != nil {
+			// A single line past the buffer cap stops the scan while the CLI is
+			// still writing. Left unread, the 64 KB pipe fills and cmd.Wait parks
+			// until the deadline, turning an answer that already arrived into a
+			// timeout, so the rest is drained first. The drain has to be synchronous:
+			// a goroutine races cmd.Wait, which closes this read end, and loses.
+			// The cancelled path stays bounded because killing the process closes
+			// the write end and io.Copy returns on EOF.
+			log.Printf("qodercli: %s CLI stdout stopped after %d bytes: %v", c.label(), stdout.Len(), scanErr)
+			_, _ = io.Copy(io.Discard, pipe)
 		}
 	}
 	var waitErr error
@@ -327,7 +345,9 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 			}
 			return stdout.String(), fmt.Errorf("%s CLI failed: %s", c.label(), detail)
 		}
-		return stdout.String(), fmt.Errorf("%s CLI failed: %w with no output", c.label(), err)
+		// err here is the long-gone credential error, which is nil by this point:
+		// wrapping it printed "%!w(<nil>)" where the exit status belonged.
+		return stdout.String(), fmt.Errorf("%s CLI failed: %w with no output", c.label(), waitErr)
 	}
 	return stdout.String(), nil
 }
@@ -346,6 +366,20 @@ func (c *Client) commandArgs(args []string) (string, []string) {
 		argv = append(argv, "--config-dir", c.loc.ConfigDir)
 	}
 	return c.loc.HostExe, argv
+}
+
+// withoutArg drops every occurrence of a boolean flag, keeping each option's
+// value next to its own name. Positional trimming cannot do this: the argv ends
+// with the valueless "--tools", so the last element is not the flag to drop.
+func withoutArg(args []string, flag string) []string {
+	out := make([]string, 0, len(args))
+	for _, arg := range args {
+		if arg == flag {
+			continue
+		}
+		out = append(out, arg)
+	}
+	return out
 }
 
 func (c *Client) environment(credential string) []string {

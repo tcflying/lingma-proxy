@@ -171,7 +171,11 @@ func dockerComposeYAML(port int) string {
     image: ghcr.io/lutiancheng1/lingma-proxy:latest
     restart: unless-stopped
     ports:
-      - "%d:8095"
+      # Published on the server's loopback only: this proxy has no auth, so a
+      # bare "%[1]d:8095" hands every host on the LAN the recorded
+      # conversations. The container itself binds 0.0.0.0 because Docker can
+      # only publish from the container's routable interface.
+      - "127.0.0.1:%[1]d:8095"
     volumes:
       - ./credentials.json:/credentials.json:ro
       - ./lingma-proxy.json:/lingma-proxy.json:ro
@@ -206,7 +210,23 @@ Direct CLI start without Docker:
 
 API endpoint after startup:
 
-  http://127.0.0.1:%d/v1/chat/completions
+  http://127.0.0.1:%[1]d/v1/chat/completions
+
+Reachability:
+
+  docker compose publishes the port on the server's loopback only, so other
+  machines cannot reach it as shipped. From your workstation, tunnel in:
+
+    ssh -N -L %[1]d:127.0.0.1:%[1]d <server>
+
+  and point clients at http://127.0.0.1:%[1]d. Changing the mapping to
+  "%[1]d:8095" puts an unauthenticated endpoint that serves recorded
+  conversation bodies on every network the server is attached to; only do that
+  behind a firewall or an authenticating reverse proxy.
+
+  Starting without Docker binds the "host" value in lingma-proxy.json directly,
+  and that file ships 0.0.0.0 because Docker needs it to publish the port. Set
+  it to 127.0.0.1 for a direct start unless the paragraph above applies to you.
 
 If you copy the files to your own server, keep credentials.json next to
 lingma-proxy.json and docker-compose.yml. The login token can expire, so export
@@ -215,6 +235,9 @@ a fresh bundle when the server starts returning authentication errors.
 }
 
 func writeZip(path string, entries []zipEntry) error {
+	// The bundle carries a portable credentials.json, so the archive itself must
+	// not be readable by the other users on a shared server. os.Create yields
+	// 0644; the zip entry modes are only metadata until something unpacks them.
 	file, err := os.Create(path)
 	if err != nil {
 		return err

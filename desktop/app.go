@@ -14,8 +14,11 @@ import (
 	"path/filepath"
 	"regexp"
 	goruntime "runtime"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lingma-ipc-proxy/internal/deploy"
@@ -37,11 +40,26 @@ const (
 	feedbackDesktopFolderName  = "Lingma Proxy Feedback"
 	serverBundleFolderName     = "Lingma Proxy Server Bundles"
 	proxyWarmupTimeout         = 30 * time.Second
-	appStateFlushInterval      = 3 * time.Second
 	appStatePersistRequestMax  = 300
 	appStatePersistLogMax      = 1000
-	appStatePersistBodyLimit   = 12000
 	listSummaryMessageLimit    = 240
+	// statsModelKeyLimit caps how many distinct model strings the token stats
+	// track: the key comes from the request body, so a client controls it.
+	statsModelKeyLimit = 200
+	// statsOverflowModel is where tokens from the 201st distinct model go. It is
+	// also the bucket for requests that name no model, so "-" never means
+	// "unknown model" precisely.
+	statsOverflowModel = "-"
+)
+
+// The state flush is a debounce with a ceiling, so both knobs have to be
+// retunable by tests that drive many writes inside one interval.
+var (
+	appStateFlushInterval = 3 * time.Second
+	// appStateFlushMaxDelay is how long a continuously dirty state may be
+	// deferred at all. A streaming coding session writes every 1-2s, so a bare
+	// debounce that keeps resetting would never reach disk.
+	appStateFlushMaxDelay = 2 * appStateFlushInterval
 )
 
 //go:embed wails.json
@@ -107,7 +125,10 @@ type TokenStats struct {
 }
 
 type App struct {
-	ctx context.Context
+	// wailsCtxRef holds the Wails lifecycle context. startup() publishes it once
+	// and every reader goes through wailsCtx(), because bound methods, menu
+	// callbacks and the auto-start goroutine all read it from other threads.
+	wailsCtxRef atomic.Pointer[context.Context]
 
 	mu        sync.RWMutex
 	cfg       service.Config
@@ -125,6 +146,7 @@ type App struct {
 
 	stateFlushTimer *time.Timer
 	stateFlushAt    time.Time
+	stateDirtySince time.Time
 
 	// console and consoleToken are guarded by mu; startup publishes both before
 	// any binding can read them, but the proxy it spawns already can.
@@ -222,16 +244,16 @@ func NewApp() *App {
 
 // startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
-	a.ctx = ctx
+	a.setWailsCtx(ctx)
 	service.SweepImageTemps()
 	a.cfg = defaultConfig()
 	if err := a.loadAppState(); err != nil {
-		runtime.LogWarningf(a.ctx, "failed to load app state: %v", err)
+		runtime.LogWarningf(a.wailsCtx(), "failed to load app state: %v", err)
 	}
 
 	// Auto-save default config on first run so users can find/edit it later
 	if err := a.saveConfig(a.cfg); err != nil {
-		runtime.LogWarningf(a.ctx, "failed to save default config: %v", err)
+		runtime.LogWarningf(a.wailsCtx(), "failed to save default config: %v", err)
 	}
 
 	// Auto-start proxy so the app is usable immediately
@@ -246,9 +268,41 @@ func (a *App) startup(ctx context.Context) {
 	a.startConsole()
 }
 
-// onDomReady is called when the frontend DOM is ready
-func (a *App) onDomReady(ctx context.Context) {
-	a.ctx = ctx
+// onDomReady is called when the frontend DOM is ready.
+//
+// It deliberately does not touch the Wails context: Wails hands OnStartup and
+// OnDomReady the very same front-end context (internal/frontend/desktop/*:
+// f.ctx is assigned once in Run), so re-publishing it here was a second
+// unsynchronised writer racing the auto-start goroutine and every per-request
+// recording goroutine, which is what could tear the interface value inside
+// EventsEmit.
+func (a *App) onDomReady(_ context.Context) {}
+
+// setWailsCtx publishes the lifecycle context for every runtime.* call.
+func (a *App) setWailsCtx(ctx context.Context) {
+	a.wailsCtxRef.Store(&ctx)
+}
+
+// wailsCtx returns the lifecycle context, or nil before startup published it.
+// The Wails runtime helpers treat that as a fatal misuse, so callers must stay
+// on paths that cannot run before startup.
+func (a *App) wailsCtx() context.Context {
+	if ctx := a.wailsCtxRef.Load(); ctx != nil {
+		return *ctx
+	}
+	return nil
+}
+
+// runtimeEvents is the only way this app pushes an event at the Wails frontend.
+// The runtime treats a context it did not hand out as fatal misuse and exits the
+// process, so a call that arrives before startup published one is dropped rather
+// than made fatal: nothing can be listening yet.
+func (a *App) runtimeEvents(event string, args ...any) {
+	ctx := a.wailsCtx()
+	if ctx == nil {
+		return
+	}
+	runtime.EventsEmit(ctx, event, args...)
 }
 
 // onSecondInstanceLaunch is called when user clicks the dock icon while app is already running.
@@ -282,25 +336,25 @@ func (a *App) beforeClose(ctx context.Context) bool {
 
 	message := "再按一次退出快捷键将停止代理并退出应用"
 	a.emitLog("warn", message)
-	runtime.EventsEmit(a.ctx, "quit:confirm", message)
+	a.runtimeEvents("quit:confirm", message)
 	return true
 }
 
 // ShowWindow shows the main window
 func (a *App) ShowWindow() {
-	runtime.Show(a.ctx)
-	runtime.WindowShow(a.ctx)
-	runtime.WindowUnminimise(a.ctx)
+	runtime.Show(a.wailsCtx())
+	runtime.WindowShow(a.wailsCtx())
+	runtime.WindowUnminimise(a.wailsCtx())
 }
 
 // HideWindow hides the main window
 func (a *App) HideWindow() {
-	runtime.Hide(a.ctx)
+	runtime.Hide(a.wailsCtx())
 }
 
 // MinimizeWindow minimises the main window.
 func (a *App) MinimizeWindow() {
-	runtime.WindowMinimise(a.ctx)
+	runtime.WindowMinimise(a.wailsCtx())
 }
 
 func (a *App) beginQuit() {
@@ -320,7 +374,7 @@ func (a *App) GetAppVersion() string {
 // RequestQuitShortcut requires two shortcut presses to avoid accidental exits.
 func (a *App) RequestQuitShortcut() {
 	a.ShowWindow()
-	runtime.EventsEmit(a.ctx, "app:confirm-force-quit")
+	a.runtimeEvents("app:confirm-force-quit")
 }
 
 func (a *App) forceQuit() {
@@ -338,7 +392,7 @@ func (a *App) forceQuit() {
 	done := make(chan struct{})
 	go func() {
 		if err := a.StopProxy(); err != nil {
-			runtime.LogWarningf(a.ctx, "stop proxy before exit failed: %v", err)
+			runtime.LogWarningf(a.wailsCtx(), "stop proxy before exit failed: %v", err)
 		}
 		close(done)
 	}()
@@ -346,7 +400,7 @@ func (a *App) forceQuit() {
 	select {
 	case <-done:
 	case <-time.After(1200 * time.Millisecond):
-		runtime.LogWarning(a.ctx, "force quit continuing before proxy shutdown completed")
+		runtime.LogWarning(a.wailsCtx(), "force quit continuing before proxy shutdown completed")
 	}
 	os.Exit(0)
 }
@@ -376,7 +430,7 @@ func (a *App) emitLogWithSource(source string, level string, message string) {
 	}
 	a.saveAppStateLocked()
 	a.mu.Unlock()
-	runtime.EventsEmit(a.ctx, "log", entry)
+	a.runtimeEvents("log", entry)
 	a.publishEvent("log", entry)
 }
 
@@ -434,7 +488,9 @@ func (a *App) GetDetectionInfo() DetectionInfo {
 	a.mu.RUnlock()
 
 	if strings.TrimSpace(addr) == "" {
-		addr = fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+		// A blank host yields no listen URL rather than one that claims the
+		// proxy is reachable on every interface.
+		addr, _ = listenAddr(cfg.Host, cfg.Port)
 	}
 	backend := cfg.Backend
 	if svc != nil {
@@ -443,13 +499,15 @@ func (a *App) GetDetectionInfo() DetectionInfo {
 	baseURL := remote.ResolveBaseURLWithSource(cfg.RemoteBaseURL)
 	proxyURL, proxySource := remote.ProxySource(cfg.RemoteProxyURL)
 	info := DetectionInfo{
-		ListenURL:           "http://" + addr,
 		Backend:             string(backend),
 		BackendLabel:        backendLabel(backend),
 		RemoteBaseURL:       baseURL.URL,
 		RemoteBaseURLSource: baseURL.Source,
 		RemoteProxyURL:      proxyURL,
 		RemoteProxySource:   proxySource,
+	}
+	if addr != "" {
+		info.ListenURL = "http://" + addr
 	}
 	if err := remote.ValidateProxyURL(proxyURL); err != nil {
 		info.RemoteProxyError = err.Error()
@@ -484,11 +542,27 @@ func (a *App) GetDetectionInfo() DetectionInfo {
 	return info
 }
 
+// listenAddr formats the proxy bind address and refuses a blank host. Go reads
+// ":8095" as every interface, so an empty setting would expose the
+// unauthenticated proxy - with its recorded conversation bodies - to the
+// network. Public listening stays opt-in with an explicit 0.0.0.0.
+func listenAddr(host string, port int) (string, error) {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "", fmt.Errorf("listen host is empty: this proxy has no auth, so leaving the host blank would bind every interface -- write 127.0.0.1 for local use or 0.0.0.0 deliberately")
+	}
+	if port < 1 || port > 65535 {
+		return "", fmt.Errorf("invalid listen port %d: keep the value the clients are configured with", port)
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
 // UpdateConfig updates the configuration, saves to file, and restarts the proxy if running.
 // Frontend sends Timeout in seconds; we convert to time.Duration.
 func (a *App) UpdateConfig(cfg service.Config) error {
-	if cfg.Port < 1 || cfg.Port > 65535 {
-		return fmt.Errorf("invalid listen port %d: keep the value the clients are configured with", cfg.Port)
+	newAddr, err := listenAddr(cfg.Host, cfg.Port)
+	if err != nil {
+		return err
 	}
 	if err := remote.ValidateProxyURL(cfg.RemoteProxyURL); err != nil {
 		return err
@@ -510,23 +584,67 @@ func (a *App) UpdateConfig(cfg service.Config) error {
 
 	a.mu.Lock()
 	wasRunning := a.running
+	previous := a.cfg
+	previousAddr := a.addr
 	a.cfg = cfg
 	a.mu.Unlock()
 
 	if err := a.saveConfig(cfg); err != nil {
-		runtime.LogWarningf(a.ctx, "failed to save config: %v", err)
+		runtime.LogWarningf(a.wailsCtx(), "failed to save config: %v", err)
 		a.emitLog("warn", fmt.Sprintf("Config updated but failed to save: %v", err))
 	} else {
 		a.emitLog("info", "Config saved to file")
 	}
 
-	if wasRunning {
-		if err := a.StopProxy(); err != nil {
-			return fmt.Errorf("stop failed: %w", err)
+	if !wasRunning {
+		return nil
+	}
+
+	// Bind the replacement listener before releasing the live one, so an
+	// unbindable port cannot leave the app with no proxy at all. The same
+	// address cannot be pre-bound: our own listener still holds it.
+	var prebound net.Listener
+	if newAddr != previousAddr {
+		ln, err := net.Listen("tcp", newAddr)
+		if err != nil {
+			return fmt.Errorf("new listen address %s is unavailable: %w; the proxy keeps running on %s", newAddr, err, previousAddr)
 		}
-		return a.StartProxy()
+		prebound = ln
+	}
+
+	if err := a.StopProxy(); err != nil {
+		if prebound != nil {
+			_ = prebound.Close()
+		}
+		return fmt.Errorf("stop failed: %w", err)
+	}
+	if err := a.startProxy(prebound); err != nil {
+		return fmt.Errorf("restart with the new config failed: %w; %s", err, a.restorePreviousConfig(previous))
 	}
 	return nil
+}
+
+// restorePreviousConfig puts the settings that were serving clients back into
+// memory and onto disk and starts the proxy on them, so a port the new config
+// cannot bind does not strand every client until the user guesses another
+// value. It returns the outcome, for the caller to report alongside the
+// original failure.
+func (a *App) restorePreviousConfig(previous service.Config) string {
+	a.mu.Lock()
+	a.cfg = previous
+	a.mu.Unlock()
+	saveErr := a.saveConfig(previous)
+	startErr := a.startProxy(nil)
+	switch {
+	case startErr != nil && saveErr != nil:
+		return fmt.Sprintf("the rollback failed too: the previous config could not be saved (%v) and could not be started (%v)", saveErr, startErr)
+	case startErr != nil:
+		return fmt.Sprintf("the rollback failed too: the previous config could not be started (%v)", startErr)
+	case saveErr != nil:
+		return fmt.Sprintf("rolled back to the previous config and restarted, but saving it failed: %v", saveErr)
+	default:
+		return "rolled back to the previous config and restarted"
+	}
 }
 
 func (a *App) saveConfig(cfg service.Config) error {
@@ -553,9 +671,14 @@ func (a *App) saveConfig(cfg service.Config) error {
 		"remote_fallback_enabled": cfg.RemoteFallbackEnabled,
 		"remote_fallback_models":  cfg.RemoteFallbackModels,
 	}
-	if len(cfg.QoderCLISites) > 0 {
-		settings["qodercli_sites"] = cfg.QoderCLISites
+	// Written even when empty: saving merges into the existing file to keep keys
+	// this app does not own, so omitting the key would let a cleared site set
+	// come back from the old value on the next start.
+	sites := cfg.QoderCLISites
+	if sites == nil {
+		sites = []string{}
 	}
+	settings["qodercli_sites"] = sites
 
 	path := instanceProfileValue().configPath
 	if path == "" {
@@ -589,16 +712,31 @@ func (a *App) saveConfig(cfg service.Config) error {
 
 // StartProxy starts the lingma-ipc-proxy HTTP server
 func (a *App) StartProxy() error {
-	a.mu.Lock()
-	if a.running {
-		a.mu.Unlock()
+	return a.startProxy(nil)
+}
+
+// startProxy serves the proxy on prebound when the caller already bound the
+// configured address. Binding before releasing the previous listener is what
+// keeps an unusable port from taking the live proxy down with it.
+func (a *App) startProxy(prebound net.Listener) error {
+	a.mu.RLock()
+	cfg := a.cfg
+	alreadyRunning := a.running
+	a.mu.RUnlock()
+	// Best effort, so a second click does not pay for the proxy probe and the
+	// service build below; the authoritative check is inside the claim.
+	if alreadyRunning {
+		closeListener(prebound)
 		return fmt.Errorf("proxy already running")
 	}
 
-	addr := fmt.Sprintf("%s:%d", a.cfg.Host, a.cfg.Port)
-	cfg := a.cfg
-	a.mu.Unlock()
+	addr, err := listenAddr(cfg.Host, cfg.Port)
+	if err != nil {
+		closeListener(prebound)
+		return err
+	}
 	if err := remote.ValidateProxyURL(cfg.RemoteProxyURL); err != nil {
+		closeListener(prebound)
 		return err
 	}
 
@@ -634,41 +772,34 @@ func (a *App) StartProxy() error {
 		a.accumulateTokenStatsLocked(record)
 		a.saveAppStateLocked()
 		a.mu.Unlock()
-		runtime.EventsEmit(a.ctx, "requests:updated")
+		a.runtimeEvents("requests:updated")
 		a.publishEvent("requests:updated", nil)
 		stats := a.GetTokenStats()
-		runtime.EventsEmit(a.ctx, "usage:updated", stats)
+		a.runtimeEvents("usage:updated", stats)
 		a.publishEvent("usage:updated", stats)
 	}
 
+	// Claim this generation and bind it in one critical section. A listener that
+	// exists but is not yet claimed lets a concurrent StopProxy return nil
+	// having done nothing, which used to leave the previous configuration
+	// serving while a.cfg and the file on disk already described the next one.
 	a.mu.Lock()
 	if a.running {
 		a.mu.Unlock()
+		closeListener(prebound)
 		return fmt.Errorf("proxy already running")
 	}
-	a.mu.Unlock()
-
-	// Bind here and serve on that listener: probing the port, closing it and
-	// calling ListenAndServe left a window where another process could take it.
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("port %s is already in use: %w", addr, err)
-	}
-
-	go func() {
-		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
-			runtime.LogErrorf(a.ctx, "server error: %v", err)
-			a.emitLog("error", fmt.Sprintf("Server error: %v", err))
-			a.mu.Lock()
-			a.running = false
-			a.svc = nil
-			a.addr = ""
-			a.startedAt = time.Time{}
+	ln := prebound
+	if ln == nil {
+		// Bind here and serve on that listener: probing the port, closing it
+		// and calling ListenAndServe left a window where another process could
+		// take it.
+		ln, err = net.Listen("tcp", addr)
+		if err != nil {
 			a.mu.Unlock()
+			return fmt.Errorf("port %s is already in use: %w", addr, err)
 		}
-	}()
-
-	a.mu.Lock()
+	}
 	a.server = server
 	a.svc = svc
 	a.addr = addr
@@ -676,8 +807,26 @@ func (a *App) StartProxy() error {
 	a.startedAt = time.Now()
 	a.mu.Unlock()
 
+	go func() {
+		err := server.Serve(ln)
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
+			return
+		}
+		// StopProxy closing the listener surfaces here as well, so a generation
+		// that is no longer ours stays out of the logs.
+		a.mu.RLock()
+		ours := a.svc == svc
+		a.mu.RUnlock()
+		if !ours {
+			return
+		}
+		runtime.LogErrorf(a.wailsCtx(), "server error: %v", err)
+		a.emitLog("error", fmt.Sprintf("Server error: %v", err))
+		a.releaseProxy(svc)
+	}()
+
 	msg := fmt.Sprintf("Proxy started on http://%s", addr)
-	runtime.LogInfof(a.ctx, msg)
+	runtime.LogInfof(a.wailsCtx(), msg)
 	a.emitLog("info", msg)
 
 	// Fetching /v1/models warms up the selected backend and refreshes the model
@@ -687,7 +836,7 @@ func (a *App) StartProxy() error {
 		hasCachedModels := a.hasModels()
 		models, err := a.fetchModelsWithRetry(addr, startupModelProbeTimeout(cfg, hasCachedModels), startupModelProbeAttempts(hasCachedModels), 750*time.Millisecond)
 		if err != nil {
-			runtime.LogWarningf(a.ctx, "startup model refresh failed: %v", err)
+			runtime.LogWarningf(a.wailsCtx(), "startup model refresh failed: %v", err)
 			if !hasCachedModels {
 				a.emitLog("warn", fmt.Sprintf("模型自动探测失败：%v", err))
 			}
@@ -695,12 +844,38 @@ func (a *App) StartProxy() error {
 		}
 		// cfg.Backend is what the user configured; the model fetch above is what
 		// makes the service resolve a "remote" config onto the CLI.
-		runtime.LogInfof(a.ctx, "%s warmup completed", backendLabel(svc.Backend()))
+		runtime.LogInfof(a.wailsCtx(), "%s warmup completed", backendLabel(svc.Backend()))
 		a.emitLog("info", fmt.Sprintf("%s warmup completed", backendLabel(svc.Backend())))
 		_ = models
 	}()
 
 	return nil
+}
+
+// releaseProxy retires the running generation, but only while svc is still in
+// charge: a late failure from a server the user already replaced must not wipe
+// the newer state.
+func (a *App) releaseProxy(svc *service.Service) {
+	a.mu.Lock()
+	// Only the generation still in charge may retire itself: a serve failure
+	// reported by a server that was already replaced must not blank the running
+	// one's claim.
+	if a.svc != nil && a.svc != svc {
+		a.mu.Unlock()
+		return
+	}
+	a.running = false
+	a.server = nil
+	a.svc = nil
+	a.addr = ""
+	a.startedAt = time.Time{}
+	a.mu.Unlock()
+}
+
+func closeListener(ln net.Listener) {
+	if ln != nil {
+		_ = ln.Close()
+	}
 }
 
 // GetLogSummaries returns recent logs with truncated messages for lightweight list rendering.
@@ -775,7 +950,7 @@ func (a *App) ClearLogs() {
 	a.saveAppStateLocked()
 	a.mu.Unlock()
 	summaries := a.GetLogSummaries()
-	runtime.EventsEmit(a.ctx, "logs:updated", summaries)
+	a.runtimeEvents("logs:updated", summaries)
 	a.publishEvent("logs:updated", summaries)
 }
 
@@ -787,7 +962,7 @@ func (a *App) ChooseFeedbackExportPath() (string, error) {
 	if err := os.MkdirAll(filepath.Dir(defaultPath), 0755); err != nil {
 		return "", err
 	}
-	return runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	return runtime.SaveFileDialog(a.wailsCtx(), runtime.SaveDialogOptions{
 		Title:                "保存反馈日志包",
 		DefaultDirectory:     filepath.Dir(defaultPath),
 		DefaultFilename:      filepath.Base(defaultPath),
@@ -950,7 +1125,7 @@ func (a *App) chooseServerDeploymentExportPath() (string, error) {
 	if err := os.MkdirAll(filepath.Dir(defaultPath), 0755); err != nil {
 		return "", err
 	}
-	return runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+	return runtime.SaveFileDialog(a.wailsCtx(), runtime.SaveDialogOptions{
 		Title:                "保存服务器部署包",
 		DefaultDirectory:     filepath.Dir(defaultPath),
 		DefaultFilename:      filepath.Base(defaultPath),
@@ -1008,7 +1183,7 @@ func (a *App) StopProxy() error {
 	a.mu.Unlock()
 
 	status := a.GetStatus()
-	runtime.EventsEmit(a.ctx, "status:updated", status)
+	a.runtimeEvents("status:updated", status)
 	a.publishEvent("status:updated", status)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1019,7 +1194,7 @@ func (a *App) StopProxy() error {
 		return err
 	}
 
-	runtime.LogInfo(a.ctx, "proxy stopped")
+	runtime.LogInfo(a.wailsCtx(), "proxy stopped")
 	a.emitLog("info", "Proxy stopped")
 	return nil
 }
@@ -1076,7 +1251,7 @@ func (a *App) ClearRequests() {
 	a.requests = nil
 	a.saveAppStateLocked()
 	a.mu.Unlock()
-	runtime.EventsEmit(a.ctx, "requests:updated")
+	a.runtimeEvents("requests:updated")
 	a.publishEvent("requests:updated", nil)
 	a.emitLog("info", "Request history cleared")
 }
@@ -1156,7 +1331,9 @@ func (a *App) SelectModel(modelID string) (ProxyStatus, error) {
 	}
 
 	a.mu.Lock()
-	found := len(a.models) == 0
+	// An empty list means startup detection has not finished, not that any string
+	// is valid: otherwise a typo becomes the persisted default model.
+	found := false
 	for _, model := range a.models {
 		if model.ID == modelID {
 			found = true
@@ -1196,7 +1373,7 @@ func (a *App) fetchModels(addr string, timeout time.Duration) ([]ModelInfo, erro
 	client := &http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		runtime.LogWarningf(a.ctx, "fetch models failed: %v", err)
+		runtime.LogWarningf(a.wailsCtx(), "fetch models failed: %v", err)
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("模型探测超时（%ds）", int(timeout.Seconds()))
 		}
@@ -1211,7 +1388,7 @@ func (a *App) fetchModels(addr string, timeout time.Duration) ([]ModelInfo, erro
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		runtime.LogWarningf(a.ctx, "decode models failed: %v", err)
+		runtime.LogWarningf(a.wailsCtx(), "decode models failed: %v", err)
 		return nil, err
 	}
 
@@ -1229,7 +1406,7 @@ func (a *App) fetchModels(addr string, timeout time.Duration) ([]ModelInfo, erro
 	a.mu.Unlock()
 
 	if changed {
-		runtime.EventsEmit(a.ctx, "models:updated", models)
+		a.runtimeEvents("models:updated", models)
 		a.publishEvent("models:updated", models)
 	}
 	if changed && len(models) > 0 {
@@ -1329,6 +1506,9 @@ func (a *App) loadAppState() error {
 	if a.stats.ByModel == nil {
 		a.stats.ByModel = map[string]int{}
 	}
+	// A file written before the key cap existed is folded down here, so the
+	// per-request clone in GetTokenStats stops paying for it.
+	foldModelKeysLocked(&a.stats, statsModelKeyLimit)
 	a.reconcileTokenStatsLocked()
 	if migrated {
 		a.flushAppStateLocked()
@@ -1337,12 +1517,30 @@ func (a *App) loadAppState() error {
 }
 
 func (a *App) saveAppStateLocked() {
-	a.stateFlushAt = time.Now().Add(appStateFlushInterval)
-	if a.stateFlushTimer != nil {
-		a.stateFlushTimer.Reset(appStateFlushInterval)
+	now := time.Now()
+	if a.stateDirtySince.IsZero() {
+		a.stateDirtySince = now
+	}
+	// The debounce exists to coalesce a burst of writes into one file rewrite,
+	// but a streaming coding session writes every 1-2s forever, so a debounce
+	// that only ever pushed the deadline forward never fired and a crash cost
+	// the whole session. Schedule at the earlier of one interval from now and
+	// the ceiling measured from when the state first went dirty.
+	at := now.Add(appStateFlushInterval)
+	if ceiling := a.stateDirtySince.Add(appStateFlushMaxDelay); ceiling.Before(at) {
+		at = ceiling
+	}
+	a.stateFlushAt = at
+	delay := time.Until(at)
+	if delay <= 0 {
+		a.flushAppStateLocked()
 		return
 	}
-	a.stateFlushTimer = time.AfterFunc(appStateFlushInterval, func() {
+	if a.stateFlushTimer != nil {
+		a.stateFlushTimer.Reset(delay)
+		return
+	}
+	a.stateFlushTimer = time.AfterFunc(delay, func() {
 		a.mu.Lock()
 		defer a.mu.Unlock()
 		if time.Now().Before(a.stateFlushAt) {
@@ -1352,21 +1550,10 @@ func (a *App) saveAppStateLocked() {
 	})
 }
 
-func (a *App) flushAppStateLocked() {
-	if a.stateFlushTimer != nil {
-		a.stateFlushTimer.Stop()
-		a.stateFlushTimer = nil
-	}
-	a.stateFlushAt = time.Time{}
-	path, err := appStatePath()
-	if err != nil {
-		runtime.LogWarningf(a.ctx, "resolve app state path failed: %v", err)
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		runtime.LogWarningf(a.ctx, "create app state dir failed: %v", err)
-		return
-	}
+// renderAppStateLocked clones the persisted state and marshals it. It is separate
+// from the write so the two costs can be measured apart: Stats.ByModel is a live
+// map, so anything that marshals off a.mu has to clone it first.
+func (a *App) renderAppStateLocked() ([]byte, bool) {
 	state := appStateFile{
 		Requests:   trimPersistedRequests(a.requests),
 		Logs:       trimPersistedLogs(a.logs),
@@ -1376,12 +1563,35 @@ func (a *App) flushAppStateLocked() {
 	}
 	data, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
-		runtime.LogWarningf(a.ctx, "marshal app state failed: %v", err)
+		runtime.LogWarningf(a.wailsCtx(), "marshal app state failed: %v", err)
+		return nil, false
+	}
+	return data, true
+}
+
+func (a *App) flushAppStateLocked() {
+	if a.stateFlushTimer != nil {
+		a.stateFlushTimer.Stop()
+		a.stateFlushTimer = nil
+	}
+	a.stateFlushAt = time.Time{}
+	a.stateDirtySince = time.Time{}
+	path, err := appStatePath()
+	if err != nil {
+		runtime.LogWarningf(a.wailsCtx(), "resolve app state path failed: %v", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		runtime.LogWarningf(a.wailsCtx(), "create app state dir failed: %v", err)
+		return
+	}
+	data, ok := a.renderAppStateLocked()
+	if !ok {
 		return
 	}
 	// The console bearer token lives here, so the file must not be world-readable.
 	if err := os.WriteFile(path, data, 0600); err != nil {
-		runtime.LogWarningf(a.ctx, "write app state failed: %v", err)
+		runtime.LogWarningf(a.wailsCtx(), "write app state failed: %v", err)
 	} else {
 		_ = os.Chmod(path, 0600)
 	}
@@ -1424,25 +1634,12 @@ func trimPersistedLogs(records []AppLog) []AppLog {
 	return out
 }
 
-func trimStatePayload(text string) string {
-	if len(text) <= appStatePersistBodyLimit {
-		return text
-	}
-	return text[:appStatePersistBodyLimit] + "\n... [truncated for desktop state cache]"
-}
-
 func trimListMessage(text string) string {
 	trimmed := strings.TrimSpace(text)
 	if len(trimmed) <= listSummaryMessageLimit {
 		return trimmed
 	}
 	return trimmed[:listSummaryMessageLimit] + "..."
-}
-
-func summarizeLogEntry(entry AppLog) AppLog {
-	cloned := entry
-	cloned.Message = trimListMessage(entry.Message)
-	return cloned
 }
 
 func appStatePath() (string, error) {
@@ -1469,15 +1666,63 @@ func (a *App) accumulateTokenStatsLocked(record RequestRecord) {
 	}
 	model := strings.TrimSpace(record.Model)
 	if model == "" {
-		model = "-"
+		model = statsOverflowModel
 	}
 	if record.TotalTokens > 0 {
+		// The key comes straight out of the request body, so a client can invent
+		// an unlimited number of them. Cap the set and fold the rest into the
+		// overflow bucket: every unread path that clones this map, including
+		// GetTokenStats on each request, would otherwise grow with them.
 		a.stats.ByModel[model] += record.TotalTokens
-		if isUsageBearingRequest(record.Path) && model != "-" {
+		if len(a.stats.ByModel) > statsModelKeyLimit {
+			foldModelKeysLocked(&a.stats, statsModelKeyLimit)
+		}
+		if isUsageBearingRequest(record.Path) && model != statsOverflowModel {
 			a.stats.LastModel = model
 		}
 	}
 	a.stats.LastUpdated = time.Now().Format(time.RFC3339)
+}
+
+// foldModelKeysLocked caps a stats map that grew past the limit under an older
+// build: the biggest buckets survive, the rest merge into the overflow bucket.
+// Sorted by size then name because Go map order is not, so the same file folds
+// to the same result every start.
+func foldModelKeysLocked(stats *TokenStats, limit int) {
+	if stats.ByModel == nil || len(stats.ByModel) <= limit {
+		return
+	}
+	type modelTotal struct {
+		model  string
+		tokens int
+	}
+	items := make([]modelTotal, 0, len(stats.ByModel))
+	overflow := stats.ByModel[statsOverflowModel]
+	delete(stats.ByModel, statsOverflowModel)
+	for model, tokens := range stats.ByModel {
+		items = append(items, modelTotal{model: model, tokens: tokens})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].tokens != items[j].tokens {
+			return items[i].tokens > items[j].tokens
+		}
+		return items[i].model < items[j].model
+	})
+	keep := limit - 1
+	if keep > len(items) {
+		keep = len(items)
+	}
+	for _, item := range items[keep:] {
+		overflow += item.tokens
+	}
+	folded := make(map[string]int, limit)
+	for _, item := range items[:keep] {
+		folded[item.model] = item.tokens
+	}
+	if overflow > 0 {
+		folded[statsOverflowModel] = overflow
+	}
+	stats.ByModel = folded
 }
 
 func (a *App) reconcileTokenStatsLocked() {
@@ -2191,7 +2436,11 @@ func defaultConfig() service.Config {
 					QoderCLISites         []string `json:"qodercli_sites"`
 				}
 				if err := json.Unmarshal(data, &fileCfg); err == nil {
-					if fileCfg.Host != "" {
+					// A blank host keeps the loopback default instead of landing
+					// in the config: it would format as ":8095", which is every
+					// interface. startup re-saves this default, so an old file
+					// with an empty host heals on the next start.
+					if strings.TrimSpace(fileCfg.Host) != "" {
 						cfg.Host = fileCfg.Host
 					}
 					if fileCfg.Port > 0 {
@@ -2367,11 +2616,4 @@ func defaultShellType() string {
 
 func transportFallbackHint() string {
 	return "请确认 Lingma / QoderCN 已启动并登录；如果自动探测失败，请到设置页手动填写：远端 API 官方默认域名 https://lingma.alibabacloud.com，企业版请填写你的专属域名；macOS WebSocket 示例 ws://127.0.0.1:36510/，macOS Socket 示例 ~/Library/Application Support/QoderCN/SharedClientCache/qodercn.sock，Windows Named Pipe 示例 \\\\.\\pipe\\lingma-xxxx 或 \\\\.\\pipe\\qodercn-xxxx。"
-}
-
-func warmupFallbackHint(backend service.BackendMode) string {
-	if backend == service.BackendRemote {
-		return "请检查设置页“当前解析结果”里的远端域名是否为官方或企业专属 API 域名；如果出现 OSS/静态资源域名或模型列表 404，请手动填写远端 API 官方默认域名 https://lingma.alibabacloud.com，企业版请填写你的专属域名，并确认登录态未过期。"
-	}
-	return "请确认 Lingma / QoderCN 已启动并登录；如果自动探测失败，请到设置页手动填写：macOS WebSocket 示例 ws://127.0.0.1:36510/，macOS Socket 示例 ~/Library/Application Support/QoderCN/SharedClientCache/qodercn.sock，Windows Named Pipe 示例 \\\\.\\pipe\\lingma-xxxx 或 \\\\.\\pipe\\qodercn-xxxx。"
 }

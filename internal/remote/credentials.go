@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -73,7 +74,9 @@ func LoadCredentialByPolicy(authFile string, policy CredentialPickPolicy) (Crede
 	var best credentialCandidate
 	var attempts []credentialLoadAttempt
 	for _, cacheDir := range candidateLingmaCacheDirs() {
-		candidate, err := loadCredentialCandidate(cacheDir)
+		// Explicit tooling asks for the truth about this machine right now, so it
+		// keeps the uncached log scan.
+		candidate, err := loadCredentialCandidate(cacheDir, false)
 		if err != nil {
 			attempts = append(attempts, credentialLoadAttempt{Path: cacheDir, Err: err})
 			continue
@@ -141,7 +144,7 @@ func InspectCredentialCandidates() []CredentialInspection {
 			Source:             userPath,
 			UserFileModifiedAt: userInfo.ModTime().Format(time.RFC3339),
 		}
-		candidate, err := loadCredentialCandidate(cacheDir)
+		candidate, err := loadCredentialCandidate(cacheDir, false)
 		if err != nil {
 			inspection.Error = compactCredentialError(err)
 			inspections = append(inspections, inspection)
@@ -185,7 +188,7 @@ func loadCredentialFile(path string) (Credential, error) {
 func importLingmaCacheCredential() (Credential, error) {
 	var attempts []credentialLoadAttempt
 	for _, lingmaDir := range candidateLingmaCacheDirs() {
-		cred, err := importLingmaCacheCredentialFromDir(lingmaDir)
+		cred, err := importLingmaCacheCredentialFromDir(lingmaDir, true)
 		if err == nil {
 			return cred, nil
 		}
@@ -202,13 +205,13 @@ type credentialCandidate struct {
 	UserModified time.Time
 }
 
-func loadCredentialCandidate(cacheDir string) (credentialCandidate, error) {
+func loadCredentialCandidate(cacheDir string, memoizeMachineID bool) (credentialCandidate, error) {
 	userPath := filepath.Join(cacheDir, "cache", "user")
 	info, err := os.Stat(userPath)
 	if err != nil {
 		return credentialCandidate{}, err
 	}
-	cred, err := importLingmaCacheCredentialFromDir(cacheDir)
+	cred, err := importLingmaCacheCredentialFromDir(cacheDir, memoizeMachineID)
 	if err != nil {
 		return credentialCandidate{}, err
 	}
@@ -226,13 +229,13 @@ func betterCredentialCandidate(candidate, best credentialCandidate, policy Crede
 	}
 }
 
-func importLingmaCacheCredentialFromDir(lingmaDir string) (Credential, error) {
+func importLingmaCacheCredentialFromDir(lingmaDir string, memoizeMachineID bool) (Credential, error) {
 	userPath := filepath.Join(lingmaDir, "cache", "user")
 	encrypted, err := os.ReadFile(userPath)
 	if err != nil {
 		return Credential{}, fmt.Errorf("read %s: %w", userPath, err)
 	}
-	machineID, err := loadMachineID(lingmaDir)
+	machineID, err := machineIDForCredentialDir(lingmaDir, memoizeMachineID)
 	if err != nil {
 		return Credential{}, err
 	}
@@ -397,6 +400,24 @@ func compactCredentialPath(path string) string {
 	return filepath.Join("...", filepath.Join(parts[len(parts)-3:]...))
 }
 
+// machineIDForCredentialDir picks between the TTL-protected scan used on the
+// request path and the uncached scan the inspect/policy entry points ask for.
+func machineIDForCredentialDir(lingmaDir string, memoizeMachineID bool) (string, error) {
+	if memoizeMachineID {
+		return loadMachineID(lingmaDir)
+	}
+	for _, path := range candidateMachineIDFiles(lingmaDir) {
+		if body, err := os.ReadFile(path); err == nil {
+			if value := strings.TrimSpace(string(body)); value != "" {
+				return value, nil
+			}
+		}
+	}
+	return loadMachineIDFromLogs(lingmaDir)
+}
+
+// loadMachineID resolves the id that decrypts cache/user. Only the cheap direct
+// files are read per request; the log walk behind them is memoized.
 func loadMachineID(lingmaDir string) (string, error) {
 	for _, path := range candidateMachineIDFiles(lingmaDir) {
 		if body, err := os.ReadFile(path); err == nil {
@@ -405,7 +426,14 @@ func loadMachineID(lingmaDir string) (string, error) {
 			}
 		}
 	}
+	return memoizedMachineIDFromLogs(lingmaDir)
+}
 
+// loadMachineIDFromLogs walks every candidate IDE log directory for the machine id.
+// It is the unbounded scan: measured against thousands of log files on a box with
+// busy CLI log rotation, so it only runs behind a TTL on the request path, or
+// straight through for the explicit inspect/policy entry points.
+func loadMachineIDFromLogs(lingmaDir string) (string, error) {
 	for _, path := range candidateMachineIDLogFiles(lingmaDir) {
 		body, err := os.ReadFile(path)
 		if err != nil {
@@ -417,6 +445,63 @@ func loadMachineID(lingmaDir string) (string, error) {
 	}
 
 	return "", errors.New("remote credential requires cache/id, cli/.auth/id, or Lingma/QoderCN log machine id; checked cache/id, cli auth id, app logs, and IDE shared client logs")
+}
+
+// A machine that has cache/user but neither cache/id nor cli/.auth/id reaches the
+// log walk on every Chat and ListModels, because both load the credential first.
+// The id only moves when an IDE profile is re-created, so reuse the answer briefly.
+const (
+	machineIDLogFallbackTTL    = 5 * time.Minute
+	machineIDLogFallbackMaxLen = 8
+)
+
+type machineIDLogFallbackEntry struct {
+	value    string
+	errText  string
+	resolved time.Time
+}
+
+var (
+	machineIDLogFallbackMu    sync.Mutex
+	machineIDLogFallbackCache = map[string]machineIDLogFallbackEntry{}
+)
+
+func memoizedMachineIDFromLogs(lingmaDir string) (string, error) {
+	machineIDLogFallbackMu.Lock()
+	defer machineIDLogFallbackMu.Unlock()
+	if entry, ok := machineIDLogFallbackCache[lingmaDir]; ok && time.Since(entry.resolved) < machineIDLogFallbackTTL {
+		if entry.errText == "" {
+			return entry.value, nil
+		}
+		return "", errors.New(entry.errText)
+	}
+	value, err := loadMachineIDFromLogs(lingmaDir)
+	entry := machineIDLogFallbackEntry{value: value, resolved: time.Now()}
+	if err != nil {
+		entry.errText = err.Error()
+	}
+	setMachineIDLogFallback(lingmaDir, entry)
+	if err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+// ponytail: fixed-size cache that drops the oldest answer; the candidate dirs are a
+// handful per machine, so this never thrashes. Failures are cached for the same TTL,
+// which caps how long a freshly started IDE stays invisible at five minutes.
+func setMachineIDLogFallback(lingmaDir string, entry machineIDLogFallbackEntry) {
+	if _, ok := machineIDLogFallbackCache[lingmaDir]; !ok && len(machineIDLogFallbackCache) >= machineIDLogFallbackMaxLen {
+		oldestKey := ""
+		var oldest time.Time
+		for key, existing := range machineIDLogFallbackCache {
+			if oldestKey == "" || existing.resolved.Before(oldest) {
+				oldestKey, oldest = key, existing.resolved
+			}
+		}
+		delete(machineIDLogFallbackCache, oldestKey)
+	}
+	machineIDLogFallbackCache[lingmaDir] = entry
 }
 
 func candidateMachineIDFiles(lingmaDir string) []string {

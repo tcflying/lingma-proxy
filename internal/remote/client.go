@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"lingma-ipc-proxy/internal/toolemulation"
 )
@@ -245,36 +246,68 @@ func scanBaseURLCandidates() []BaseURLHint {
 			hints = append(hints, BaseURLHint{URL: strings.TrimRight(value, "/"), Source: path})
 		}
 	}
+	// The official endpoint joins the ranking before it is sorted, so a host that
+	// carries no signal (score 0) cannot take first place over it.
+	hints = append(hints, BaseURLHint{URL: DefaultBaseURL, Source: "default"})
 	hints = sortBaseURLHints(uniqueBaseURLHints(hints))
-	if cached := cachedBaseURLHint(); cached.URL != "" {
-		hints = uniqueBaseURLHints(append([]BaseURLHint{cached}, hints...))
+	cached, fresh := cachedBaseURLHintAndFreshness()
+	if cached.URL == "" {
+		return hints
 	}
-	for _, hint := range hints {
-		if hint.URL == DefaultBaseURL {
-			return hints
-		}
+	if !fresh {
+		// A domain nobody re-confirmed for cachedBaseURLHintMaxAge stays a
+		// last-resort candidate for the probe fallback instead of pinning every
+		// signed request to it.
+		return uniqueBaseURLHints(append(hints, cached))
 	}
-	return append(hints, BaseURLHint{URL: DefaultBaseURL, Source: "default"})
+	// Sort after prepending: the fresh cache wins ties with the configured hints,
+	// a better-scoring one still gets the first request.
+	return sortBaseURLHints(uniqueBaseURLHints(append([]BaseURLHint{cached}, hints...)))
 }
 
+// cachedBaseURLHintMaxAge bounds how long a domain that merely answered 200 once
+// keeps priority. Nothing refreshes the stamp while the same domain keeps working,
+// so without a leash an operator that moves the tenant stays pointed at the old
+// endpoint -- with signed credential headers -- for as long as it answers 200.
+const cachedBaseURLHintMaxAge = 30 * 24 * time.Hour
+
 func cachedBaseURLHint() BaseURLHint {
+	hint, _ := readBaseURLCacheFile()
+	return hint
+}
+
+func cachedBaseURLHintAndFreshness() (BaseURLHint, bool) {
+	hint, updatedAt := readBaseURLCacheFile()
+	if hint.URL == "" {
+		return BaseURLHint{}, false
+	}
+	// Files written before the stamp existed are treated as fresh; the next
+	// successful probe rewrites them.
+	if !updatedAt.IsZero() && time.Since(updatedAt) > cachedBaseURLHintMaxAge {
+		return hint, false
+	}
+	return hint, true
+}
+
+func readBaseURLCacheFile() (BaseURLHint, time.Time) {
 	path, err := baseURLCachePath()
 	if err != nil {
-		return BaseURLHint{}
+		return BaseURLHint{}, time.Time{}
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return BaseURLHint{}
+		return BaseURLHint{}, time.Time{}
 	}
 	var cache baseURLCacheFile
 	if err := json.Unmarshal(data, &cache); err != nil {
-		return BaseURLHint{}
+		return BaseURLHint{}, time.Time{}
 	}
 	url := normalizeRemoteBaseURLHint(cache.URL)
 	if url == "" {
-		return BaseURLHint{}
+		return BaseURLHint{}, time.Time{}
 	}
-	return BaseURLHint{URL: url, Source: "last successful remote domain"}
+	updatedAt, _ := time.Parse(time.RFC3339, strings.TrimSpace(cache.UpdatedAt))
+	return BaseURLHint{URL: url, Source: "last successful remote domain"}, updatedAt
 }
 
 func cacheSuccessfulBaseURL(raw string) {
@@ -445,13 +478,30 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("remote chat status %d: %s", resp.StatusCode, truncate(string(respBody), 1000))
+		message := fmt.Sprintf("remote chat status %d: %s", resp.StatusCode, truncate(string(respBody), 1000))
+		// 401/403 deliberately stay hard failures: retrying a rejected credential
+		// cannot clear it, and answering 503 would make clients hammer a dead login.
+		if isTransientUpstreamStatus(resp.StatusCode) {
+			return nil, fmt.Errorf("%w: %s", ErrTransientUpstream, message)
+		}
+		return nil, errors.New(message)
 	}
 	var builder strings.Builder
 	toolCallBuffer := newRemoteToolCallBuffer()
+	var finishReason string
+	var promptTokens, completionTokens int
 	if err := scanSSE(resp.Body, func(event sseEvent) error {
 		if event.Done {
 			return nil
+		}
+		if strings.TrimSpace(event.FinishReason) != "" {
+			finishReason = strings.TrimSpace(event.FinishReason)
+		}
+		if event.PromptTokens > 0 {
+			promptTokens = event.PromptTokens
+		}
+		if event.CompletionTokens > 0 {
+			completionTokens = event.CompletionTokens
 		}
 		if len(event.ToolCalls) > 0 {
 			toolCallBuffer.Add(event.ToolCalls)
@@ -468,14 +518,47 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
 		return nil, err
 	}
 	text := builder.String()
+	// Upstream counts win: len(runes)/4 underestimates Chinese by roughly 4x and
+	// model_usage bills on these numbers.
+	inputTokens := promptTokens
+	if inputTokens == 0 {
+		inputTokens = estimateTokens(request.Prompt)
+	}
+	outputTokens := completionTokens
+	if outputTokens == 0 {
+		outputTokens = estimateTokens(text)
+	}
 	return &ChatResult{
 		Text:          text,
-		InputTokens:   estimateTokens(request.Prompt),
-		OutputTokens:  estimateTokens(text),
+		InputTokens:   inputTokens,
+		OutputTokens:  outputTokens,
 		RequestID:     requestID,
 		CredentialSrc: cred.Source,
 		ToolCalls:     toolCallBuffer.Calls(),
+		StopReason:    backendStopReason(finishReason),
 	}, nil
+}
+
+// isTransientUpstreamStatus reports the gateway statuses a retry can plausibly
+// clear: it throttled us, gave up waiting for the model, or fell over.
+func isTransientUpstreamStatus(statusCode int) bool {
+	switch statusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true
+	default:
+		return statusCode >= http.StatusInternalServerError
+	}
+}
+
+// backendStopReason puts the gateway's OpenAI-flavoured finish_reason into the
+// vocabulary the service layer reads. Only a budget stop is distinguishable there,
+// so "length" becomes "max_tokens" and the rest passes through untouched.
+func backendStopReason(finishReason string) string {
+	finishReason = strings.TrimSpace(finishReason)
+	if strings.EqualFold(finishReason, "length") {
+		return "max_tokens"
+	}
+	return finishReason
 }
 
 func (c *Client) buildBody(requestID string, request ChatRequest) (string, error) {
@@ -784,13 +867,21 @@ type innerSSE struct {
 			Content   string                `json:"content"`
 			ToolCalls []remoteToolCallDelta `json:"tool_calls"`
 		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
+	Usage *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+	} `json:"usage"`
 }
 
 type sseEvent struct {
-	Content   string
-	ToolCalls []remoteToolCallFragment
-	Done      bool
+	Content          string
+	ToolCalls        []remoteToolCallFragment
+	FinishReason     string
+	PromptTokens     int
+	CompletionTokens int
+	Done             bool
 }
 
 type remoteToolCallFragment struct {
@@ -814,6 +905,8 @@ type remoteToolCallDelta struct {
 func scanSSE(reader io.Reader, onEvent func(sseEvent) error) error {
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	sawDone := false
+	sawFinish := false
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || !strings.HasPrefix(line, "data:") {
@@ -821,7 +914,11 @@ func scanSSE(reader io.Reader, onEvent func(sseEvent) error) error {
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
-			return onEvent(sseEvent{Done: true})
+			sawDone = true
+			if err := onEvent(sseEvent{Done: true}); err != nil {
+				return err
+			}
+			break
 		}
 		event, ok, err := parseSSEPayload(payload)
 		if err != nil {
@@ -830,11 +927,28 @@ func scanSSE(reader io.Reader, onEvent func(sseEvent) error) error {
 		if !ok {
 			continue
 		}
+		if event.FinishReason != "" {
+			sawFinish = true
+		}
+		if event.Done {
+			sawDone = true
+		}
 		if err := onEvent(event); err != nil {
 			return err
 		}
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+	// An expired gateway session answers 302 and the redirect chain ends on a 200
+	// HTML login page, and a stream cut mid-turn ends the same way: content chunks
+	// arrive, then nothing. Counting any event as a terminator reported that half
+	// answer as a successful completion with no stop reason, so only a finish_reason
+	// or [DONE] counts as the upstream having finished.
+	if !sawDone && !sawFinish {
+		return fmt.Errorf("%w: remote stream closed without any event or [DONE] marker", ErrTransientUpstream)
+	}
+	return nil
 }
 
 func parseSSEPayload(payload string) (sseEvent, bool, error) {
@@ -857,8 +971,13 @@ func parseSSEPayload(payload string) (sseEvent, bool, error) {
 	}
 	var builder strings.Builder
 	var toolCalls []remoteToolCallFragment
+	var finishReason string
+	var promptTokens, completionTokens int
 	for _, choice := range inner.Choices {
 		builder.WriteString(choice.Delta.Content)
+		if strings.TrimSpace(choice.FinishReason) != "" {
+			finishReason = strings.TrimSpace(choice.FinishReason)
+		}
 		for _, tc := range choice.Delta.ToolCalls {
 			toolCalls = append(toolCalls, remoteToolCallFragment{
 				Index:             tc.Index,
@@ -869,7 +988,17 @@ func parseSSEPayload(payload string) (sseEvent, bool, error) {
 			})
 		}
 	}
-	return sseEvent{Content: builder.String(), ToolCalls: toolCalls}, true, nil
+	if inner.Usage != nil {
+		promptTokens = inner.Usage.PromptTokens
+		completionTokens = inner.Usage.CompletionTokens
+	}
+	return sseEvent{
+		Content:          builder.String(),
+		ToolCalls:        toolCalls,
+		FinishReason:     finishReason,
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+	}, true, nil
 }
 
 type remoteToolCallBuffer struct {
@@ -1030,7 +1159,9 @@ func baseURLHintScore(raw string) int {
 	case host == "lingma-api.tongyi.aliyun.com":
 		return 10
 	default:
-		return 80
+		// A host that is not on the enterprise list is only noise from a log line:
+		// scoring it above the official endpoint handed every signed request to it.
+		return 0
 	}
 }
 
@@ -1458,6 +1589,11 @@ func truncate(value string, max int) string {
 	value = strings.TrimSpace(value)
 	if len(value) <= max {
 		return value
+	}
+	// Back off to a rune boundary: gateway error bodies are often Chinese, and a
+	// byte cut leaves half of a multi-byte rune for the client to render as mojibake.
+	for max > 0 && !utf8.RuneStart(value[max]) {
+		max--
 	}
 	return value[:max] + "... [truncated]"
 }

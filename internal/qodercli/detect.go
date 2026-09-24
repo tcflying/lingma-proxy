@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 // Location points at a usable Qoder CLI host for one site. Either the standalone
@@ -56,8 +57,51 @@ func Available() bool { return len(UsableSites()) > 0 }
 // AvailableSite reports whether both a CLI host and usable login state exist.
 func AvailableSite(site Site) bool {
 	loc, ok := DetectSite(site)
-	return ok && loc.ProfileDir != "" && hasAppCredential(loc.ProfileDir)
+	if !ok {
+		return false
+	}
+	if jobTokenFromEnv() != "" {
+		// An operator-supplied job token is the whole credential: there is no
+		// desktop login to read, and off Windows reading one is impossible, so
+		// requiring it there would rule out the only supported path.
+		return true
+	}
+	return loc.ProfileDir != "" && loginUsable(loc.ProfileDir)
 }
+
+// loginUsable reports whether the profile's login state can actually be decoded.
+// Presence of auth.v1.dat proves nothing: the envelope is DPAPI-wrapped under the
+// interactive user's master key, so as another user or service -- and on any
+// non-Windows host -- the file exists but never opens, and every request then
+// fails as "login state unavailable" for the life of the process.
+func loginUsable(dir string) bool {
+	return loginProbeError(dir) == nil
+}
+
+// loginProbeError caches one decode attempt per profile directory: the probe reads
+// two files and calls DPAPI, and UsableSites is rebuilt per process, not per
+// request (the service layer memoizes it, and this cache covers the paths that do
+// not go through that memo). A login that turns usable mid-process is picked up on
+// restart, which is already how that site memo behaves.
+// ponytail: one global lock across the decode, because at most two profile dirs
+// exist per process. Upgrade path is a per-directory sync.Once.
+func loginProbeError(dir string) error {
+	loginProbeMu.Lock()
+	defer loginProbeMu.Unlock()
+	if err, seen := loginProbes[dir]; seen {
+		return err
+	}
+	_, err := probeLogin(dir)
+	loginProbes[dir] = err
+	return err
+}
+
+var (
+	loginProbeMu sync.Mutex
+	loginProbes  = map[string]error{}
+	// probeLogin is the seam the tests use to watch how often the decode is tried.
+	probeLogin = loadAppCredential
+)
 
 // explicitLocation honours the host overrides an operator sets to pin a build.
 func explicitLocation() (Location, bool) {
@@ -121,7 +165,12 @@ func installRoots(site Site) []string {
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		roots = append(roots,
-			filepath.Join(home, profile.homeDirName, "bin", profile.standaloneBin),
+			// The CLI installs itself under <home>/<homeDirName>/bin/<bin>, so this
+			// has to be the profile home: naming the binary itself made
+			// standaloneCLI append bin/<name> to a file path and never match, which
+			// reported "not installed" on a machine that has the CLI but no desktop
+			// app.
+			filepath.Join(home, profile.homeDirName),
 			filepath.Join(home, "AppData", "Local", "Programs", profile.appName),
 			filepath.Join("/Applications", profile.appName+".app"),
 		)

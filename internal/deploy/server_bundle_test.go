@@ -2,7 +2,11 @@ package deploy
 
 import (
 	"archive/zip"
+	"io"
+	"os"
 	"path/filepath"
+	goruntime "runtime"
+	"strings"
 	"testing"
 
 	"lingma-ipc-proxy/internal/remote"
@@ -53,4 +57,75 @@ func TestWriteServerBundle(t *testing.T) {
 			t.Fatalf("bundle missing %s", name)
 		}
 	}
+}
+
+func TestServerBundleKeepsCredentialsPrivate(t *testing.T) {
+	dir := t.TempDir()
+	sourceCredPath := filepath.Join(dir, "source-credentials.json")
+	if err := remote.SaveCredentialFile(remote.Credential{
+		CosyKey:         "cosy",
+		EncryptUserInfo: "encrypted",
+		UserID:          "user-123456",
+		MachineID:       "machine-1234567890",
+		Source:          "test",
+	}, sourceCredPath); err != nil {
+		t.Fatalf("SaveCredentialFile() error = %v", err)
+	}
+	outputPath := filepath.Join(dir, "bundle.zip")
+	if _, err := WriteServerBundle(ServerBundleOptions{
+		AuthFile:   sourceCredPath,
+		OutputPath: outputPath,
+		Port:       18095,
+	}); err != nil {
+		t.Fatalf("WriteServerBundle() error = %v", err)
+	}
+
+	// On the target server the archive is the credential: anything group or
+	// other readable leaks it without unpacking.
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatalf("stat bundle: %v", err)
+	}
+	switch perm := info.Mode().Perm(); {
+	case goruntime.GOOS == "windows":
+		t.Logf("bundle file mode %o not asserted: Windows emulates the POSIX bits", perm)
+	case perm&0o077 != 0:
+		t.Errorf("bundle file mode = %o, want group/other bits cleared", perm)
+	}
+
+	reader, err := zip.OpenReader(outputPath)
+	if err != nil {
+		t.Fatalf("open bundle: %v", err)
+	}
+	defer reader.Close()
+	var compose string
+	for _, file := range reader.File {
+		switch file.Name {
+		case "credentials.json":
+			if perm := file.Mode().Perm(); perm&0o077 != 0 {
+				t.Errorf("credentials.json entry mode = %o, want no group/other bits", perm)
+			}
+		case "docker-compose.yml":
+			compose = readZipFile(t, file)
+		}
+	}
+	// The proxy has no auth, so a bare "<port>:8095" mapping hands the recorded
+	// conversations to every host that can route the server.
+	if !strings.Contains(compose, `"127.0.0.1:18095:8095"`) {
+		t.Errorf("compose must publish on the server loopback only, got:\n%s", compose)
+	}
+}
+
+func readZipFile(t *testing.T, file *zip.File) string {
+	t.Helper()
+	rc, err := file.Open()
+	if err != nil {
+		t.Fatalf("open %s: %v", file.Name, err)
+	}
+	defer rc.Close()
+	body, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read %s: %v", file.Name, err)
+	}
+	return string(body)
 }

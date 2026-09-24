@@ -18,8 +18,16 @@ const (
 	// defaultClientID is the OAuth client id both Qoder desktop builds register
 	// with their gateway; the global site uses the same value as the CN one.
 	defaultClientID = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa"
-	// jobTokenLifetime is the refreshed-at safety margin.
+	// renewMargin is the refreshed-at safety margin.
 	renewMargin = 10 * time.Minute
+	// defaultJobTokenLifetime is the lifetime assumed when a job token response
+	// carries no usable expiry. It equals renewMargin on purpose: such a token is
+	// reminted on nearly every use, which is the cheap side of the guess, while a
+	// longer guess would serve a token the gateway has already dropped.
+	defaultJobTokenLifetime = renewMargin
+	// jobTokenEnv names the operator-supplied job credential that stands in for a
+	// desktop login, which only Windows can read.
+	jobTokenEnv = "LINGMA_QODERCLI_JOB_TOKEN"
 )
 
 // JobCredential is what the bundled CLI expects in its <SITE>_JOB_TOKEN
@@ -70,9 +78,15 @@ func NewTokenSource(profileDir string, site Site) *TokenSource {
 	}
 }
 
+// jobTokenFromEnv returns the operator-supplied job credential, which replaces the
+// whole desktop-login chain when set.
+func jobTokenFromEnv() string {
+	return strings.TrimSpace(os.Getenv(jobTokenEnv))
+}
+
 // JobToken returns a usable job credential, minting or refreshing as needed.
 func (t *TokenSource) JobToken(ctx context.Context) (JobCredential, error) {
-	if explicit := strings.TrimSpace(os.Getenv("LINGMA_QODERCLI_JOB_TOKEN")); explicit != "" {
+	if explicit := jobTokenFromEnv(); explicit != "" {
 		var cred JobCredential
 		if err := json.Unmarshal([]byte(explicit), &cred); err != nil {
 			return JobCredential{}, fmt.Errorf("parse LINGMA_QODERCLI_JOB_TOKEN: %w", err)
@@ -255,6 +269,14 @@ func decodeJobCredential(payload []byte) (JobCredential, error) {
 		}
 	case decoded.ExpiresIn > 0:
 		cred.ExpiresAt = time.Now().Add(time.Duration(decoded.ExpiresIn) * time.Millisecond)
+	}
+	// An unreadable expires_at lands in the first case without setting anything, so
+	// both "no expiry field" and "expiry in a shape we do not parse" have to fall
+	// back here: a zero ExpiresAt reads as immortal to expiresIn, which kept a
+	// minted token in service until the gateway dropped it and then failed every
+	// request until the proxy restarted.
+	if cred.ExpiresAt.IsZero() {
+		cred.ExpiresAt = time.Now().Add(defaultJobTokenLifetime)
 	}
 	return cred, nil
 }

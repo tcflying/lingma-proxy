@@ -68,7 +68,13 @@ type Client struct {
 	closed     chan struct{}
 	closeErr   atomic.Value
 	responseMu sync.Mutex
+	// dropped counts notification frames no subscriber could take, see broadcast.
+	dropped atomic.Int64
 }
+
+// DroppedNotifications reports how many frames this client discarded because a
+// subscriber's buffer was full. A non-zero count means some consumer is lagging.
+func (c *Client) DroppedNotifications() int64 { return c.dropped.Load() }
 
 func DefaultShellType() string {
 	if shellType := strings.TrimSpace(os.Getenv("LINGMA_PROXY_SHELL_TYPE")); shellType != "" {
@@ -301,11 +307,23 @@ func (c *Client) sendEmptyResponse(id int) error {
 	return c.transport.WriteFrame(body)
 }
 
+// broadcast hands a notification to every subscriber without ever waiting for
+// one. readLoop calls this while the transport is the only reader, so a blocking
+// send here would stop the whole connection for every in-flight request: a
+// consumer stalled on an SSE write fills its 2048-frame buffer, the send parks
+// holding subsMu's read lock, and both Subscribe's cancel and Close's
+// closeAllSubs queue behind it, so the transport never self-heals. Dropping only
+// costs the overflowing subscriber, and the service layer already discards frames
+// whose request id is not its own.
 func (c *Client) broadcast(notification Notification) {
 	c.subsMu.RLock()
 	defer c.subsMu.RUnlock()
 	for _, ch := range c.subs {
-		ch <- notification
+		select {
+		case ch <- notification:
+		default:
+			c.dropped.Add(1)
+		}
 	}
 }
 

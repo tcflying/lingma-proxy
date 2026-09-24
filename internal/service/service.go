@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lingma-ipc-proxy/internal/lingmaipc"
@@ -1514,8 +1515,22 @@ func (s *Service) generateLocked(
 	if err != nil {
 		return nil, describeIPCSetupError("session setup", err)
 	}
+
+	// turnAbandoned marks the paths that drop this session locally. Dropping a reuse
+	// session on our side has to be matched by deleting it on the plug-in's, or it
+	// keeps generating for a client that is already gone.
+	turnAbandoned := false
+	abandonTurn := func() {
+		turnAbandoned = true
+		if effectiveMode == SessionModeReuse {
+			s.invalidateStickySession()
+		}
+	}
 	defer func() {
-		if effectiveMode == SessionModeReuse || strings.TrimSpace(sessionID) == "" {
+		if effectiveMode == SessionModeReuse && !turnAbandoned {
+			return
+		}
+		if strings.TrimSpace(sessionID) == "" {
 			return
 		}
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -1549,9 +1564,7 @@ func (s *Service) generateLocked(
 		}, nil)
 		modelCancel()
 		if err != nil {
-			if effectiveMode == SessionModeReuse {
-				s.invalidateStickySession()
-			}
+			abandonTurn()
 			return nil, describeIPCSetupError("model setup", err)
 		}
 		s.rememberStickyModel(sessionID, modelID)
@@ -1561,15 +1574,11 @@ func (s *Service) generateLocked(
 
 	runResult, err := s.runPromptLocked(requestCtx, ipcClient, sessionID, prompt, images, requestID, meta, onDelta)
 	if err != nil {
-		if effectiveMode == SessionModeReuse {
-			s.invalidateStickySession()
-		}
+		abandonTurn()
 		return nil, err
 	}
 	if runResult.TimedOut || strings.TrimSpace(runResult.AssistantText) == "" {
-		if effectiveMode == SessionModeReuse {
-			s.invalidateStickySession()
-		}
+		abandonTurn()
 	}
 	if runResult.TimedOut && strings.TrimSpace(runResult.AssistantText) == "" {
 		return nil, errors.New("timed out while waiting for Lingma IPC to finish responding")
@@ -1593,7 +1602,9 @@ func (s *Service) generateLocked(
 			CurrentFilePath: s.cfg.CurrentFilePath,
 			EnabledMCP:      []any{},
 		})
-		retryRunResult, retryErr := s.runPromptLocked(requestCtx, ipcClient, sessionID, hintPrompt, images, retryRequestID, retryMeta, onDelta)
+		// nil onDelta: the client already streamed the first attempt, and result.Text
+		// is about to be replaced by this retry. The remote retry passes nil too.
+		retryRunResult, retryErr := s.runPromptLocked(requestCtx, ipcClient, sessionID, hintPrompt, images, retryRequestID, retryMeta, nil)
 		if retryErr != nil {
 			return "", 0, retryErr
 		}
@@ -1934,11 +1945,21 @@ func (s *Service) currentTransport() lingmaipc.Transport {
 // fetch; anything past this age cannot belong to a turn that is still live.
 const imageTempHorizon = 24 * time.Hour
 
+// imageTempSweepMinInterval bounds how often the request path may sweep. A sweep is
+// one glob plus a stat per match, so running it for every attachment costs O(files)
+// per image on a host that piles them up.
+const imageTempSweepMinInterval = time.Minute
+
+// lastImageTempSweep is the unix-nano time of the most recent sweep, shared by the
+// startup call and every write path.
+var lastImageTempSweep atomic.Int64
+
 // SweepImageTemps removes image files the legacy Lingma IPC path spooled into
 // the temp directory, plus the leftovers of builds that spooled them for Qoder CN
 // too. Call it once at process start: building a Service is not a reason to touch
 // the filesystem.
 func SweepImageTemps() {
+	lastImageTempSweep.Store(time.Now().UnixNano())
 	matches, err := filepath.Glob(filepath.Join(os.TempDir(), "lingma-img-*"))
 	if err != nil {
 		return
@@ -1951,6 +1972,24 @@ func SweepImageTemps() {
 		}
 		_ = os.Remove(path)
 	}
+}
+
+// sweepImageTempsForWrites keeps the startup sweep company: a host that runs for
+// weeks and only attaches images would otherwise grow the temp directory forever.
+// ponytail: one process-wide timestamp rather than per-Service state, because the
+// files are process-wide too and a deferred sweep still happens before the next
+// interval passes.
+func sweepImageTempsForWrites() {
+	now := time.Now()
+	last := lastImageTempSweep.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) < imageTempSweepMinInterval {
+		return
+	}
+	// CAS hands the sweep to exactly one of the racing writers.
+	if !lastImageTempSweep.CompareAndSwap(last, now.UnixNano()) {
+		return
+	}
+	SweepImageTemps()
 }
 
 func (s *Service) runPromptLocked(
@@ -2075,6 +2114,9 @@ func imagePromptItem(imageScheme string, img Image) (map[string]any, bool) {
 
 	var imageURI string
 	if img.Data != "" && imageScheme != "qodercn" {
+		// This is the only branch that leaves a file behind, so it pays for the
+		// cleanup of the ones it and every earlier request left behind.
+		sweepImageTempsForWrites()
 		if tmpFile, err := os.CreateTemp("", "lingma-img-*"+imageExtension(mediaType)); err == nil {
 			tmpPath := tmpFile.Name()
 			_ = tmpFile.Close()
@@ -2102,7 +2144,14 @@ func imagePromptItem(imageScheme string, img Image) (map[string]any, bool) {
 }
 
 func (s *Service) ipcImageURIScheme() string {
-	values := strings.ToLower(strings.Join([]string{s.cfg.Pipe, s.cfg.WebSocketURL, s.pipePath, s.endpoint}, " "))
+	// pipePath and endpoint belong to the live connection: ensureConnected writes
+	// them and closeClientLocked clears them, so read them as one snapshot. The
+	// cfg pair never changes after New, and the fallback probe touches the
+	// filesystem, which is why it stays outside the lock.
+	s.mu.Lock()
+	pipePath, endpoint := s.pipePath, s.endpoint
+	s.mu.Unlock()
+	values := strings.ToLower(strings.Join([]string{s.cfg.Pipe, s.cfg.WebSocketURL, pipePath, endpoint}, " "))
 	if strings.Contains(values, "qoder") || strings.Contains(values, "qodercn") {
 		return "qodercn"
 	}
@@ -2319,9 +2368,19 @@ func extractModels(raw any) []Model {
 				if name == "" {
 					name = id
 				}
-				seen[name] = Model{ID: name, Name: name, Scene: currentScene, InternalID: id}
+				// First entry wins: map order is random, so letting a later scene
+				// overwrite this one would reroute /v1/chat on every refresh.
+				if _, dup := seen[name]; !dup {
+					seen[name] = Model{ID: name, Name: name, Scene: currentScene, InternalID: id}
+				}
 			}
-			for key, child := range typed {
+			keys := make([]string, 0, len(typed))
+			for key := range typed {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				child := typed[key]
 				nextScene := currentScene
 				if nextScene == "" || isSceneKey(key) {
 					nextScene = key
