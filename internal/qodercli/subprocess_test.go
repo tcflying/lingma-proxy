@@ -26,6 +26,8 @@ const (
 	fakeHugeLine = "huge-line"
 	// fakeSilentExit dies with a status and prints nothing anywhere.
 	fakeSilentExit = "silent-exit"
+	// fakeFlood keeps writing well past the capture ceiling.
+	fakeFlood = "flood"
 )
 
 func TestMain(m *testing.M) {
@@ -60,6 +62,13 @@ func runFakeCLI(mode string) {
 		fmt.Println(`{"type":"result","subtype":"success","result":"这一帧永远读不到"}`)
 	case fakeSilentExit:
 		os.Exit(7)
+	case fakeFlood:
+		// Past whatever capture ceiling the test installed, with a terminal frame at
+		// the end that must never be reached.
+		for i := 0; i < 4000; i++ {
+			fmt.Println(`{"type":"assistant","message":{"content":[{"type":"text","text":"` + strings.Repeat("y", 100) + `"}]}}`)
+		}
+		fmt.Println(`{"type":"result","subtype":"success","result":"beyond the ceiling"}`)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown fake CLI mode %q\n", mode)
 		os.Exit(9)
@@ -212,5 +221,31 @@ func TestSilentNonZeroExitReportsItsStatus(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "%!w(<nil>)") {
 		t.Fatalf("the stale credential error was wrapped again: %q", err)
+	}
+}
+
+// TestCapturedOutputStopsAtTheCeiling is the volume half of the same pipe: the
+// deadline bounds how long the child may talk, not how fast, so a CLI in an error
+// loop could push hundreds of megabytes into the capture buffer inside one timeout.
+func TestCapturedOutputStopsAtTheCeiling(t *testing.T) {
+	t.Setenv(fakeCLIArgvEnv, "")
+
+	prev := maxCLICapturedOutputBytes
+	maxCLICapturedOutputBytes = 64 * 1024
+	t.Cleanup(func() { maxCLICapturedOutputBytes = prev })
+
+	c := fakeCLIClient(t, fakeFlood, 60*time.Second)
+	text, err := c.runWithStdinData(context.Background(), nil, func(string) {}, "--print")
+	if err != nil {
+		t.Fatalf("a capped stream must still finish cleanly: %v", err)
+	}
+	if !strings.Contains(text, `"type":"assistant"`) {
+		t.Fatalf("nothing was captured: %q", text[:min(len(text), 200)])
+	}
+	if strings.Contains(text, "beyond the ceiling") {
+		t.Fatal("the terminal frame after the ceiling was captured, so no cap applied")
+	}
+	if len(text) > maxCLICapturedOutputBytes+512 {
+		t.Fatalf("captured %d bytes, want the %d byte ceiling held", len(text), maxCLICapturedOutputBytes)
 	}
 }

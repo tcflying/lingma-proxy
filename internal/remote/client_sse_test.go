@@ -2,6 +2,7 @@ package remote
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -164,6 +165,46 @@ func TestChatKeepsAuthStatusesFatal(t *testing.T) {
 			}
 			if errors.Is(err, ErrTransientUpstream) {
 				t.Fatalf("status %d must not be reported as retryable: %q", status, err)
+			}
+		})
+	}
+}
+
+// R6 covers the same predicate at the two sibling call sites the HTTP-layer fix
+// missed: the gateway reports most per-turn failures inside a 200 SSE envelope, and
+// /v1/models answers through the API layer's retryable check. A 429 that reaches
+// either as a bare error reads as a permanent 500 to clients.
+func TestEnvelopeAndModelListStatusesUseTheTransientSentinel(t *testing.T) {
+	for _, tc := range []struct {
+		status    int
+		transient bool
+	}{
+		{status: http.StatusRequestTimeout, transient: true},
+		{status: http.StatusTooManyRequests, transient: true},
+		{status: http.StatusInternalServerError, transient: true},
+		{status: http.StatusServiceUnavailable, transient: true},
+		{status: http.StatusBadRequest, transient: false},
+		{status: http.StatusUnauthorized, transient: false},
+		{status: http.StatusForbidden, transient: false},
+		{status: http.StatusNotFound, transient: false},
+	} {
+		t.Run(fmt.Sprint(tc.status), func(t *testing.T) {
+			payload, err := json.Marshal(outerSSE{Body: "upstream said no", StatusCode: tc.status})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, _, envelopeErr := parseSSEPayload(string(payload))
+			if envelopeErr == nil {
+				t.Fatalf("envelope status %d accepted", tc.status)
+			}
+			listErr := (&Client{}).modelListStatusError("https://example.invalid", tc.status, "upstream said no")
+			for _, got := range []error{envelopeErr, listErr} {
+				if errors.Is(got, ErrTransientUpstream) != tc.transient {
+					t.Fatalf("status %d retryable = %v, want %v (%q)", tc.status, errors.Is(got, ErrTransientUpstream), tc.transient, got)
+				}
+				if !strings.Contains(got.Error(), fmt.Sprint(tc.status)) {
+					t.Fatalf("status %d missing from %q", tc.status, got)
+				}
 			}
 		})
 	}

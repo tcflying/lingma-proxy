@@ -84,18 +84,29 @@ func jobTokenFromEnv() string {
 	return strings.TrimSpace(os.Getenv(jobTokenEnv))
 }
 
+// envJobCredential parses the operator-supplied job token, or says why it cannot
+// stand in for a login. Both the availability probe and JobToken ask through here so
+// neither can treat a value that never decodes as a usable credential.
+func envJobCredential() (JobCredential, error) {
+	explicit := jobTokenFromEnv()
+	if explicit == "" {
+		return JobCredential{}, errors.New(jobTokenEnv + " is not set")
+	}
+	var cred JobCredential
+	if err := json.Unmarshal([]byte(explicit), &cred); err != nil {
+		return JobCredential{}, fmt.Errorf("parse %s: %w", jobTokenEnv, err)
+	}
+	if strings.TrimSpace(cred.Token) == "" {
+		return JobCredential{}, errors.New(jobTokenEnv + " has no token field")
+	}
+	cred.Raw = json.RawMessage(explicit)
+	return cred, nil
+}
+
 // JobToken returns a usable job credential, minting or refreshing as needed.
 func (t *TokenSource) JobToken(ctx context.Context) (JobCredential, error) {
-	if explicit := jobTokenFromEnv(); explicit != "" {
-		var cred JobCredential
-		if err := json.Unmarshal([]byte(explicit), &cred); err != nil {
-			return JobCredential{}, fmt.Errorf("parse LINGMA_QODERCLI_JOB_TOKEN: %w", err)
-		}
-		if cred.Token == "" {
-			return JobCredential{}, errors.New("LINGMA_QODERCLI_JOB_TOKEN has no token field")
-		}
-		cred.Raw = json.RawMessage(explicit)
-		return cred, nil
+	if jobTokenFromEnv() != "" {
+		return envJobCredential()
 	}
 
 	t.mu.Lock()

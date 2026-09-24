@@ -404,3 +404,55 @@ func TestImagePromptItemSweepsSpooledImages(t *testing.T) {
 		t.Fatal("the sweep did not record its clock, so every image would rescan")
 	}
 }
+
+// TestImageTempSweepHonoursItsOwnInterval is the other half of S6: the ceiling is a
+// rate limit, so a second attachment inside the window must not sweep. Asserting only
+// "the first one cleaned up" leaves the interval unguarded, and an interval that never
+// binds costs a glob plus a stat per attachment on the request path.
+func TestImageTempSweepHonoursItsOwnInterval(t *testing.T) {
+	dir := t.TempDir()
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+		t.Setenv(key, dir)
+	}
+	lastImageTempSweep.Store(0)
+	t.Cleanup(func() { lastImageTempSweep.Store(0) })
+
+	payload := base64.StdEncoding.EncodeToString([]byte("a-picture"))
+	old := time.Now().Add(-2 * imageTempHorizon)
+	stale := func(name string) string {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("x"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	first := stale("lingma-img-first.png")
+	if _, ok := imagePromptItem("lingma", Image{Data: payload, MediaType: "image/png"}); !ok {
+		t.Fatal("legacy image should be sent")
+	}
+	if _, err := os.Stat(first); err == nil {
+		t.Fatal("the first attachment did not sweep")
+	}
+
+	second := stale("lingma-img-second.png")
+	if _, ok := imagePromptItem("lingma", Image{Data: payload, MediaType: "image/png"}); !ok {
+		t.Fatal("legacy image should be sent")
+	}
+	if _, err := os.Stat(second); err != nil {
+		t.Fatalf("the interval did not bind: the second attachment swept again: %v", err)
+	}
+
+	// Once the window passes, the same write path has to clean up again -- otherwise
+	// "rate limited" has quietly become "swept once".
+	lastImageTempSweep.Store(time.Now().Add(-2 * imageTempSweepMinInterval).UnixNano())
+	if _, ok := imagePromptItem("lingma", Image{Data: payload, MediaType: "image/png"}); !ok {
+		t.Fatal("legacy image should be sent")
+	}
+	if _, err := os.Stat(second); err == nil {
+		t.Fatal("the sweep never resumed after its interval passed")
+	}
+}

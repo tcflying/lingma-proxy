@@ -106,6 +106,36 @@ func TestStaleCachedBaseURLHintLosesFirstPlace(t *testing.T) {
 	}
 }
 
+// R5's own leash has to be refreshed by use, or a tenant that stays healthy for 30
+// days ages out of first place and its signed credential headers start going to the
+// public default endpoint.
+func TestCacheSuccessfulBaseURLRestampsAnAgingHit(t *testing.T) {
+	sandboxCandidateEnv(t)
+	aging := time.Now().Add(-(baseURLHintRefreshInterval + time.Hour))
+	writeBaseURLCacheFile(t, "https://lingma.asiainfo.com", aging)
+
+	cacheSuccessfulBaseURL("https://lingma.asiainfo.com")
+
+	_, updatedAt := readBaseURLCacheFile()
+	if updatedAt.Before(time.Now().Add(-time.Minute)) {
+		t.Fatalf("aging hit left the stamp at %s, want it re-stamped within the last minute", updatedAt)
+	}
+}
+
+// The reason the skip exists: every rewrite drops the candidate memo, and rebuilding
+// it is the multi-second scan. A fresh hit must not touch the file at all.
+func TestCacheSuccessfulBaseURLDoesNotRewriteAFreshHit(t *testing.T) {
+	sandboxCandidateEnv(t)
+	stamp := time.Now().Add(-time.Minute).Truncate(time.Second)
+	writeBaseURLCacheFile(t, "https://lingma.asiainfo.com", stamp)
+
+	cacheSuccessfulBaseURL("https://lingma.asiainfo.com")
+
+	if _, updatedAt := readBaseURLCacheFile(); !updatedAt.Equal(stamp) {
+		t.Fatalf("fresh hit rewrote the stamp to %s, want %s", updatedAt, stamp)
+	}
+}
+
 // R5 counterpart: a recently confirmed domain still outranks the official endpoint.
 func TestFreshCachedBaseURLHintKeepsPriority(t *testing.T) {
 	sandboxCandidateEnv(t)

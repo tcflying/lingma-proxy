@@ -306,7 +306,7 @@ func TestApplyToolEmulationRespectsToolChoiceNone(t *testing.T) {
 		ToolChoice: toolemulation.ToolChoice{Mode: "none"},
 	}
 	result := &ChatResult{Text: "```json action\n{\"tool\":\"Bash\",\"parameters\":{\"command\":\"pwd\"}}\n```"}
-	(&Service{}).applyToolEmulation(context.Background(), req, "", result, nil, nil)
+	(&Service{}).applyToolEmulation(context.Background(), req, "", result, nil)
 	if len(result.ToolCalls) != 0 {
 		t.Fatalf("tool_choice:none must not produce calls: %+v", result.ToolCalls)
 	}
@@ -685,6 +685,24 @@ func TestImagePromptItemKeepsQoderCNImagesOutOfTempDir(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("legacy host should spool exactly one file, got %d", len(entries))
+	}
+}
+
+func TestAbandonedTurnOnlyInvalidatesItsOwnStickySession(t *testing.T) {
+	// N1: two requests share the reuse-mode sticky session. The one that gives up has
+	// to drop its own session, not the newer one another turn is still streaming on.
+	var s Service
+	s.stickySessionID = "session-a"
+	s.stickyModelID = "model-a"
+
+	s.invalidateStickySession("session-b")
+	if s.stickySessionID != "session-a" || s.stickyModelID != "model-a" {
+		t.Fatalf("a losing turn cleared the current sticky pair: %q/%q", s.stickySessionID, s.stickyModelID)
+	}
+
+	s.invalidateStickySession("session-a")
+	if s.stickySessionID != "" || s.stickyModelID != "" {
+		t.Fatalf("the owning turn left %q/%q behind", s.stickySessionID, s.stickyModelID)
 	}
 }
 

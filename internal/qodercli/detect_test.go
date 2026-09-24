@@ -1,6 +1,7 @@
 package qodercli
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -139,5 +140,39 @@ func TestAvailableSiteRequiresADecodableLogin(t *testing.T) {
 	}
 	if probes != before {
 		t.Fatalf("the env job token still paid for %d login decodes", probes-before)
+	}
+}
+
+// TestUsableEnvJobTokenIsTheOneJobTokenAccepts applies C4's lesson to the other
+// credential: presence of LINGMA_QODERCLI_JOB_TOKEN proved nothing, so a value that
+// never decodes marked the site available and then failed every request for the rest
+// of the process.
+func TestUsableEnvJobTokenIsTheOneJobTokenAccepts(t *testing.T) {
+	home := useFakeHome(t)
+	cli := filepath.Join(home, "qoderclicn.exe")
+	if err := os.WriteFile(cli, []byte("fake cli"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LINGMA_QODERCLI_BIN", cli)
+	t.Setenv("LINGMA_QODERCLI_PROFILE", filepath.Join(home, "com.qodercn.app.nologin"))
+
+	source := NewTokenSource("", SiteCN)
+	for _, tc := range []struct {
+		value string
+		ok    bool
+	}{
+		{value: `{"token":"operator-token"}`, ok: true},
+		{value: `0`, ok: false},
+		{value: `notjson`, ok: false},
+		{value: `{"expires_at":3600}`, ok: false},
+		{value: `{"token":"   "}`, ok: false},
+	} {
+		t.Setenv("LINGMA_QODERCLI_JOB_TOKEN", tc.value)
+		if got := AvailableSite(SiteCN); got != tc.ok {
+			t.Fatalf("AvailableSite with %q = %v, want %v", tc.value, got, tc.ok)
+		}
+		if _, err := source.JobToken(context.Background()); (err == nil) != tc.ok {
+			t.Fatalf("JobToken with %q disagreed with the probe: err=%v", tc.value, err)
+		}
 	}
 }

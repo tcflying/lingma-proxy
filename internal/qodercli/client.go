@@ -38,6 +38,13 @@ const maxSystemPromptArgChars = 20000
 // oversized-line regression test can reach the ceiling without shipping 8 MB.
 var maxCLIOutputLineBytes = 8 * 1024 * 1024
 
+// maxCLICapturedOutputBytes caps the whole turn. The deadline bounds how long the
+// child may talk, not how fast: a CLI stuck in an error loop can push hundreds of
+// megabytes into the capture buffer inside one timeout. 64 MB is eight times the
+// per-frame cap, and a turn that fills it has no answer in it worth parsing. A var
+// so the regression test can reach the ceiling without allocating 64 MB.
+var maxCLICapturedOutputBytes = 64 * 1024 * 1024
+
 // partialStreamUnsupported latches after a CLI install refuses
 // --include-partial-messages, so one old build does not fail every streamed turn.
 var partialStreamUnsupported atomic.Bool
@@ -296,15 +303,34 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	}
 	startErr := cmd.Start()
 	if startErr == nil && pipe != nil {
+		// ponytail: this read is the one unbounded wait in the backend. exec only
+		// closes the read end inside Wait, and Wait is unreachable from the read it is
+		// waiting for, so a grandchild that inherited the write end outranks the
+		// context deadline -- measured at 15.03s to return only when the holder exited
+		// (a timer-driven pipe.Close does not help: Windows leaves a parked pipe read
+		// alone, and a read end made with os.Pipe here never saw EOF at all). The real
+		// CLI is not known to fork such a child, and a streamed turn finished in 13.6s
+		// on this code, so the ceiling is theoretical for now. Upgrade path: point the
+		// child's stdout at a temporary file (a file read cannot be wedged by another
+		// holder), or bound the process tree with a Windows job object / Setpgid plus
+		// kill(-pgid).
 		scanner := bufio.NewScanner(pipe)
 		scanner.Buffer(make([]byte, 0, 64*1024), maxCLIOutputLineBytes)
+		var scanErr error
 		for scanner.Scan() {
 			line := scanner.Text()
+			if stdout.Len()+len(line) > maxCLICapturedOutputBytes {
+				scanErr = fmt.Errorf("capture ceiling of %d bytes reached", maxCLICapturedOutputBytes)
+				break
+			}
 			stdout.WriteString(line)
 			stdout.WriteByte('\n')
 			onLine(line)
 		}
-		if scanErr := scanner.Err(); scanErr != nil {
+		if err := scanner.Err(); err != nil && scanErr == nil {
+			scanErr = err
+		}
+		if scanErr != nil {
 			// A single line past the buffer cap stops the scan while the CLI is
 			// still writing. Left unread, the 64 KB pipe fills and cmd.Wait parks
 			// until the deadline, turning an answer that already arrived into a

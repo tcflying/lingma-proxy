@@ -271,6 +271,20 @@ func scanBaseURLCandidates() []BaseURLHint {
 // endpoint -- with signed credential headers -- for as long as it answers 200.
 const cachedBaseURLHintMaxAge = 30 * 24 * time.Hour
 
+// baseURLHintRefreshInterval is how often a domain that is still the one being
+// used re-stamps its own cache file. It has to sit far below
+// cachedBaseURLHintMaxAge (or a healthy tenant ages out and its signed
+// credentials start going to the public default endpoint) and far above the model
+// list interval (each rewrite drops the candidate memo, and rebuilding it is the
+// multi-second scan that must stay off the request path).
+const baseURLHintRefreshInterval = 24 * time.Hour
+
+func baseURLHintStampNeedsRefresh(updatedAt time.Time) bool {
+	// A missing or unparseable stamp counts as needing one, so a file written
+	// before the stamp existed cannot stay "fresh" by being unreadable.
+	return updatedAt.IsZero() || time.Since(updatedAt) > baseURLHintRefreshInterval
+}
+
 func cachedBaseURLHint() BaseURLHint {
 	hint, _ := readBaseURLCacheFile()
 	return hint
@@ -319,7 +333,14 @@ func cacheSuccessfulBaseURL(raw string) {
 	// skip the write when the file already records it. Skipping also skips dropping
 	// the candidate memo, and that is what keeps the multi-second scan off the
 	// request path. Compare against the file, not against a position in the memo.
-	if cached := cachedBaseURLHint(); cached.URL == url {
+	//
+	// The stamp still has to move, just rarely: a domain that keeps working for 30
+	// days would otherwise age past cachedBaseURLHintMaxAge and lose priority while
+	// it is still the only correct endpoint, which is when the signed credential
+	// headers start going to the public default. Rewriting at most once a day keeps
+	// the freshness honest without putting a file write, or the scan it would drop
+	// the memo for, on the request path.
+	if hint, updatedAt := readBaseURLCacheFile(); hint.URL == url && !baseURLHintStampNeedsRefresh(updatedAt) {
 		return
 	}
 	path, err := baseURLCachePath()
@@ -446,6 +467,13 @@ func (c *Client) modelListStatusError(baseURL string, statusCode int, body strin
 	message := fmt.Sprintf("remote model list status %d from %s: %s", statusCode, baseURL, truncate(body, 500))
 	if statusCode == http.StatusNotFound || strings.Contains(body, "NoSuchKey") {
 		message += "。这通常表示远端 API 域名自动探测命中了错误地址，请到设置页手动填写 Lingma 官方或企业专属远端 API 域名；官方默认域名为 https://lingma.alibabacloud.com。"
+		return fmt.Errorf("%s", message)
+	}
+	if isTransientUpstreamStatus(statusCode) {
+		// /v1/models answers through writeOpenAIUpstreamError, which does consult the
+		// sentinel: an overloaded gateway has to read as retryable here too, not as a
+		// permanent 500 on a page that refreshes by itself.
+		return fmt.Errorf("%w: %s", ErrTransientUpstream, message)
 	}
 	return fmt.Errorf("%s", message)
 }
@@ -946,7 +974,7 @@ func scanSSE(reader io.Reader, onEvent func(sseEvent) error) error {
 	// answer as a successful completion with no stop reason, so only a finish_reason
 	// or [DONE] counts as the upstream having finished.
 	if !sawDone && !sawFinish {
-		return fmt.Errorf("%w: remote stream closed without any event or [DONE] marker", ErrTransientUpstream)
+		return fmt.Errorf("%w: remote stream closed without a finish_reason or [DONE] marker", ErrTransientUpstream)
 	}
 	return nil
 }
@@ -957,6 +985,13 @@ func parseSSEPayload(payload string) (sseEvent, bool, error) {
 		return sseEvent{}, false, err
 	}
 	if outer.StatusCode >= 400 {
+		// The gateway reports most per-turn failures inside a 200 SSE envelope, so
+		// this is the status Chat actually sees: without the same classification the
+		// R6 fix only covered the HTTP layer and a 429 here still reached clients as
+		// a hard 500 with no retry.
+		if isTransientUpstreamStatus(outer.StatusCode) {
+			return sseEvent{}, false, fmt.Errorf("%w: remote sse status %d", ErrTransientUpstream, outer.StatusCode)
+		}
 		return sseEvent{}, false, fmt.Errorf("remote sse status %d", outer.StatusCode)
 	}
 	if outer.Body == "" {

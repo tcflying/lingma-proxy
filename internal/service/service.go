@@ -174,6 +174,11 @@ type Service struct {
 	detectedCLISites []qodercli.Site
 	cliSitesOnce     sync.Once
 	remoteProbeCache map[string]remoteModelProbeEntry
+	// imageScheme memoises the filesystem probe behind the IPC image URI scheme: the
+	// install layout does not move while the proxy runs, and the probe sat on the
+	// request path for every attachment.
+	imageSchemeOnce  sync.Once
+	imageSchemeValue string
 }
 
 type promptRunResult struct {
@@ -957,7 +962,7 @@ func (s *Service) generateRemoteWithModel(
 		result.Endpoint = ""
 	}
 	if emulateTools {
-		s.applyToolEmulation(ctx, req, prompt, result, onDelta, func(hintPrompt string) (string, int, error) {
+		s.applyToolEmulation(ctx, req, prompt, result, func(hintPrompt string) (string, int, error) {
 			retryResult, err := client.Chat(ctx, remote.ChatRequest{
 				Model:           model,
 				Prompt:          hintPrompt,
@@ -1523,7 +1528,7 @@ func (s *Service) generateLocked(
 	abandonTurn := func() {
 		turnAbandoned = true
 		if effectiveMode == SessionModeReuse {
-			s.invalidateStickySession()
+			s.invalidateStickySession(sessionID)
 		}
 	}
 	defer func() {
@@ -1592,7 +1597,7 @@ func (s *Service) generateLocked(
 
 	result = s.buildChatResult(req, sessionID, requestID, prompt, runResult, effectiveMode)
 
-	s.applyToolEmulation(requestCtx, req, prompt, result, onDelta, func(hintPrompt string) (string, int, error) {
+	s.applyToolEmulation(requestCtx, req, prompt, result, func(hintPrompt string) (string, int, error) {
 		retryRequestID := lingmaipc.CreateRequestID("serve-tool")
 		retryMeta := lingmaipc.CreateMeta(lingmaipc.MetaOptions{
 			RequestID:       retryRequestID,
@@ -1658,7 +1663,6 @@ func (s *Service) applyToolEmulation(
 	req ChatRequest,
 	prompt string,
 	result *ChatResult,
-	onDelta func(StreamEvent),
 	retry func(string) (string, int, error),
 ) {
 	// tool_choice:"none" is the client forbidding tool calls, so a block that
@@ -1889,10 +1893,15 @@ func (s *Service) resolveSession(ctx context.Context, client *lingmaipc.Client, 
 	return sessionID, nil
 }
 
-func (s *Service) invalidateStickySession() {
+func (s *Service) invalidateStickySession(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.clearStickyLocked()
+	// The identity check is the whole function: a concurrent request can have
+	// installed a newer sticky session by now, and dropping that one would cut off a
+	// turn that is still streaming.
+	if strings.TrimSpace(s.stickySessionID) == strings.TrimSpace(sessionID) {
+		s.clearStickyLocked()
+	}
 }
 
 func (s *Service) rememberStickyModel(sessionID string, modelID string) {
@@ -2004,6 +2013,9 @@ func (s *Service) runPromptLocked(
 ) (*promptRunResult, error) {
 	notifications, cancel := client.Subscribe()
 	defer cancel()
+	// DroppedNotifications is lifetime-wide, so only a delta says anything about
+	// this turn. See the timeout path below for why the count belongs in the log.
+	droppedAtStart := client.DroppedNotifications()
 
 	promptItems := []map[string]any{
 		{"type": "text", "text": text},
@@ -2045,6 +2057,13 @@ func (s *Service) runPromptLocked(
 			result.AssistantText = builder.String()
 			result.ThoughtText = thoughtBuilder.String()
 			result.TimedOut = true
+			if dropped := client.DroppedNotifications() - droppedAtStart; dropped > 0 {
+				// A saturated subscriber buffer loses the newest frame first, and the
+				// newest frame is chat_finish -- so the turn can be complete in
+				// builder and still be abandoned downstream as "response remained
+				// incomplete". The count is the only evidence either way.
+				log.Printf("lingma IPC: turn %s hit its deadline with %d notification frame(s) dropped, %d bytes of answer held", requestID, dropped, len(result.AssistantText))
+			}
 			return result, nil
 		case notification, ok := <-notifications:
 			if !ok {
@@ -2155,7 +2174,13 @@ func (s *Service) ipcImageURIScheme() string {
 	if strings.Contains(values, "qoder") || strings.Contains(values, "qodercn") {
 		return "qodercn"
 	}
-	return lingmaipc.DefaultImageURIScheme(s.cfg.Pipe, s.cfg.WebSocketURL)
+	// The fallback probes the filesystem for an install layout, which does not move
+	// while the proxy runs. Once makes the second and later attachments free, and
+	// publishes the value to every reader.
+	s.imageSchemeOnce.Do(func() {
+		s.imageSchemeValue = lingmaipc.DefaultImageURIScheme(s.cfg.Pipe, s.cfg.WebSocketURL)
+	})
+	return s.imageSchemeValue
 }
 
 func (s *Service) deleteSession(ctx context.Context, client *lingmaipc.Client, sessionID string) error {

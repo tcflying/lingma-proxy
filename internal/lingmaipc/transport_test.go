@@ -1,6 +1,7 @@
 package lingmaipc
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -163,5 +164,46 @@ func TestNewestExistingPathPrefersNewestSocket(t *testing.T) {
 	}
 	if got := newestExistingPath([]string{older, newer}); got != newer {
 		t.Fatalf("newestExistingPath = %q, want %q", got, newer)
+	}
+}
+
+// TestFrameReadersRefuseAnOversizedContentLength: both readers sized an allocation
+// straight from the peer's own header, so announcing a huge frame was a request to
+// reserve that much memory, and announcing an absurd one was a panic.
+func TestFrameReadersRefuseAnOversizedContentLength(t *testing.T) {
+	call := func(name string, run func() error) {
+		t.Helper()
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("%s panicked on a peer-supplied length instead of refusing it: %v", name, r)
+			}
+		}()
+		if err := run(); err == nil {
+			t.Fatalf("%s accepted a frame past the %d byte limit", name, maxIPCFrameBytes)
+		}
+	}
+	for _, claim := range []string{"67108865", "1073741824", "4611686018427387904"} {
+		header := "Content-Length: " + claim + "\r\n\r\n"
+		call("framedReader", func() error {
+			_, err := newFramedReader(strings.NewReader(header)).ReadFrame()
+			return err
+		})
+		call("tryReadBufferedFrame", func() error {
+			buffer := bytes.NewBufferString(header)
+			_, _, err := tryReadBufferedFrame(buffer)
+			return err
+		})
+	}
+
+	// The cap must be a ceiling, not a target: an ordinary frame still parses.
+	body := "Content-Length: 5\r\n\r\nhello"
+	got, err := newFramedReader(strings.NewReader(body)).ReadFrame()
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("framedReader on a legal frame = %q, %v", got, err)
+	}
+	buffer := bytes.NewBufferString(body)
+	got, ok, err := tryReadBufferedFrame(buffer)
+	if err != nil || !ok || string(got) != "hello" {
+		t.Fatalf("tryReadBufferedFrame on a legal frame = %q, %v, %v", got, ok, err)
 	}
 }

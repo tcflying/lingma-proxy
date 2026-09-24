@@ -466,6 +466,9 @@ func connectWebSocketTransport(ctx context.Context, wsURL string) (*websocketTra
 	if err != nil {
 		return nil, fmt.Errorf("connect Lingma websocket %s: %w", wsURL, err)
 	}
+	// This bounds the read buffer, not just one frame: without it a peer that keeps
+	// sending without ever completing a header grows t.buffer for as long as it likes.
+	conn.SetReadLimit(maxIPCFrameBytes)
 	return &websocketTransport{url: wsURL, conn: conn}, nil
 }
 
@@ -510,6 +513,21 @@ type framedReader struct {
 	reader *bufio.Reader
 }
 
+// maxIPCFrameBytes is the largest frame either transport will allocate for. The HTTP
+// side of this proxy caps a request body at 32 MiB, and an ACP frame carrying a
+// base64 image is the same content travelling the other way, so 64 MiB gives a legal
+// turn room to breathe while a peer that claims gigabytes cannot make this process
+// allocate them.
+const maxIPCFrameBytes = 64 << 20
+
+// checkFrameLength runs before any allocation sized by the peer's own header.
+func checkFrameLength(contentLength int) error {
+	if contentLength > maxIPCFrameBytes {
+		return fmt.Errorf("ipc frame of %d bytes exceeds the %d byte limit", contentLength, maxIPCFrameBytes)
+	}
+	return nil
+}
+
 func newFramedReader(r io.Reader) *framedReader {
 	return &framedReader{reader: bufio.NewReader(r)}
 }
@@ -536,6 +554,9 @@ func (r *framedReader) ReadFrame() ([]byte, error) {
 	}
 	if contentLength < 0 {
 		return nil, errors.New("missing Content-Length header")
+	}
+	if err := checkFrameLength(contentLength); err != nil {
+		return nil, err
 	}
 
 	body := make([]byte, contentLength)
@@ -567,6 +588,9 @@ func tryReadBufferedFrame(buffer *bytes.Buffer) ([]byte, bool, error) {
 	}
 	if contentLength < 0 {
 		return nil, false, errors.New("missing Content-Length header")
+	}
+	if err := checkFrameLength(contentLength); err != nil {
+		return nil, false, err
 	}
 
 	bodyStart := headerEnd + len("\r\n\r\n")

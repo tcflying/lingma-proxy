@@ -63,8 +63,10 @@ func AvailableSite(site Site) bool {
 	if jobTokenFromEnv() != "" {
 		// An operator-supplied job token is the whole credential: there is no
 		// desktop login to read, and off Windows reading one is impossible, so
-		// requiring it there would rule out the only supported path.
-		return true
+		// requiring it there would rule out the only supported path. Presence alone
+		// proves nothing, same as auth.v1.dat below.
+		_, err := envJobCredential()
+		return err == nil
 	}
 	return loc.ProfileDir != "" && loginUsable(loc.ProfileDir)
 }
