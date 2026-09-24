@@ -431,10 +431,14 @@ func TestBuildOpenAIResponseBodyIncludesReasoningItem(t *testing.T) {
 	}
 }
 
-func TestWriteOpenAIResponseReasoningEmitsLifecycle(t *testing.T) {
+func TestResponseReasoningWriterEmitsLifecycle(t *testing.T) {
 	rec := httptest.NewRecorder()
 	emitter := newOpenAIResponseStreamEmitter(rec, rec, "resp_1")
-	if err := writeOpenAIResponseReasoning(emitter, "rs_resp_1", 0, "reasoning summary"); err != nil {
+	r := newResponseReasoningWriter(emitter, "rs_resp_1", 0)
+	if err := r.Delta("reasoning summary"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
 	body := rec.Body.String()
@@ -1277,7 +1281,11 @@ func TestResponseReasoningWriterStreamsSameSequenceAsWholeItem(t *testing.T) {
 	}
 
 	whole := httptest.NewRecorder()
-	if err := writeOpenAIResponseReasoning(newOpenAIResponseStreamEmitter(whole, whole, "resp_1"), "rs_resp_1", 0, strings.Join(pieces, "")); err != nil {
+	wh := newResponseReasoningWriter(newOpenAIResponseStreamEmitter(whole, whole, "resp_1"), "rs_resp_1", 0)
+	if err := wh.Delta(strings.Join(pieces, "")); err != nil {
+		t.Fatal(err)
+	}
+	if err := wh.Close(); err != nil {
 		t.Fatal(err)
 	}
 

@@ -2707,14 +2707,6 @@ func (r *responseReasoningWriter) Close() error {
 	})
 }
 
-func writeOpenAIResponseReasoning(emitter *openAIResponseStreamEmitter, itemID string, outputIndex int, reasoningText string) error {
-	r := newResponseReasoningWriter(emitter, itemID, outputIndex)
-	if err := r.Delta(reasoningText); err != nil {
-		return err
-	}
-	return r.Close()
-}
-
 func writeOpenAIResponseStreamCompleted(emitter *openAIResponseStreamEmitter, responseID string, created int64, model string, result *service.ChatResult, messageID string, messageStarted bool, reasoningEmitted bool, streamedText string) {
 	outputIndex := 0
 	if reasoningEmitted {
