@@ -14,10 +14,12 @@ import (
 	"lingma-ipc-proxy/internal/service"
 )
 
-// stateFlushLockBudget is how long one full-ring app-state flush may hold a.mu.
-// Measured floor is ~40ms here, so this is headroom for contention, not a licence
-// to grow the payload.
-const stateFlushLockBudget = 250 * time.Millisecond
+// stateFlushPayloadBudget is how big the persisted app state may get. The flush
+// renders all of it while holding a.mu, which every request log line also needs,
+// so the payload size -- not a wall-clock number, which moves 10x between a plain
+// and a -race build -- is what has to stay bounded. The fixture below is the
+// designed maximum ring; this is that with ~20% headroom for indentation.
+const stateFlushPayloadBudget = 6 << 20
 
 // useTempInstanceProfile points both the per-install settings file and the app
 // state file at a temporary home, so no test can touch the real
@@ -345,13 +347,15 @@ func TestReleaseProxyOnlyClearsItsOwnGeneration(t *testing.T) {
 }
 
 // 924 §4.3 measured, not assumed: flushAppStateLocked marshals and writes while
-// holding a.mu, which every request log line also needs. The measurement says the
-// marshal is the whole cost and the WriteFile is ~1ms, so moving the write off the
-// lock would buy the cheap half; what has to stay true instead is the budget,
-// which is what this pins. If a change pushes the payload past its designed bound
-// (300 requests x two 8KB bodies, 1000 log lines), the flush goes red here rather
-// than quietly stalling the request path.
-func TestStateFlushHoldsTheLockForABoundedTime(t *testing.T) {
+// holding a.mu, which every request log line also needs. Measured here with the
+// ring full: rendering ~5 MB is ~45ms plain and ~600ms under -race, and the
+// WriteFile behind it is ~1ms -- so moving the write off the lock would buy the
+// cheap half of a cost that is really the render, and a wall-clock budget would
+// just fail in the instrumented build. What has to stay true is how much there is
+// to render, which is what this pins. If a change grows the persisted payload past
+// its designed bound (300 requests x two 8KB bodies, 1000 log lines), it goes red
+// here instead of quietly lengthening the stall every request waits behind.
+func TestStateFlushPayloadStaysBounded(t *testing.T) {
 	useTempInstanceProfile(t)
 
 	body := strings.Repeat("x", 8<<10)
@@ -396,10 +400,19 @@ func TestStateFlushHoldsTheLockForABoundedTime(t *testing.T) {
 	// write was not moved off a.mu -- the restructure would only buy the 1ms half.
 	// The budget below is ~5x the quiet median so contention cannot make this flap,
 	// while anything that pushes the payload past its designed bound still trips it.
+	// The mechanism that decides lock duty is how much state there is to render, so
+	// that is what gets bounded: 300 requests x two 8KB bodies plus 1000 log lines.
+	// Timing is the consequence, and it is build-mode dependent (~45ms plain, ~600ms
+	// under -race on this box), so it is only logged and held to the loose ceiling
+	// that a real pathology (an accidental re-scan per request) would break.
 	t.Logf("flushed %.2f MB of app state under a.mu for %s, of which rendering took %s",
 		float64(info.Size())/(1<<20), held.Round(time.Millisecond), rendered.Round(time.Millisecond))
-	if held > stateFlushLockBudget {
-		t.Fatalf("one flush held a.mu for %s, over the %s budget (render %s)",
-			held.Round(time.Millisecond), stateFlushLockBudget, rendered.Round(time.Millisecond))
+	if info.Size() > stateFlushPayloadBudget {
+		t.Fatalf("app state file is %.2f MB, over the %.1f MB budget: the flush renders it under a.mu, so bounding the payload is what bounds the stall",
+			float64(info.Size())/(1<<20), float64(stateFlushPayloadBudget)/(1<<20))
+	}
+	if held > appStateFlushInterval {
+		t.Fatalf("one flush held a.mu for %s, longer than the %s debounce interval it is supposed to fit inside",
+			held.Round(time.Millisecond), appStateFlushInterval)
 	}
 }
