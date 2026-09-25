@@ -52,7 +52,46 @@ type fileConfig struct {
 	QoderCLISites         []string `json:"qodercli_sites"`
 }
 
+// headlessLog takes the log off the console. Task Scheduler starts this build
+// inside an interactive console, and a console that stops servicing writes (a
+// quick-edit selection, a session whose window station went away) makes
+// WriteFile block rather than fail: measured on 192.168.50.239, the exe started
+// by the task sat at 0.12 s of total CPU and never bound its port, while the same
+// bytes started with stderr pointed at a file bound within 10 s and had already
+// logged five lines. The startup logs run before net.Listen, so a blocked write
+// there produces exactly the failure this box kept showing -- process alive, no
+// listener, nothing to read afterwards. So the log goes to
+// <UserConfigDir>\lingma-proxy\headless.log, and anyone watching it uses
+// `Get-Content -Wait`.
+func headlessLog() {
+	if runtime.GOOS != "windows" {
+		return
+	}
+	base, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(base) == "" {
+		base = os.TempDir()
+	}
+	dir := filepath.Join(base, "lingma-proxy")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	path := filepath.Join(dir, "headless.log")
+	// One generation of history is enough to answer "what did it do on boot", and
+	// a service nobody restarts must not grow without bound.
+	if fi, err := os.Stat(path); err == nil && fi.Size() > 5<<20 {
+		_ = os.Remove(path + ".old")
+		_ = os.Rename(path, path+".old")
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return
+	}
+	log.SetOutput(f)
+	log.Printf("log file: %s", path)
+}
+
 func main() {
+	headlessLog()
 	cfg, configPath := loadConfig()
 	if handleUtilityCommands(cfg) {
 		return
