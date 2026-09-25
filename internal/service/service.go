@@ -559,19 +559,96 @@ type cliCatalogEntry struct {
 	expiresAt time.Time
 }
 
+// persistedCLICatalog is one site's last good model list on disk. Without it a
+// restart pays a full CLI cold start before it can answer /v1/models: on
+// 192.168.50.239 the CLI's own logs show that cold start is the whole cost
+// (uptime_ms=24799 and 46591 for --list-models runs whose actual model work was
+// duration=1407ms catalog fetch + 2266ms runtime ready), and the first client
+// after a restart was measured answering 500 at 120.7s
+// (.scratch/s239_phases.txt, .scratch/s239_final2.txt). A seeded entry is also
+// expired-but-usable, so the probe that follows gets the short warm budget and
+// the caller gets the old list instead of an error.
+type persistedCLICatalog struct {
+	ExpiresAt time.Time `json:"expires_at"`
+	Names     []string  `json:"names"`
+}
+
+// cliCatalogDir is the seam the tests redirect.
+var cliCatalogDir = defaultCLICatalogDir
+
+func defaultCLICatalogDir() string {
+	base, err := os.UserConfigDir()
+	if err != nil || strings.TrimSpace(base) == "" {
+		base = os.TempDir()
+	}
+	return filepath.Join(base, "lingma-proxy")
+}
+
+func cliCatalogPath(site qodercli.Site) string {
+	dir := strings.TrimSpace(cliCatalogDir())
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, "cli-catalog-"+string(site.Normalized())+".json")
+}
+
+// readCLICatalog is best-effort: a missing or unreadable file is just no cache.
+func readCLICatalog(site qodercli.Site) cliCatalogEntry {
+	path := cliCatalogPath(site)
+	if path == "" {
+		return cliCatalogEntry{}
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return cliCatalogEntry{}
+	}
+	var doc persistedCLICatalog
+	if err := json.Unmarshal(data, &doc); err != nil || len(doc.Names) == 0 {
+		return cliCatalogEntry{}
+	}
+	return cliCatalogEntry{names: doc.Names, expiresAt: doc.ExpiresAt}
+}
+
+// writeCLICatalog mirrors the same best-effort rule: the in-memory cache already
+// answered this request, so a disk failure must not turn it into an error.
+func writeCLICatalog(site qodercli.Site, names []string, expiresAt time.Time) {
+	path := cliCatalogPath(site)
+	if path == "" || len(names) == 0 {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	data, err := json.Marshal(persistedCLICatalog{ExpiresAt: expiresAt, Names: names})
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		log.Printf("backend: %s CLI catalog could not be persisted to %s: %v", site.Label(), path, err)
+	}
+}
+
 func (s *Service) cliCatalogEntry(site qodercli.Site) cliCatalogEntry {
+	key := site.Normalized()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.cliCatalog[site.Normalized()]
+	entry := s.cliCatalog[key]
+	s.mu.Unlock()
+	if entry.names != nil {
+		return entry
+	}
+	// ponytail: reads the file on every miss (no disk list is only a failed Stat),
+	// because promoting it into memory would claim a freshness the file does not have.
+	return readCLICatalog(key)
 }
 
 func (s *Service) setCLICatalog(site qodercli.Site, names []string, expiresAt time.Time) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.cliCatalog == nil {
 		s.cliCatalog = map[qodercli.Site]cliCatalogEntry{}
 	}
 	s.cliCatalog[site.Normalized()] = cliCatalogEntry{names: names, expiresAt: expiresAt}
+	s.mu.Unlock()
+	writeCLICatalog(site, names, expiresAt)
 }
 
 // listCLIMergedModels lists the models of every served site. The international

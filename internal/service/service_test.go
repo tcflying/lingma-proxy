@@ -576,6 +576,7 @@ func TestSplitCLISiteReadsTheSiteMarkerFromAnySegment(t *testing.T) {
 // Electron subprocess that measures seconds, so /v1/models must not pay for one
 // while a site's catalog is still inside its TTL.
 func TestFreshCLICatalogIsServedWithoutProbing(t *testing.T) {
+	useCLICatalogDir(t)
 	s := &Service{cfg: Config{Backend: BackendQoderCLI}}
 	sites := s.cliSites()
 	if len(sites) == 0 {
@@ -604,6 +605,56 @@ func TestFreshCLICatalogIsServedWithoutProbing(t *testing.T) {
 		if len(ids) != 2 || ids[0] != "cached-a" {
 			t.Fatalf("site %v tier ids = %v, want the bare cached names", site, ids)
 		}
+	}
+}
+
+// useCLICatalogDir keeps catalog persistence writes out of the developer's real
+// config directory for the duration of one test.
+func useCLICatalogDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	previous := cliCatalogDir
+	cliCatalogDir = func() string { return dir }
+	t.Cleanup(func() { cliCatalogDir = previous })
+	return dir
+}
+
+// TestCLICatalogSurvivesRestart pins the cost of not having this on disk: a
+// fresh process with no in-memory cache must answer a new Service from the file
+// one Service wrote, otherwise every restart re-pays a CLI cold start that
+// measures 25-112s on a slow box and hands the first client a 500.
+func TestCLICatalogSurvivesRestart(t *testing.T) {
+	useCLICatalogDir(t)
+	names := []string{"cached-a", "cached-b"}
+
+	// Nothing written yet: the miss must read as "no names", because the caller
+	// picks its probe budget from exactly that difference.
+	if e := (&Service{}).cliCatalogEntry(qodercli.SiteCN); len(e.names) != 0 {
+		t.Fatalf("site with no persisted catalog = %v, want no names", e.names)
+	}
+
+	writer := &Service{}
+	writer.setCLICatalog(qodercli.SiteCN, names, time.Now().Add(time.Minute))
+	reader := &Service{}
+	got := reader.cliCatalogEntry(qodercli.SiteCN)
+	if len(got.names) != len(names) || got.names[0] != names[0] {
+		t.Fatalf("fresh service read %v, want the names the other service wrote", got.names)
+	}
+	if got.expiresAt.IsZero() {
+		t.Fatal("persisted expiry was lost")
+	}
+
+	// An expired file still counts: the request path falls back to it instead of
+	// reporting a site with no catalog, so the expiry must survive too.
+	expired := time.Now().Add(-time.Hour)
+	writer.setCLICatalog(qodercli.SiteGlobal, names, expired)
+	if e := (&Service{}).cliCatalogEntry(qodercli.SiteGlobal); !e.expiresAt.Before(time.Now()) {
+		t.Fatalf("global entry expiry = %v, want the stored past time %v", e.expiresAt, expired)
+	}
+
+	// The zero Site is the CN build, so it reads the same file.
+	if e := (&Service{}).cliCatalogEntry(qodercli.Site("")); len(e.names) != 2 {
+		t.Fatalf("zero Site = %v, want it to read the CN catalog", e.names)
 	}
 }
 
