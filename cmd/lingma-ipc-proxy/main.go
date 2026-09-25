@@ -117,20 +117,32 @@ func main() {
 		}
 	}()
 
-	// Warm up only once the port is open. Minting a CLI job token spawns the
-	// desktop runtime, and os/exec can go on waiting for a grandchild that inherited
-	// the output pipe after the context has killed the direct child. Warming before
-	// the listener meant such a wedged child silently left the proxy with no port at
-	// all -- measured on a LAN box: process alive, 0.02 s of CPU, no listener, no log.
-	// The budget is only a cache-priming bound now; a request path that finds nothing
-	// cached probes for itself, so lengthening it buys nothing a client can see.
-	warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := svc.Warmup(warmupCtx); err != nil {
-		log.Printf("warmup failed: %v", err)
-	} else {
-		log.Printf("Lingma IPC warmup completed")
-	}
-	warmupCancel()
+	// Warm up only once the port is open, and never inside a budget a client could
+	// be waiting on. Minting a CLI job token spawns the desktop runtime, and os/exec
+	// can go on waiting for a grandchild that inherited the output pipe after the
+	// context has killed the direct child -- warming before the listener meant such
+	// a wedged child silently left the proxy with no port at all.
+	//
+	// The budget is a priming bound for the on-disk per-site catalog, so it has to
+	// be long enough to *win*, not short enough to look polite: on
+	// 192.168.50.239 the process needed ~12 min of OS-side stall before it even
+	// reached net.Listen (headless.log: `log file:` at 06:29:30, `listening on` at
+	// 06:38:43 for a process started at 06:26:40), and one CLI model listing costs
+	// 36-47 s there. The old 10 s cap therefore cancelled every priming attempt on
+	// that box, which left the catalog empty forever and made each client pay its
+	// own cold probe -- measured as `/v1/models` failing at 156.7 s with six
+	// "cancelled before it finished" lines in one second. A client that arrives
+	// before priming finishes is served from the persisted catalog or gets a fast
+	// error; it is never queued behind this goroutine.
+	go func() {
+		warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer warmupCancel()
+		if err := svc.Warmup(warmupCtx); err != nil {
+			log.Printf("warmup failed: %v", err)
+		} else {
+			log.Printf("Lingma IPC warmup completed")
+		}
+	}()
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
