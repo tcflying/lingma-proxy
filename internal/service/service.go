@@ -531,10 +531,17 @@ type cliSiteListing struct {
 // A site with nothing cached yet gets cliColdProbeTimeout instead: cutting it
 // off at 8s with no fallback was measured to return the international 17 models
 // on its own, which reads to a client as "the CN catalog is empty".
+//
+// 120s is a ceiling, not a proven fix. On 192.168.50.239 the cold /v1/models
+// answered all 31 ids, but at 150.6s, 159.8s and 211.9s -- and two other
+// attempts 500'd after 102s and 182s -- because that box's CLI spawn can
+// outrun any budget a client will wait for, and a failed probe with nothing
+// cached has nothing to fall back to. That box needs the last good catalog kept
+// across restarts; a bigger number here cannot reach past its own deadline.
 const (
 	cliCatalogTTL       = 5 * time.Minute
 	cliProbeTimeout     = 8 * time.Second
-	cliColdProbeTimeout = 25 * time.Second
+	cliColdProbeTimeout = 120 * time.Second
 )
 
 type cliCatalogEntry struct {
