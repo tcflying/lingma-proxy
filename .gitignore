@@ -27,3 +27,6 @@ lingma-ipc-proxy.macos.json
 
 # Local iteration doc (not for git)
 ITERATION.md
+
+# Local probe scripts and their落盘 output; several carry the LAN passphrase
+.scratch/
