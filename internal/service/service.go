@@ -532,12 +532,14 @@ type cliSiteListing struct {
 // off at 8s with no fallback was measured to return the international 17 models
 // on its own, which reads to a client as "the CN catalog is empty".
 //
-// 120s is a ceiling, not a proven fix. On 192.168.50.239 the cold /v1/models
-// answered all 31 ids, but at 150.6s, 159.8s and 211.9s -- and two other
-// attempts 500'd after 102s and 182s -- because that box's CLI spawn can
-// outrun any budget a client will wait for, and a failed probe with nothing
-// cached has nothing to fall back to. That box needs the last good catalog kept
-// across restarts; a bigger number here cannot reach past its own deadline.
+// 120s is a ceiling, not a fix. On 192.168.50.239 four cold /v1/models calls
+// each returned all 31 ids and each took 149.4-211.9s; two others answered 500
+// after 102s and 182.3s (.scratch/s239_nine.txt, .scratch/s239_coldtime.txt).
+// Before this change that box answered 500 in ~25s forever, so the catalog is
+// now reachable there but no faster: the box's own CLI discovery is the cost,
+// and no budget makes a client want to wait three minutes for a model list.
+// What would actually help is not re-deriving the list per request at all --
+// keep the last good catalog across restarts.
 const (
 	cliCatalogTTL       = 5 * time.Minute
 	cliProbeTimeout     = 8 * time.Second
