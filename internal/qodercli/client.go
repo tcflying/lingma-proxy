@@ -33,6 +33,10 @@ type Client struct {
 // CreateProcess limit Windows enforces on the whole argv.
 const maxSystemPromptArgChars = 20000
 
+// cliStdoutDrainDelay is how long cmd.Wait() waits for exec's stdout copy
+// goroutine after the CLI process itself has exited.
+const cliStdoutDrainDelay = 3 * time.Second
+
 // maxCLIOutputLineBytes caps a single JSONL frame: the terminal result frame
 // carries the whole answer, and 8 MB is far above any measured turn. A var so the
 // oversized-line regression test can reach the ceiling without shipping 8 MB.
@@ -287,6 +291,15 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 		guard.release()
 		return cmd.Process.Kill()
 	}
+	// The guard covers descendants that were alive when it was released, not ones
+	// the CLI forks on its way out: measured on 192.168.50.239 the CN CLI logged
+	// `process.exiting exit_code=0 uptime_ms=36337` and the /v1/models call that
+	// started with it was still unanswered at 400 s, i.e. the exit status had
+	// arrived and only the stdout EOF had not. That EOF is exec's copy goroutine
+	// finishing, so cmd.Wait() was the parked call and nothing bounded it --
+	// WaitDelay is the stdlib version of "give the leftover holder three seconds,
+	// then close the pipe and take what was written".
+	cmd.WaitDelay = cliStdoutDrainDelay
 	cmd.Env = c.environment(credential)
 	var stdout, stderr bytes.Buffer
 	if stdin == nil {
