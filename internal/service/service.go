@@ -532,17 +532,25 @@ type cliSiteListing struct {
 // off at 8s with no fallback was measured to return the international 17 models
 // on its own, which reads to a client as "the CN catalog is empty".
 //
-// 120s is a ceiling, not a fix. On 192.168.50.239 four cold /v1/models calls
-// each returned all 31 ids and each took 149.4-211.9s; two others answered 500
-// after 102s and 182.3s (.scratch/s239_nine.txt, .scratch/s239_coldtime.txt).
-// Before this change that box answered 500 in ~25s forever, so the catalog is
-// now reachable there but no faster: the box's own CLI discovery is the cost,
-// and no budget makes a client want to wait three minutes for a model list.
-// What would actually help is not re-deriving the list per request at all --
-// keep the last good catalog across restarts.
+// 120s is a ceiling, not a fix. On 192.168.50.239 six cold /v1/models calls each
+// returned all 31 ids and each took 149.4-218.3s; two others answered 500 after
+// 102s and 182.3s (.scratch/s239_nine.txt, .scratch/s239_verify.txt,
+// .scratch/s239_coldtime.txt). Chats are the same shape: 151.9s for one intl
+// reply and a CN request that never answered inside 290s. So the catalog became
+// reachable on that box and nothing else changed -- its CLI spawn is the cost,
+// and no budget makes a client want to wait three minutes. What would is not
+// re-deriving the list per request: keep the last good catalog across restarts.
 const (
-	cliCatalogTTL       = 5 * time.Minute
-	cliProbeTimeout     = 8 * time.Second
+	// One probe costs ~3-17s here but 149-218s on 192.168.50.239, and the answer
+	// changes on the order of days. A 5m TTL made that box pay a fresh three-minute
+	// discovery about twelve times an hour, i.e. it was probing almost continuously;
+	// an hour keeps the cache honest about its own staleness while making one
+	// success buy an hour of quiet.
+	cliCatalogTTL = time.Hour
+	// A warm cache is read on the request path, so a refresh that overruns this
+	// answers from the cache the caller already has.
+	cliProbeTimeout = 8 * time.Second
+	// Nothing cached yet: there is no fallback, so this one is allowed to be slow.
 	cliColdProbeTimeout = 120 * time.Second
 )
 
