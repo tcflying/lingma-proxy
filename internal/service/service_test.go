@@ -588,7 +588,7 @@ func TestFreshCLICatalogIsServedWithoutProbing(t *testing.T) {
 		s.setCLICatalog(site, []string{"cached-a", "cached-b"}, time.Now().Add(time.Minute))
 	}
 
-	out, err := s.listCLIMergedModels(context.Background())
+	out, err := s.listCLIMergedModels(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("listCLIMergedModels: %v", err)
 	}

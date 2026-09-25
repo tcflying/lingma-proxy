@@ -427,7 +427,7 @@ func (s *Service) warmCLISites(ctx context.Context) error {
 			log.Printf("backend: %s CLI warmup failed: %v", site.Label(), err)
 			continue
 		}
-		s.cachedCLIModels(ctx, site)
+		s.cachedCLIModels(ctx, site, cliPrimeProbeTimeout)
 		warmed = true
 	}
 	if !warmed {
@@ -552,6 +552,15 @@ const (
 	cliProbeTimeout = 8 * time.Second
 	// Nothing cached yet: there is no fallback, so this one is allowed to be slow.
 	cliColdProbeTimeout = 120 * time.Second
+	// The warm-up pass has no client waiting on it, so it is the one caller allowed
+	// to outlast the two budgets above. It matters because those budgets sit at or
+	// below what one probe costs on the slow box (36-47s when it is quiet there,
+	// 149-218s when it is not): priming that inherits them never writes a cache, so
+	// headless.log on 192.168.50.239 shows every discovery attempt ending in
+	// "cancelled before it finished: context deadline exceeded" while the
+	// cli-catalog-*.json files never appear at all. Raising the client-visible cap
+	// instead would make a caller wait minutes for a list, which is its own outage.
+	cliPrimeProbeTimeout = 15 * time.Minute
 )
 
 type cliCatalogEntry struct {
@@ -663,7 +672,11 @@ func (s *Service) setCLICatalog(site qodercli.Site, names []string, expiresAt ti
 // /v1/models exactly the same way once the box's own Qoder session went busy, mutex
 // or not. The probe budgets and the catalog TTL are what bound this. If concurrent
 // probes ever measure as the cost, fix cmd.Wait() to kill the whole process tree.
-func (s *Service) listCLIMergedModels(ctx context.Context) ([]Model, error) {
+//
+// probeBudget raises the per-site bound above the client-facing ones; that is what
+// the warm-up pass passes so priming can win on a box where one probe costs more
+// than a client should ever wait. 0 keeps the request-path behaviour.
+func (s *Service) listCLIMergedModels(ctx context.Context, probeBudget time.Duration) ([]Model, error) {
 	sites := s.cliSites()
 	now := time.Now()
 	listings := make([]cliSiteListing, len(sites))
@@ -686,6 +699,9 @@ func (s *Service) listCLIMergedModels(ctx context.Context) ([]Model, error) {
 			timeout := cliProbeTimeout
 			if stale == nil {
 				timeout = cliColdProbeTimeout
+			}
+			if probeBudget > timeout {
+				timeout = probeBudget
 			}
 			probeCtx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
@@ -782,7 +798,7 @@ func (s *Service) setCLIModels(site qodercli.Site, ids []string) {
 
 func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
 	if s.backend() == BackendQoderCLI {
-		return s.listCLIMergedModels(ctx)
+		return s.listCLIMergedModels(ctx, 0)
 	}
 
 	if s.backend() == BackendRemote {
@@ -1431,7 +1447,7 @@ func (s *Service) resolveCLIModel(ctx context.Context, model string, site qoderc
 	if alias, ok := cliModelAliases[strings.ToLower(wanted)]; ok {
 		wanted = alias
 	}
-	known := s.cachedCLIModels(ctx, site)
+	known := s.cachedCLIModels(ctx, site, 0)
 	if len(known) == 0 {
 		if wanted == "" {
 			return "Auto"
@@ -1475,7 +1491,7 @@ func cliModelFamily(model string) string {
 
 // cachedCLIModels returns one site's model list, discovering it on first use.
 // The names are bare, as the CLI wants them.
-func (s *Service) cachedCLIModels(ctx context.Context, site qodercli.Site) []string {
+func (s *Service) cachedCLIModels(ctx context.Context, site qodercli.Site, probeBudget time.Duration) []string {
 	read := func() []string {
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -1484,7 +1500,7 @@ func (s *Service) cachedCLIModels(ctx context.Context, site qodercli.Site) []str
 	if cached := read(); len(cached) > 0 {
 		return cached
 	}
-	if _, err := s.listCLIMergedModels(ctx); err != nil {
+	if _, err := s.listCLIMergedModels(ctx, probeBudget); err != nil {
 		log.Printf("backend: %s CLI model discovery failed: %v", site.Label(), err)
 	}
 	return read()

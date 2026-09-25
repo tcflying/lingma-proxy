@@ -123,19 +123,14 @@ func main() {
 	// context has killed the direct child -- warming before the listener meant such
 	// a wedged child silently left the proxy with no port at all.
 	//
-	// The budget is a priming bound for the on-disk per-site catalog, so it has to
-	// be long enough to *win*, not short enough to look polite: on
-	// 192.168.50.239 the process needed ~12 min of OS-side stall before it even
-	// reached net.Listen (headless.log: `log file:` at 06:29:30, `listening on` at
-	// 06:38:43 for a process started at 06:26:40), and one CLI model listing costs
-	// 36-47 s there. The old 10 s cap therefore cancelled every priming attempt on
-	// that box, which left the catalog empty forever and made each client pay its
-	// own cold probe -- measured as `/v1/models` failing at 156.7 s with six
-	// "cancelled before it finished" lines in one second. A client that arrives
-	// before priming finishes is served from the persisted catalog or gets a fast
-	// error; it is never queued behind this goroutine.
+	// The goroutine keeps the port open to clients either way: the point of this
+	// pass is to land the per-site catalog on disk (internal/service's
+	// cliPrimeProbeTimeout bounds each probe), and a request that arrives while it
+	// runs is served from the persisted catalog or fails fast, never queued here.
+	// The 10 s this used to carry was measured to lose on 192.168.50.239, where one
+	// discovery costs 36-47s at best.
 	go func() {
-		warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		warmupCtx, warmupCancel := context.WithTimeout(context.Background(), 45*time.Minute)
 		defer warmupCancel()
 		if err := svc.Warmup(warmupCtx); err != nil {
 			log.Printf("warmup failed: %v", err)
