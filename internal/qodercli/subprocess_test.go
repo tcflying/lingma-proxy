@@ -28,6 +28,9 @@ const (
 	fakeSilentExit = "silent-exit"
 	// fakeFlood keeps writing well past the capture ceiling.
 	fakeFlood = "flood"
+	// fakeLingersAfterResult prints its terminal frame and then refuses to leave,
+	// which is what 192.168.50.239's CLI does to a finished turn.
+	fakeLingersAfterResult = "linger-after-result"
 )
 
 func TestMain(m *testing.M) {
@@ -60,6 +63,9 @@ func runFakeCLI(mode string) {
 		os.Stdout.WriteString(strings.Repeat("x", 1<<20))
 		fmt.Println()
 		fmt.Println(`{"type":"result","subtype":"success","result":"这一帧永远读不到"}`)
+	case fakeLingersAfterResult:
+		fmt.Println(`{"type":"result","subtype":"success","result":"answered, process still here"}`)
+		time.Sleep(2 * time.Minute)
 	case fakeSilentExit:
 		os.Exit(7)
 	case fakeFlood:
@@ -247,5 +253,41 @@ func TestCapturedOutputStopsAtTheCeiling(t *testing.T) {
 	}
 	if len(text) > maxCLICapturedOutputBytes+512 {
 		t.Fatalf("captured %d bytes, want the %d byte ceiling held", len(text), maxCLICapturedOutputBytes)
+	}
+}
+
+// TestChatDoesNotWaitForAProcessThatAlreadyAnswered is the 192.168.50.239 chat
+// shape: the CLI emits its terminal frame ~50s in (`process.exiting exit_code=0
+// uptime_ms=49493`) and keeps its host process alive, while the HTTP request that
+// started it was still unanswered at 400s. The answer must not be held hostage to
+// the process leaving.
+func TestChatDoesNotWaitForAProcessThatAlreadyAnswered(t *testing.T) {
+	t.Setenv(fakeCLIArgvEnv, "")
+	c := fakeCLIClient(t, fakeLingersAfterResult, 0)
+
+	type outcome struct {
+		text string
+		err  error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		res, err := c.Chat(context.Background(), remote.ChatRequest{Prompt: "hi", Model: "m"}, nil)
+		text := ""
+		if res != nil {
+			text = res.Text
+		}
+		done <- outcome{text: text, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Chat: %v", got.err)
+		}
+		if got.text != "answered, process still here" {
+			t.Fatalf("text = %q, want the terminal frame's answer", got.text)
+		}
+	case <-time.After(45 * time.Second):
+		t.Fatal("Chat is still waiting for a CLI that already emitted its result frame")
 	}
 }

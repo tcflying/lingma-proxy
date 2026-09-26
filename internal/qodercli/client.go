@@ -37,6 +37,11 @@ const maxSystemPromptArgChars = 20000
 // goroutine after the CLI process itself has exited.
 const cliStdoutDrainDelay = 3 * time.Second
 
+// cliResultTeardownGrace is how long the CLI process gets to leave on its own
+// after its terminal result frame. It exists for installs that answer and then
+// keep an Electron host alive for minutes.
+const cliResultTeardownGrace = 5 * time.Second
+
 // maxCLIOutputLineBytes caps a single JSONL frame: the terminal result frame
 // carries the whole answer, and 8 MB is far above any measured turn. A var so the
 // oversized-line regression test can reach the ceiling without shipping 8 MB.
@@ -240,6 +245,23 @@ func userFrame(prompt string, images []remote.Image) ([]byte, error) {
 	return append(frame, '\n'), nil
 }
 
+// isTerminalFrame reports the CLI's own "this turn is over" frame. It is the
+// signal that no more answer text can arrive, so the process may be given a short
+// grace to exit on its own and be killed after that.
+func isTerminalFrame(line string) bool {
+	line = strings.TrimSpace(line)
+	if !strings.HasPrefix(line, "{") || !strings.Contains(line, `"result"`) {
+		return false
+	}
+	var frame struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal([]byte(line), &frame); err != nil {
+		return false
+	}
+	return frame.Type == "result"
+}
+
 // partialTextDelta picks the text out of a stream_event delta frame. Everything
 // else - thinking, tool spans, lifecycle events - stays buffered for the final
 // parse, because the proxy's own text filter needs the whole answer.
@@ -302,26 +324,23 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	cmd.WaitDelay = cliStdoutDrainDelay
 	cmd.Env = c.environment(credential)
 	var stdout, stderr bytes.Buffer
+	// teardown kills the CLI process once the answer is complete but the process is
+	// still with us; declared here so the Wait below can stop it.
+	var teardown *time.Timer
 	if stdin == nil {
 		cmd.Stdin = strings.NewReader("")
 	} else {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
 	cmd.Stderr = &stderr
+	// stdout always goes through a pipe, even when nobody streams: the loop below
+	// is the only place that can tell "the turn is over" from "the CLI is still
+	// running", and that distinction is what the teardown timer needs.
 	var pipe io.ReadCloser
-	if onLine == nil {
+	if opened, pipeErr := cmd.StdoutPipe(); pipeErr != nil {
 		cmd.Stdout = &stdout
 	} else {
-		// The pipe path is what turns this backend from "wait for the whole turn"
-		// into a stream. The scan must finish in this goroutine before Wait, which
-		// closes the pipe once the process exits.
-		opened, pipeErr := cmd.StdoutPipe()
-		if pipeErr != nil {
-			cmd.Stdout = &stdout
-			onLine = nil
-		} else {
-			pipe = opened
-		}
+		pipe = opened
 	}
 	startErr := cmd.Start()
 	if startErr == nil {
@@ -330,15 +349,16 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 		guard.assign(cmd.Process)
 	}
 	if startErr == nil && pipe != nil {
-		// ponytail: this read has no deadline of its own -- Windows leaves a parked
-		// pipe read alone (measured: a timer-driven pipe.Close came back 15.03s later,
-		// exactly when the write-end holder exited, and a read end made with os.Pipe
-		// here never saw EOF at all). What bounds it is cmd.Cancel: the deadline
-		// releases the job guard, which kills every process in the tree and closes the
-		// write end with them. Off Windows the guard is a no-op, so a wedged
-		// grandchild still pins this read to the child's own exit; upgrade path there
-		// is a temporary file for stdout (a file read cannot be wedged by another
-		// holder) or setpgid plus kill(-pgid).
+		// ponytail: a read that is still parked past the last frame has no deadline
+		// of its own -- Windows leaves a parked pipe read alone (measured: a
+		// timer-driven pipe.Close came back 15.03s later, exactly when the write-end
+		// holder exited, and a read end made with os.Pipe here never saw EOF at all).
+		// Two things bound it: the terminal-frame teardown below, and cmd.Cancel,
+		// whose deadline releases the job guard and kills every process in the tree.
+		// The frame check only helps a turn that produced a frame, so a wedged CLI on
+		// a non-chat call still waits for its own exit; off Windows the guard is a
+		// no-op, so the upgrade path there is a temporary file for stdout (a file read
+		// cannot be wedged by another holder) or setpgid plus kill(-pgid).
 		scanner := bufio.NewScanner(pipe)
 		scanner.Buffer(make([]byte, 0, 64*1024), maxCLIOutputLineBytes)
 		var scanErr error
@@ -350,7 +370,22 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 			}
 			stdout.WriteString(line)
 			stdout.WriteByte('\n')
-			onLine(line)
+			if onLine != nil {
+				onLine(line)
+			}
+			// The CLI's own terminal frame means the answer is complete; whatever
+			// the process does after it (an Electron host that outlives the turn by
+			// minutes) is teardown we do not need to watch. Measured on
+			// 192.168.50.239: its log says `process.exiting exit_code=0
+			// uptime_ms=49493` for a turn whose HTTP request was still unanswered at
+			// 400 s, because cmd.Wait() blocks on the process, not on the answer.
+			if teardown == nil && isTerminalFrame(line) {
+				teardown = time.AfterFunc(cliResultTeardownGrace, func() {
+					// Release the guard first so the whole tree goes, not just the child.
+					guard.release()
+					_ = cmd.Process.Kill()
+				})
+			}
 		}
 		if err := scanner.Err(); err != nil && scanErr == nil {
 			scanErr = err
@@ -370,6 +405,9 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	var waitErr error
 	if startErr == nil {
 		waitErr = cmd.Wait()
+		if teardown != nil {
+			teardown.Stop()
+		}
 	} else {
 		waitErr = startErr
 	}
