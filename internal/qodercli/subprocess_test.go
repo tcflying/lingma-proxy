@@ -64,6 +64,7 @@ func runFakeCLI(mode string) {
 		fmt.Println()
 		fmt.Println(`{"type":"result","subtype":"success","result":"这一帧永远读不到"}`)
 	case fakeLingersAfterResult:
+		fmt.Println(`{"type":"assistant","message":{"content":[{"type":"text","text":"answered, process still here"}]}}`)
 		fmt.Println(`{"type":"result","subtype":"success","result":"answered, process still here"}`)
 		time.Sleep(2 * time.Minute)
 	case fakeSilentExit:
@@ -270,6 +271,7 @@ func TestChatDoesNotWaitForAProcessThatAlreadyAnswered(t *testing.T) {
 		err  error
 	}
 	done := make(chan outcome, 1)
+	started := time.Now()
 	go func() {
 		res, err := c.Chat(context.Background(), remote.ChatRequest{Prompt: "hi", Model: "m"}, nil)
 		text := ""
@@ -279,15 +281,22 @@ func TestChatDoesNotWaitForAProcessThatAlreadyAnswered(t *testing.T) {
 		done <- outcome{text: text, err: err}
 	}()
 
+	// The grace period is five seconds, so anything that has to wait for the kill
+	// misses this bar: the read must stop at the frame, not at the teardown.
+	budget := 4 * time.Second
 	select {
-	case got := <-done:
-		if got.err != nil {
-			t.Fatalf("Chat: %v", got.err)
+	case got := <-time.After(budget):
+		_ = got
+		t.Fatalf("Chat did not return within %s of a CLI that emitted its result frame", budget)
+	case out := <-done:
+		if out.err != nil {
+			t.Fatalf("Chat: %v", out.err)
 		}
-		if got.text != "answered, process still here" {
-			t.Fatalf("text = %q, want the terminal frame's answer", got.text)
+		if out.text != "answered, process still here" {
+			t.Fatalf("text = %q, want the terminal frame's answer", out.text)
 		}
-	case <-time.After(45 * time.Second):
-		t.Fatal("Chat is still waiting for a CLI that already emitted its result frame")
+		if elapsed := time.Since(started); elapsed > budget {
+			t.Fatalf("returned in %s, want the read to stop at the frame", elapsed.Round(time.Millisecond))
+		}
 	}
 }

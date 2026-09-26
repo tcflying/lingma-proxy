@@ -327,6 +327,8 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	// teardown kills the CLI process once the answer is complete but the process is
 	// still with us; declared here so the Wait below can stop it.
 	var teardown *time.Timer
+	// answered marks that the scan stopped because the CLI's terminal frame arrived.
+	var answered bool
 	if stdin == nil {
 		cmd.Stdin = strings.NewReader("")
 	} else {
@@ -373,18 +375,25 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 			if onLine != nil {
 				onLine(line)
 			}
-			// The CLI's own terminal frame means the answer is complete; whatever
-			// the process does after it (an Electron host that outlives the turn by
-			// minutes) is teardown we do not need to watch. Measured on
-			// 192.168.50.239: its log says `process.exiting exit_code=0
-			// uptime_ms=49493` for a turn whose HTTP request was still unanswered at
-			// 400 s, because cmd.Wait() blocks on the process, not on the answer.
-			if teardown == nil && isTerminalFrame(line) {
+			// The CLI's own terminal frame means the answer is complete. Keep reading
+			// and this loop parks on the *next* line forever: the write end is still
+			// held by whatever the install left behind, so neither cmd.Wait() nor its
+			// WaitDelay is ever reached. Measured on 192.168.50.239, where the CLI
+			// logged `Headless session completed successfully uptime_ms=47433` and the
+			// /v1/chat/completions that started with it was still unanswered at 400 s.
+			if isTerminalFrame(line) {
+				answered = true
+				// The process gets five seconds to leave on its own, then the tree is
+				// taken down. Killing it is not what unblocks us -- stopping the read
+				// is -- but leaving an answered CLI running leaks a process per turn.
 				teardown = time.AfterFunc(cliResultTeardownGrace, func() {
-					// Release the guard first so the whole tree goes, not just the child.
+					// Best-effort tree kill: a child that the Task Scheduler already
+					// put in another job cannot be assigned here, so the guard may
+					// hold nothing and only the direct child dies.
 					guard.release()
 					_ = cmd.Process.Kill()
 				})
+				break
 			}
 		}
 		if err := scanner.Err(); err != nil && scanErr == nil {
@@ -404,6 +413,14 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	}
 	var waitErr error
 	if startErr == nil {
+		if answered {
+			// Stopping the read is not enough: cmd.Wait() would then block on the
+			// process leaving instead, and an answered CLI that lingers for minutes
+			// is exactly the shape this box has. Reap it in the background; the
+			// teardown timer and the deferred guard release are what take it down.
+			go func() { _ = cmd.Wait() }()
+			return stdout.String(), nil
+		}
 		waitErr = cmd.Wait()
 		if teardown != nil {
 			teardown.Stop()
