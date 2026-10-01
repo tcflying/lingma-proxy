@@ -1,0 +1,6 @@
+# Go sources are LF everywhere. The working tree of this checkout is mostly CRLF
+# and the index is LF, which is invisible until a clone lands on a different
+# core.autocrlf: then the 8 LF files show up as whole-file rewrites and blame
+# attributes lines to the wrong commits. Naming the line ending here settles it
+# per file rather than per machine, without rewriting a single file.
+*.go text eol=lf

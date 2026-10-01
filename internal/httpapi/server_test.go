@@ -7,12 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -375,7 +378,7 @@ func TestWriteOpenAIResponseStreamCompletedToolOnlyEmitsFunctionCallLifecycle(t 
 		}},
 	}
 
-	writeOpenAIResponseStreamCompleted(emitter, "resp_1", 123, "kmodel", result, "msg_1", false, false, "")
+	writeOpenAIResponseStreamCompleted(emitter, "resp_1", 123, "kmodel", result, "msg_1", false, false, false, "")
 
 	body := rec.Body.String()
 	if strings.Contains(body, "\"type\":\"message\"") {
@@ -670,6 +673,95 @@ func TestAnthropicCountTokensEndpoint(t *testing.T) {
 	}
 }
 
+// The /anthropic-prefixed aliases exist for clients whose base URL embeds the
+// provider prefix (MiniMax's mmx CLI). Both paths must reach the exact same
+// handlers: same count_tokens estimate, and a non-streaming /v1/messages turn
+// that answers identically apart from the per-call message id.
+func TestAnthropicAliasRoutesServeSameHandlers(t *testing.T) {
+	server := NewServer("", service.New(service.Config{
+		Model:   "Qwen3-Coder",
+		Timeout: time.Second,
+	}))
+
+	const countBody = `{
+		"model":"kmodel",
+		"max_tokens":128,
+		"system":"You are concise.",
+		"messages":[{"role":"user","content":"hello"}],
+		"tools":[{"name":"read_file","input_schema":{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"]}}]
+	}`
+	var canonicalTokens float64
+	for _, path := range []string{"/v1/messages/count_tokens", "/anthropic/v1/messages/count_tokens"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(countBody))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		server.http.Handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d body = %s", path, rec.Code, rec.Body.String())
+		}
+		var body map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		tokens, _ := body["input_tokens"].(float64)
+		if tokens <= 0 {
+			t.Fatalf("%s: input_tokens = %#v", path, body["input_tokens"])
+		}
+		if canonicalTokens == 0 {
+			canonicalTokens = tokens
+		} else if tokens != canonicalTokens {
+			t.Fatalf("input_tokens drifted between paths: %v vs %v", canonicalTokens, tokens)
+		}
+	}
+
+	stub := newStubRemoteProxy(t, "alias route nonce answer")
+	requestBody, err := json.Marshal(map[string]any{
+		"model":      streamGuardModelName,
+		"max_tokens": 64,
+		"messages":   []any{map[string]any{"role": "user", "content": "hello"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var canonical map[string]any
+	for _, path := range []string{"/v1/messages", "/anthropic/v1/messages"} {
+		resp, err := http.Post(stub.proxy.URL+path, "application/json", bytes.NewReader(requestBody))
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		raw, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status = %d body = %s", path, resp.StatusCode, raw)
+		}
+		var body map[string]any
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if body["type"] != "message" || body["role"] != "assistant" || body["stop_reason"] != "end_turn" {
+			t.Fatalf("%s: unexpected envelope: %s", path, raw)
+		}
+		content, ok := body["content"].([]any)
+		if !ok || len(content) != 1 {
+			t.Fatalf("%s: content = %s", path, raw)
+		}
+		textBlock, _ := content[0].(map[string]any)
+		if textBlock["type"] != "text" || textBlock["text"] != "alias route nonce answer" {
+			t.Fatalf("%s: unexpected first block: %s", path, raw)
+		}
+		delete(body, "id") // msg_<unix-nano> differs per call by design
+		if canonical == nil {
+			canonical = body
+		} else if !reflect.DeepEqual(canonical, body) {
+			t.Fatalf("response drifted between paths:\ncanonical: %v\nalias:     %v", canonical, body)
+		}
+	}
+}
+
 func TestDiscoveryCompatibilityEndpoints(t *testing.T) {
 	server := NewServer("", service.New(service.Config{
 		Model:   "Qwen3-Coder",
@@ -726,6 +818,23 @@ func streamThrough(t *testing.T, filter *toolStreamFilter, deltas ...string) str
 	}
 	out.WriteString(strings.Join(filter.Flush(), ""))
 	return out.String()
+}
+
+// TestToolStreamFilterFlushDecidesMarkerlessHybrids: a hybrid block whose JSON
+// completed but whose wrapper never closed is undecidable mid-stream, so the
+// stream holds it; Flush runs the final-text parse and must keep only the prose
+// around it, exactly like the non-streaming path would.
+func TestToolStreamFilterFlushDecidesMarkerlessHybrids(t *testing.T) {
+	open := "<" + "tool_call" + ">"
+	body := `{"tool": "Bash", "parameters": {"command": "pwd"}}`
+
+	filter := newToolStreamFilter(streamFilterRequest())
+	if chunks := filter.Push("前段" + open + "\n" + body); len(chunks) != 1 || chunks[0] != "前段" {
+		t.Fatalf("prose before an open hybrid must stream, got %#v", chunks)
+	}
+	if got := strings.Join(filter.Flush(), ""); strings.TrimSpace(got) != "" {
+		t.Fatalf("flush must strip the markerless hybrid block, got %q", got)
+	}
 }
 
 func TestToolStreamFilterStreamsNormalTextWithTools(t *testing.T) {
@@ -1172,7 +1281,15 @@ func TestFetchImageHonorsContextAndByteCap(t *testing.T) {
 		case "/redirect-metadata":
 			http.Redirect(w, r, "http://169.254.169.254/x.png", http.StatusFound)
 		default:
-			_, _ = w.Write([]byte{0x89, 0x50, 0x4e, 0x47})
+			// A real image, declared as one. fetchImageAsBase64 refuses an
+			// answer that is not image/* any more: a URL that returns JSON,
+			// HTML or plain text is not a picture, and base64-ing it into the
+			// model prompt is the read half of the SSRF chain that the Origin
+			// gate only closes for browsers. The four PNG magic bytes this used
+			// to write are not an image to Go's own content sniffer, which
+			// answered text/plain for them.
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(harden933PNG())
 		}
 	}))
 	defer srv.Close()
@@ -1361,7 +1478,7 @@ func TestStreamCompletedClosesMessageAnnouncedOnlyByDeltas(t *testing.T) {
 		}},
 	}
 
-	writeOpenAIResponseStreamCompleted(emitter, "resp_1", 123, "kmodel", result, "msg_1", true, false, "let me read that ")
+	writeOpenAIResponseStreamCompleted(emitter, "resp_1", 123, "kmodel", result, "msg_1", true, false, false, "let me read that ")
 
 	body := rec.Body.String()
 	if !strings.Contains(body, "\"type\":\"response.output_text.done\"") {
@@ -1388,7 +1505,7 @@ func TestStreamCompletedClosesMessageOpenedByWhitespaceOnlyDelta(t *testing.T) {
 		}},
 	}
 
-	writeOpenAIResponseStreamCompleted(emitter, "resp_1", 123, "kmodel", result, "msg_1", true, false, " ")
+	writeOpenAIResponseStreamCompleted(emitter, "resp_1", 123, "kmodel", result, "msg_1", true, false, false, " ")
 
 	body := rec.Body.String()
 	for _, want := range []string{
@@ -1561,5 +1678,640 @@ func TestFullQueueRefusesInsteadOfGoingSilent(t *testing.T) {
 	}
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want %d, body = %s", rec.Code, http.StatusTooManyRequests, rec.Body.String())
+	}
+}
+
+// 931 real acceptance: a first turn streamed "I'll read both fixture files
+// now." plus two function_call items, but response.completed's output array
+// carried only the function calls with output_text empty. The final frame has
+// to stay faithful to what the stream already announced.
+func TestStreamCompletedResponseCarriesStreamedMessageAndCallsFaithfully(t *testing.T) {
+	rec := httptest.NewRecorder()
+	emitter := newOpenAIResponseStreamEmitter(rec, rec, "resp_1")
+	streamed := "I'll read both fixture files now.\n\n"
+	result := &service.ChatResult{
+		Model: "kmodel",
+		Text:  streamed,
+		ToolCalls: []toolemulation.ToolCall{
+			{ID: "call_1", Name: "read_fixture", Arguments: map[string]any{"path": "alpha.txt"}},
+			{ID: "call_2", Name: "read_fixture", Arguments: map[string]any{"path": "beta.txt"}},
+		},
+	}
+
+	writeOpenAIResponseStreamCompleted(emitter, "resp_1", 123, "kmodel", result, "msg_1", true, false, false, streamed)
+
+	var completed map[string]any
+	messageDoneIndexes := []int{}
+	callDoneIndexes := map[string]int{}
+	for _, block := range strings.Split(rec.Body.String(), "\n\n") {
+		var name, data string
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "event: ") {
+				name = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		if name == "" || data == "" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			t.Fatalf("unparseable SSE payload for %s: %v (%s)", name, err, data)
+		}
+		switch name {
+		case "response.completed":
+			completed = payload
+		case "response.output_item.done":
+			item, _ := payload["item"].(map[string]any)
+			index, _ := payload["output_index"].(float64)
+			switch item["type"] {
+			case "message":
+				messageDoneIndexes = append(messageDoneIndexes, int(index))
+				content, _ := item["content"].([]any)
+				if len(content) != 1 {
+					t.Fatalf("message done content = %#v", item["content"])
+				}
+				part, _ := content[0].(map[string]any)
+				if part["text"] != streamed {
+					t.Fatalf("message done text = %q, want the streamed bytes verbatim", part["text"])
+				}
+			case "function_call":
+				callDoneIndexes[item["call_id"].(string)] = int(index)
+			}
+		}
+	}
+	if completed == nil {
+		t.Fatal("no response.completed event in stream")
+	}
+
+	response, _ := completed["response"].(map[string]any)
+	output, _ := response["output"].([]any)
+	if len(output) != 3 {
+		t.Fatalf("completed output = %#v, want [message, function_call, function_call]", output)
+	}
+	msg, _ := output[0].(map[string]any)
+	if msg["type"] != "message" || msg["id"] != "msg_1" {
+		t.Fatalf("completed output[0] = %#v, want the streamed message item with its id", msg)
+	}
+	content, _ := msg["content"].([]any)
+	if len(content) != 1 {
+		t.Fatalf("completed message content = %#v", msg["content"])
+	}
+	part, _ := content[0].(map[string]any)
+	if part["text"] != streamed {
+		t.Fatalf("completed message text = %q, want the streamed bytes verbatim", part["text"])
+	}
+	fc1, _ := output[1].(map[string]any)
+	fc2, _ := output[2].(map[string]any)
+	if fc1["call_id"] != "call_1" || fc2["call_id"] != "call_2" {
+		t.Fatalf("completed call order = %v, %v", fc1["call_id"], fc2["call_id"])
+	}
+	if response["output_text"] != streamed {
+		t.Fatalf("completed output_text = %q, want the streamed text", response["output_text"])
+	}
+
+	// The completed array must sit at the same indexes the done events used, so
+	// a client reconciling the stream against the final frame finds one history.
+	if len(messageDoneIndexes) != 1 || messageDoneIndexes[0] != 0 {
+		t.Fatalf("message done indexes = %v, want [0]", messageDoneIndexes)
+	}
+	if callDoneIndexes["call_1"] != 1 || callDoneIndexes["call_2"] != 2 {
+		t.Fatalf("call done indexes = %v, want call_1=1 call_2=2", callDoneIndexes)
+	}
+}
+
+// The non-streaming Responses body shares the text+tools path with the final
+// stream frame: dropping the prose whenever a tool call won lost the answer in
+// JSON mode too.
+func TestBuildOpenAIResponseBodyKeepsTextAlongsideToolCalls(t *testing.T) {
+	result := &service.ChatResult{
+		Model: "kmodel",
+		Text:  "I'll read both fixture files now.",
+		ToolCalls: []toolemulation.ToolCall{{
+			ID:        "call_1",
+			Name:      "read_fixture",
+			Arguments: map[string]any{"path": "alpha.txt"},
+		}},
+	}
+
+	body := buildOpenAIResponseBody("resp_1", 123, "kmodel", result, "", false)
+
+	output, ok := body["output"].([]map[string]any)
+	if !ok {
+		t.Fatalf("output type = %T", body["output"])
+	}
+	if len(output) != 2 {
+		t.Fatalf("output len = %d, want message + function_call: %#v", len(output), output)
+	}
+	if output[0]["type"] != "message" {
+		t.Fatalf("output[0] = %#v, want the message item ahead of the call", output[0])
+	}
+	content, _ := output[0]["content"].([]map[string]any)
+	if len(content) != 1 || content[0]["text"] != "I'll read both fixture files now." {
+		t.Fatalf("message content = %#v", output[0]["content"])
+	}
+	if output[1]["type"] != "function_call" || output[1]["call_id"] != "call_1" {
+		t.Fatalf("output[1] = %#v, want the function call", output[1])
+	}
+	if body["output_text"] != "I'll read both fixture files now." {
+		t.Fatalf("output_text = %#v", body["output_text"])
+	}
+}
+
+// 931 real acceptance, aggregate path: turn 2 of cn-agg-responses-sse carried a
+// full nonce message in the final frame but not one response.output_text.delta
+// -- clients assemble the answer from deltas, so the done-only lifecycle left
+// the text invisible. A message the stream never announced has to be opened,
+// delta'd, and closed in protocol order.
+func TestStreamCompletedEmitsDeltaForUnannouncedText(t *testing.T) {
+	rec := httptest.NewRecorder()
+	emitter := newOpenAIResponseStreamEmitter(rec, rec, "resp_1")
+	result := &service.ChatResult{
+		Model: "kmodel",
+		Text:  "ALPHA_68e5f86ee847d8d2|BETA_65c00ba76aea55bb",
+	}
+
+	writeOpenAIResponseStreamCompleted(emitter, "resp_1", 123, "kmodel", result, "msg_1", false, false, false, "")
+
+	var order []string
+	var deltaText string
+	for _, block := range strings.Split(rec.Body.String(), "\n\n") {
+		var name, data string
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "event: ") {
+				name = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		if name == "" {
+			continue
+		}
+		switch name {
+		case "response.output_text.delta":
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(data), &payload); err != nil {
+				t.Fatalf("unparseable delta: %v (%s)", err, data)
+			}
+			deltaText = payload["delta"].(string)
+			order = append(order, name)
+		case "response.output_item.added", "response.content_part.added",
+			"response.content_part.done", "response.output_text.done",
+			"response.output_item.done", "response.completed":
+			order = append(order, name)
+		}
+	}
+
+	wantOrder := []string{
+		"response.output_item.added",
+		"response.content_part.added",
+		"response.output_text.delta",
+		"response.content_part.done",
+		"response.output_text.done",
+		"response.output_item.done",
+		"response.completed",
+	}
+	if !reflect.DeepEqual(order, wantOrder) {
+		t.Fatalf("lifecycle = %v, want %v", order, wantOrder)
+	}
+	if deltaText != result.Text {
+		t.Fatalf("delta text = %q, want the whole final text %q", deltaText, result.Text)
+	}
+}
+
+// stubRemoteProxy wires a real service and HTTP handler to a loopback stub of
+// the Lingma gateway that streams one answer, so stream-level protocol tests
+// run end to end without any cloud or CLI.
+type stubRemoteProxy struct {
+	proxy    *httptest.Server
+	upstream *httptest.Server
+	calls    *atomic.Int32
+}
+
+func newStubRemoteProxy(t *testing.T, answer string) *stubRemoteProxy {
+	t.Helper()
+	t.Setenv("LINGMA_AGGREGATE_TOOL_STREAM", "")
+	for _, key := range []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"} {
+		t.Setenv(key, "")
+	}
+	t.Setenv("NO_PROXY", "127.0.0.1,localhost")
+
+	calls := &atomic.Int32{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		for _, piece := range []string{answer[:len(answer)/2], answer[len(answer)/2:]} {
+			if _, err := io.WriteString(w, streamGuardUpstreamFrame(t, piece)); err != nil {
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		}
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+
+	authFile := filepath.Join(t.TempDir(), "credentials.json")
+	credential := `{"source":"test","token_expire_time":"4102444800000","auth":{` +
+		`"cosy_key":"cosy-key-value","encrypt_user_info":"encrypted-user-info",` +
+		`"user_id":"user-123456","machine_id":"machine-1234567890ab"}}`
+	if err := os.WriteFile(authFile, []byte(credential), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := service.New(service.Config{
+		Backend:        service.BackendRemote,
+		RemoteBaseURL:  upstream.URL,
+		RemoteAuthFile: authFile,
+		Model:          streamGuardModelName,
+		Timeout:        30 * time.Second,
+	})
+	t.Cleanup(func() { _ = svc.Close() })
+
+	proxy := httptest.NewServer(NewServer("", svc).http.Handler)
+	t.Cleanup(upstream.Close)
+	t.Cleanup(proxy.Close)
+	return &stubRemoteProxy{proxy: proxy, upstream: upstream, calls: calls}
+}
+
+// anthropicBlockStarts walks one Anthropic SSE body and reports every
+// content_block_start as (index, block type), in arrival order.
+func anthropicBlockStarts(t *testing.T, body string) [][2]any {
+	t.Helper()
+	var out [][2]any
+	for _, block := range strings.Split(body, "\n\n") {
+		var name, data string
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "event: ") {
+				name = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		if name != "content_block_start" {
+			continue
+		}
+		var payload struct {
+			Index int `json:"index"`
+			Block struct {
+				Type string `json:"type"`
+			} `json:"content_block"`
+		}
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			t.Fatalf("unparseable content_block_start: %v (%s)", err, data)
+		}
+		out = append(out, [2]any{payload.Index, payload.Block.Type})
+	}
+	return out
+}
+
+// 931 real acceptance: the pure-tool first turn of cn-anthropic-sse announced
+// its only content block at index 1, and the installed official anthropic SDK
+// 0.76.0 rejects that frame sequence with an IndexError -- replaying the very
+// same frames against the live cloud produced the same crash
+// (official-anthropic-sdk-replay.json / official-sdk-live-before.json). A
+// reserved-but-never-opened thinking block must not consume an index: blocks
+// are numbered from 0 in announcement order.
+func TestAnthropicToolOnlyStreamIndexesContentBlocksFromZero(t *testing.T) {
+	stub := newStubRemoteProxy(t, "```json action\n{\"tool\":\"read_fixture\",\"parameters\":{\"path\":\"block-index-alpha.txt\"}}\n```")
+
+	requestBody, err := json.Marshal(map[string]any{
+		"model":      streamGuardModelName,
+		"stream":     true,
+		"max_tokens": 64,
+		"messages":   []any{map[string]any{"role": "user", "content": "read the fixture"}},
+		"tools": []any{map[string]any{
+			"name":         "read_fixture",
+			"input_schema": map[string]any{"type": "object"},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(stub.proxy.URL+"/v1/messages", "application/json", bytes.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.StatusCode, raw)
+	}
+	body := string(raw)
+	if !strings.Contains(body, "event: message_stop") {
+		t.Fatalf("the stream never finished: %s", body)
+	}
+
+	starts := anthropicBlockStarts(t, body)
+	if len(starts) == 0 {
+		t.Fatalf("no content blocks announced: %s", body)
+	}
+	for i, start := range starts {
+		if start[0] != i {
+			t.Fatalf("content blocks announced at indexes %v, want dense 0..%d in arrival order: %s", starts, len(starts)-1, body)
+		}
+	}
+	if starts[0][1] != "tool_use" {
+		t.Fatalf("first block type = %v, want tool_use for a pure tool turn: %s", starts[0][1], body)
+	}
+}
+
+// The Responses twin of the same defect: output_index 1 was reserved for the
+// message on the request alone, so a turn that asked for reasoning and got
+// none streamed its text at index 1 while response.completed's output array
+// held the message at position 0. The delta index and the array position have
+// to agree without a reasoning item that was never announced.
+func TestResponsesStreamUnfulfilledReasoningKeepsIndexZero(t *testing.T) {
+	stub := newStubRemoteProxy(t, "reasoning never arrived, plain nonce answer")
+
+	requestBody, err := json.Marshal(map[string]any{
+		"model":  streamGuardModelName,
+		"stream": true,
+		"input":  "say the nonce",
+		"reasoning": map[string]any{
+			"effort": "medium",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Post(stub.proxy.URL+"/v1/responses", "application/json", bytes.NewReader(requestBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d body = %s", resp.StatusCode, raw)
+	}
+	body := string(raw)
+	if !strings.Contains(body, "event: response.completed") {
+		t.Fatalf("the stream never completed: %s", body)
+	}
+
+	deltaIndex := -1
+	for _, block := range strings.Split(body, "\n\n") {
+		var name, data string
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "event: ") {
+				name = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		if name != "response.output_text.delta" {
+			continue
+		}
+		var payload struct {
+			OutputIndex int `json:"output_index"`
+		}
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			t.Fatalf("unparseable delta: %v (%s)", err, data)
+		}
+		if deltaIndex == -1 {
+			deltaIndex = payload.OutputIndex
+		}
+	}
+	if deltaIndex == -1 {
+		t.Fatalf("no text deltas announced: %s", body)
+	}
+
+	var completed struct {
+		Response struct {
+			Output []struct {
+				Type string `json:"type"`
+			} `json:"output"`
+		} `json:"response"`
+	}
+	for _, block := range strings.Split(body, "\n\n") {
+		var name, data string
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "event: ") {
+				name = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		if name != "response.completed" {
+			continue
+		}
+		if err := json.Unmarshal([]byte(data), &completed); err != nil {
+			t.Fatalf("unparseable completed: %v (%s)", err, data)
+		}
+	}
+	if len(completed.Response.Output) == 0 {
+		t.Fatalf("completed output is empty: %s", body)
+	}
+	if completed.Response.Output[0].Type != "message" {
+		t.Fatalf("completed output[0] = %s, want the message (no unannounced reasoning): %s", completed.Response.Output[0].Type, body)
+	}
+	if deltaIndex != 0 {
+		t.Fatalf("text streamed at output_index %d while response.completed puts the message first: the reserved-but-empty reasoning slot desyncs the two views: %s", deltaIndex, body)
+	}
+}
+
+// anthropicStreamIndexes summarizes one SSE body's block lifecycle: every
+// content_block_start as (index, type), every stop's index, every delta's
+// index.
+type anthropicStreamIndexes struct {
+	starts [][2]any
+	stops  []int
+	deltas []int
+}
+
+func parseAnthropicStreamIndexes(t *testing.T, body string) anthropicStreamIndexes {
+	t.Helper()
+	var out anthropicStreamIndexes
+	for _, block := range strings.Split(body, "\n\n") {
+		var name, data string
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "event: ") {
+				name = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		var payload struct {
+			Index int `json:"index"`
+			Block struct {
+				Type string `json:"type"`
+			} `json:"content_block"`
+		}
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			continue
+		}
+		switch name {
+		case "content_block_start":
+			out.starts = append(out.starts, [2]any{payload.Index, payload.Block.Type})
+		case "content_block_stop":
+			out.stops = append(out.stops, payload.Index)
+		case "content_block_delta":
+			out.deltas = append(out.deltas, payload.Index)
+		}
+	}
+	return out
+}
+
+// The four shapes one Anthropic stream can take, locked against the
+// SDK-facing contract: announced blocks get dense indexes from 0 in
+// announcement order, and every stop/delta lands on the index its block
+// opened at.
+func TestAnthropicStreamBlocksNumberIndexesInAnnouncementOrder(t *testing.T) {
+	calls := []toolemulation.ToolCall{
+		{ID: "call_1", Name: "read_fixture", Arguments: map[string]any{"path": "a.txt"}},
+		{ID: "call_2", Name: "read_fixture", Arguments: map[string]any{"path": "b.txt"}},
+	}
+
+	t.Run("tools only", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		b := &anthropicStreamBlocks{w: rec, flusher: rec}
+		if !b.FinishToolCalls(calls) {
+			t.Fatal("client gone")
+		}
+		idx := parseAnthropicStreamIndexes(t, rec.Body.String())
+		want := [][2]any{{0, "tool_use"}, {1, "tool_use"}}
+		if !reflect.DeepEqual(idx.starts, want) {
+			t.Fatalf("starts = %v, want %v", idx.starts, want)
+		}
+		if len(idx.stops) != 2 || idx.stops[0] != 0 || idx.stops[1] != 1 {
+			t.Fatalf("stops = %v, want one per block at its own index", idx.stops)
+		}
+	})
+
+	t.Run("text only", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		b := &anthropicStreamBlocks{w: rec, flusher: rec}
+		if !b.TextDelta("answer") || !b.CloseAnnounced() {
+			t.Fatal("client gone")
+		}
+		idx := parseAnthropicStreamIndexes(t, rec.Body.String())
+		if len(idx.starts) != 1 || idx.starts[0][0] != 0 || idx.starts[0][1] != "text" {
+			t.Fatalf("starts = %v, want text at 0", idx.starts)
+		}
+		if len(idx.stops) != 1 || idx.stops[0] != 0 {
+			t.Fatalf("stops = %v, want the text stop at 0", idx.stops)
+		}
+	})
+
+	t.Run("reasoning requested but empty", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		b := &anthropicStreamBlocks{w: rec, flusher: rec}
+		// No ThinkingDelta ever fires: the backend produced no thought.
+		if !b.TextDelta("answer") || !b.CloseAnnounced() || !b.FinishToolCalls(calls) {
+			t.Fatal("client gone")
+		}
+		idx := parseAnthropicStreamIndexes(t, rec.Body.String())
+		want := [][2]any{{0, "text"}, {1, "tool_use"}, {2, "tool_use"}}
+		if !reflect.DeepEqual(idx.starts, want) {
+			t.Fatalf("starts = %v, want the never-announced thinking block to consume no index", idx.starts)
+		}
+	})
+
+	t.Run("reasoning real with interleaved text and tools", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		b := &anthropicStreamBlocks{w: rec, flusher: rec}
+		if !b.ThinkingDelta("chain") || !b.TextDelta("answer") || !b.CloseAnnounced() || !b.FinishToolCalls(calls) {
+			t.Fatal("client gone")
+		}
+		idx := parseAnthropicStreamIndexes(t, rec.Body.String())
+		want := [][2]any{{0, "thinking"}, {1, "text"}, {2, "tool_use"}, {3, "tool_use"}}
+		if !reflect.DeepEqual(idx.starts, want) {
+			t.Fatalf("starts = %v, want %v", idx.starts, want)
+		}
+		for _, delta := range idx.deltas {
+			if delta < 0 || delta > 3 {
+				t.Fatalf("delta index %d outside announced blocks", delta)
+			}
+		}
+	})
+}
+
+// A reasoning item only the final frame knows about (aggregate mode, or a
+// thought that surfaced only in the result) is replayed at index 0 ahead of
+// the message, so the event stream and response.completed agree instead of
+// the array carrying an item the stream never announced.
+func TestStreamCompletedReplaysUnstreamedReasoningAtIndexZero(t *testing.T) {
+	rec := httptest.NewRecorder()
+	emitter := newOpenAIResponseStreamEmitter(rec, rec, "resp_1")
+	result := &service.ChatResult{
+		Model:       "kmodel",
+		Text:        "final answer",
+		ThoughtText: "final-frame thought",
+	}
+
+	writeOpenAIResponseStreamCompleted(emitter, "resp_1", 123, "kmodel", result, "msg_1", false, true, false, "")
+
+	reasoningIndexes, messageIndexes := []int{}, []int{}
+	for _, block := range strings.Split(rec.Body.String(), "\n\n") {
+		var name, data string
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "event: ") {
+				name = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		var payload struct {
+			OutputIndex int `json:"output_index"`
+			Item        struct {
+				Type string `json:"type"`
+			} `json:"item"`
+		}
+		_ = json.Unmarshal([]byte(data), &payload)
+		switch name {
+		case "response.output_item.added":
+			switch payload.Item.Type {
+			case "reasoning":
+				reasoningIndexes = append(reasoningIndexes, payload.OutputIndex)
+			case "message":
+				messageIndexes = append(messageIndexes, payload.OutputIndex)
+			}
+		case "response.reasoning_summary_text.delta":
+			reasoningIndexes = append(reasoningIndexes, payload.OutputIndex)
+		case "response.output_text.delta":
+			messageIndexes = append(messageIndexes, payload.OutputIndex)
+		}
+	}
+	if len(reasoningIndexes) == 0 || reasoningIndexes[0] != 0 {
+		t.Fatalf("the unstreamed reasoning item must replay at index 0, got %v: %s", reasoningIndexes, rec.Body.String())
+	}
+	for _, idx := range messageIndexes {
+		if idx != 1 {
+			t.Fatalf("message events must follow the replayed reasoning at index 1, got %v: %s", messageIndexes, rec.Body.String())
+		}
+	}
+	var completed struct {
+		Response struct {
+			Output []struct {
+				Type string `json:"type"`
+			} `json:"output"`
+		} `json:"response"`
+	}
+	for _, block := range strings.Split(rec.Body.String(), "\n\n") {
+		var name, data string
+		for _, line := range strings.Split(block, "\n") {
+			if strings.HasPrefix(line, "event: ") {
+				name = strings.TrimPrefix(line, "event: ")
+			} else if strings.HasPrefix(line, "data: ") {
+				data = strings.TrimPrefix(line, "data: ")
+			}
+		}
+		if name == "response.completed" {
+			if err := json.Unmarshal([]byte(data), &completed); err != nil {
+				t.Fatalf("unparseable completed: %v", err)
+			}
+		}
+	}
+	if len(completed.Response.Output) != 2 ||
+		completed.Response.Output[0].Type != "reasoning" ||
+		completed.Response.Output[1].Type != "message" {
+		t.Fatalf("completed output = %#v, want [reasoning, message] in stream order", completed.Response.Output)
 	}
 }

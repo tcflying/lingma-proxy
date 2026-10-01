@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,11 +30,17 @@ import (
 	"lingma-ipc-proxy/internal/version"
 )
 
-// streamKeepaliveInterval bounds how long an Anthropic stream may stay silent
-// before it sends a ping. IDE clients give up on a response that has not started
-// within well under a model turn, and the qodercli backend can only report
-// progress once its subprocess finishes.
-const streamKeepaliveInterval = 15 * time.Second
+// streamKeepaliveInterval bounds how long an established SSE stream may stay
+// silent before the proxy emits a keep-alive comment line. Clients read silence
+// as a dead stream (Codex CLI disconnects on its idle timeout mid-answer), and
+// the backend stays silent while the model works. A var, like
+// maxCLIOutputLineBytes, so tests can shrink it instead of waiting 15s.
+//
+// CONCURRENCY: this is a plain package-level var, and the httpapi tests rewrite
+// it (keep with keepalive933SetInterval) while the package's other tests are
+// running. Adding t.Parallel() to any test in this package that starts a stream
+// will immediately be a data race here. The same applies to slotQueueWait.
+var streamKeepaliveInterval = 15 * time.Second
 
 type Server struct {
 	svc     *service.Service
@@ -177,6 +184,11 @@ func NewServer(addr string, svc *service.Service) *Server {
 	mux.HandleFunc("/version", s.handleVersion)
 	mux.HandleFunc("/v1/messages/count_tokens", s.handleAnthropicCountTokens)
 	mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
+	// Anthropic-protocol clients that embed the provider prefix in their base
+	// URL (MiniMax's mmx CLI posts to <base>/anthropic/v1/messages) need the
+	// prefixed aliases; they must stay wired to the exact same handlers.
+	mux.HandleFunc("/anthropic/v1/messages/count_tokens", s.handleAnthropicCountTokens)
+	mux.HandleFunc("/anthropic/v1/messages", s.handleAnthropicMessages)
 	mux.HandleFunc("/v1/chat/completions", s.handleOpenAIChatCompletions)
 	mux.HandleFunc("/api/v1/chat/completions", s.handleOpenAIChatCompletions)
 	mux.HandleFunc("/v1/responses", s.handleOpenAIResponses)
@@ -186,6 +198,13 @@ func NewServer(addr string, svc *service.Service) *Server {
 		Addr:              addr,
 		Handler:           s.withRecorder(withCORS(mux)),
 		ReadHeaderTimeout: 10 * time.Second,
+		// A finished keep-alive connection otherwise waits in the listener's
+		// pool until the client closes it, and a client that went away silently
+		// holds the slot forever. IdleTimeout reaps it.
+		// WriteTimeout is deliberately absent: a streaming turn legitimately
+		// writes nothing for minutes between the first and second frame, and a
+		// write deadline would cut those answers in half.
+		IdleTimeout: 120 * time.Second,
 	}
 	return s
 }
@@ -265,7 +284,7 @@ func debugAccessAllowed(r *http.Request) bool {
 	// A browser sends Origin on every fetch from another page, curl does not, so
 	// refusing a foreign Origin closes "any local webpage can read the recorded
 	// conversations" without breaking CLI tooling or the same-origin console.
-	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && !sameDebugOrigin(r, origin) {
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && !sameHostOrigin(r, origin) {
 		return false
 	}
 	if truthyEnv("LINGMA_ALLOW_REMOTE_DEBUG") {
@@ -279,10 +298,95 @@ func debugAccessAllowed(r *http.Request) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-func sameDebugOrigin(r *http.Request, origin string) bool {
+// sameHostOrigin reports whether an Origin header names this very proxy. A
+// browser sends one on every cross-site fetch; curl, every CLI client and the
+// desktop shell send none at all.
+func sameHostOrigin(r *http.Request, origin string) bool {
 	u, err := url.Parse(origin)
 	return err == nil && strings.EqualFold(u.Host, r.Host)
 }
+
+// namedImageRequest is a request that makes the proxy go read something it does
+// not carry: a remote image URL, or a path on this box. That read is the SSRF
+// primitive. The proxy binds loopback, has no API authentication, and answers
+// with Access-Control-Allow-Origin: *, so any page in any browser could point
+// it at 127.0.0.1 or a LAN service, let the model transcribe what came back,
+// and read the transcript out of the reply. Inline data: URLs read nothing off
+// the box, so they are deliberately out of scope here.
+func namedImageRequest(messages []rawMessage) bool {
+	for _, message := range messages {
+		if contentNamesAnImage(message.Content) {
+			return true
+		}
+	}
+	return false
+}
+
+func namedImageResponsesInput(input any) bool {
+	items, ok := input.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if imageItemNamesASource(m) || contentNamesAnImage(m["content"]) {
+			return true
+		}
+	}
+	return false
+}
+
+func contentNamesAnImage(content any) bool {
+	items, ok := content.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range items {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		// Only the protocol's own image item types count. Matching on the key
+		// alone would trip on a tool schema that happens to declare an
+		// image_url parameter, and 403 a legitimate client.
+		switch stringFromAny(m["type"]) {
+		case "image_url", "input_image", "image", "output_image":
+			if imageItemNamesASource(m) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func imageItemNamesASource(item map[string]any) bool {
+	raw := stringFromAny(item["image_url"])
+	if raw == "" {
+		if nested, ok := item["image_url"].(map[string]any); ok {
+			raw = stringFromAny(nested["url"])
+		}
+	}
+	if raw == "" {
+		if source, ok := item["source"].(map[string]any); ok {
+			raw = stringFromAny(source["url"])
+		}
+	}
+	return raw != "" && !strings.HasPrefix(strings.TrimSpace(raw), "data:")
+}
+
+// crossOriginNamedImageRead reports whether this request has to be refused: a
+// caller in a foreign web origin asking the proxy to read an image by URL or by
+// path. A same-origin page, and every non-browser client, pass.
+func crossOriginNamedImageRead(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	return origin != "" && !sameHostOrigin(r, origin)
+}
+
+const crossOriginImageMessage = "a request from another web origin may not make the proxy read an image by URL or path; " +
+	"inline data: images and non-browser clients are unaffected"
 
 func (s *Server) handleDebugRequests(w http.ResponseWriter, r *http.Request) {
 	if !debugAccessAllowed(r) {
@@ -675,9 +779,10 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		writeAnthropicError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	switch s.acquire(r.Context()) {
+	outcome, release := s.acquireRequestSlot(r)
+	defer release()
+	switch outcome {
 	case slotAcquired:
-		defer s.release()
 	case slotClientGone:
 		writeAnthropicError(w, http.StatusRequestTimeout, "timeout_error", "request was cancelled while waiting for a proxy execution slot")
 		return
@@ -692,11 +797,17 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if crossOriginNamedImageRead(r) && namedImageRequest(req.Messages) {
+		writeAnthropicError(w, http.StatusForbidden, "invalid_request_error", crossOriginImageMessage)
+		return
+	}
+
 	if call, ok := anthropicHostedWebSearchCall(req); ok {
 		if req.Stream {
 			s.writeAnthropicHostedToolStream(w, req.Model, call)
 			return
 		}
+
 		s.writeAnthropicHostedToolResponse(w, req.Model, call)
 		return
 	}
@@ -723,7 +834,14 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 	if shouldEmitAnthropicThinking(normalized, result) {
 		content = append(content, map[string]any{"type": "thinking", "thinking": result.ThoughtText})
 	}
-	content = append(content, map[string]any{"type": "text", "text": result.Text})
+	// Whitespace-only text is not text. The service trims the prose in front of
+	// a consumed action block, so a pure tool turn that streamed a blank line
+	// first reports no text at all; announcing a block for it here put text at
+	// index 0 and the tool_use at 1, and official SDKs assemble the content
+	// array by index, so the two views of one turn disagreed.
+	if strings.TrimSpace(result.Text) != "" || len(result.ToolCalls) == 0 {
+		content = append(content, map[string]any{"type": "text", "text": result.Text})
+	}
 	stopReason := anthropicStopReason(result)
 	if len(result.ToolCalls) > 0 {
 		for _, tc := range result.ToolCalls {
@@ -760,9 +878,10 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	switch s.acquire(r.Context()) {
+	outcome, release := s.acquireRequestSlot(r)
+	defer release()
+	switch outcome {
 	case slotAcquired:
-		defer s.release()
 	case slotClientGone:
 		writeOpenAIError(w, http.StatusRequestTimeout, "timeout_error", "request was cancelled while waiting for a proxy execution slot")
 		return
@@ -774,6 +893,10 @@ func (s *Server) handleOpenAIChatCompletions(w http.ResponseWriter, r *http.Requ
 	var req openAIChatRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if crossOriginNamedImageRead(r) && namedImageRequest(req.Messages) {
+		writeOpenAIError(w, http.StatusForbidden, "invalid_request_error", crossOriginImageMessage)
 		return
 	}
 
@@ -807,9 +930,10 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "invalid_request_error", "method not allowed")
 		return
 	}
-	switch s.acquire(r.Context()) {
+	outcome, release := s.acquireRequestSlot(r)
+	defer release()
+	switch outcome {
 	case slotAcquired:
-		defer s.release()
 	case slotClientGone:
 		writeOpenAIError(w, http.StatusRequestTimeout, "timeout_error", "request was cancelled while waiting for a proxy execution slot")
 		return
@@ -821,6 +945,10 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	var req openAIResponsesRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	if crossOriginNamedImageRead(r) && namedImageResponsesInput(req.Input) {
+		writeOpenAIError(w, http.StatusForbidden, "invalid_request_error", crossOriginImageMessage)
 		return
 	}
 
@@ -849,6 +977,217 @@ func (s *Server) handleOpenAIResponses(w http.ResponseWriter, r *http.Request) {
 	writeOpenAIResponse(w, result, normalized)
 }
 
+// anthropicStreamBlocks owns the content-block lifecycle of one streamed
+// Anthropic message. The official SDKs index a message's content array by the
+// block index, so indexes are handed out in announcement order starting at 0:
+// thinking the client asked for but the backend never produced consumes no
+// index, which is what left a pure tool turn's only block at 1 and crashed the
+// official Python SDK with an IndexError.
+type anthropicStreamBlocks struct {
+	w       http.ResponseWriter
+	flusher http.Flusher
+
+	thinkingAnnounced bool
+	thinkingOpen      bool
+	textAnnounced     bool
+	// textOpen tracks whether the text block's content_block_stop is still
+	// owed, which textAnnounced cannot answer: FlushLead opens and closes that
+	// block inside one call, and a closed-but-announced block made CloseAnnounced
+	// emit a second content_block_stop for an index the client had already seen
+	// closed. It mirrors thinkingOpen, and only CloseAnnounced consults it.
+	textOpen  bool
+	textIndex int
+	// lead holds the whitespace deltas that arrived before the first
+	// non-whitespace one. They are prepended to the delta that finally opens
+	// the block, so not one byte is lost; and a turn whose whole prose was
+	// whitespace and that ends in tool calls never opens a text block at all,
+	// which is exactly what the non-streaming body reports for it.
+	lead string
+}
+
+// ThinkingDelta streams the thinking block, announcing it at index 0 on the
+// first delta. A thought that arrives after text has opened owns no index and
+// is dropped: there is no honest slot ahead of text the client already holds.
+func (b *anthropicStreamBlocks) ThinkingDelta(delta string) bool {
+	if delta == "" {
+		return true
+	}
+	if b.textAnnounced {
+		return true
+	}
+	if !b.thinkingAnnounced {
+		if err := writeSSEEvent(b.w, b.flusher, "content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         0,
+			"content_block": map[string]any{"type": "thinking", "thinking": ""},
+		}); err != nil {
+			return false
+		}
+		b.thinkingAnnounced = true
+		b.thinkingOpen = true
+	}
+	return writeSSEEvent(b.w, b.flusher, "content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": 0,
+		"delta": map[string]any{"type": "thinking_delta", "thinking": delta},
+	}) == nil
+}
+
+// TextDelta closes an open thinking block and streams the text block,
+// announcing it at the next index in announcement order on its first
+// non-whitespace delta.
+func (b *anthropicStreamBlocks) TextDelta(delta string) bool {
+	if delta == "" {
+		return true
+	}
+	if !b.textAnnounced && strings.TrimSpace(delta) == "" {
+		b.lead += delta
+		return true
+	}
+	if b.thinkingOpen {
+		if err := writeSSEEvent(b.w, b.flusher, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": 0,
+		}); err != nil {
+			return false
+		}
+		b.thinkingOpen = false
+	}
+	if !b.textAnnounced {
+		b.textIndex = 0
+		if b.thinkingAnnounced {
+			b.textIndex = 1
+		}
+		if err := writeSSEEvent(b.w, b.flusher, "content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         b.textIndex,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		}); err != nil {
+			return false
+		}
+		b.textAnnounced = true
+		b.textOpen = true
+	}
+	if b.lead != "" {
+		delta = b.lead + delta
+		b.lead = ""
+	}
+	return writeSSEEvent(b.w, b.flusher, "content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": b.textIndex,
+		"delta": map[string]any{"type": "text_delta", "text": delta},
+	}) == nil
+}
+
+// FlushLead emits the held whitespace as a text block when the turn ended
+// without any other prose. It runs only for a turn with no tool calls: that is
+// precisely the case where the non-streaming body still reports the blank text,
+// and dropping it here would leave the stream with no content block at all.
+func (b *anthropicStreamBlocks) FlushLead(hasToolCalls bool) bool {
+	if b.textAnnounced || b.lead == "" || hasToolCalls {
+		return true
+	}
+	if b.thinkingOpen {
+		if err := writeSSEEvent(b.w, b.flusher, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": 0,
+		}); err != nil {
+			return false
+		}
+		b.thinkingOpen = false
+	}
+	b.textIndex = 0
+	if b.thinkingAnnounced {
+		b.textIndex = 1
+	}
+	if err := writeSSEEvent(b.w, b.flusher, "content_block_start", map[string]any{
+		"type":          "content_block_start",
+		"index":         b.textIndex,
+		"content_block": map[string]any{"type": "text", "text": ""},
+	}); err != nil {
+		return false
+	}
+	b.textAnnounced = true
+	b.textOpen = true
+	lead := b.lead
+	b.lead = ""
+	if err := writeSSEEvent(b.w, b.flusher, "content_block_delta", map[string]any{
+		"type":  "content_block_delta",
+		"index": b.textIndex,
+		"delta": map[string]any{"type": "text_delta", "text": lead},
+	}); err != nil {
+		return false
+	}
+	if err := writeSSEEvent(b.w, b.flusher, "content_block_stop", map[string]any{
+		"type":  "content_block_stop",
+		"index": b.textIndex,
+	}); err != nil {
+		return false
+	}
+	b.textOpen = false
+	return true
+}
+
+// CloseAnnounced stops every open block at its own index.
+func (b *anthropicStreamBlocks) CloseAnnounced() bool {
+	if b.thinkingOpen {
+		if err := writeSSEEvent(b.w, b.flusher, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": 0,
+		}); err != nil {
+			return false
+		}
+		b.thinkingOpen = false
+	}
+	if b.textOpen {
+		if err := writeSSEEvent(b.w, b.flusher, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": b.textIndex,
+		}); err != nil {
+			return false
+		}
+		b.textOpen = false
+	}
+	return true
+}
+
+// FinishToolCalls appends the turn's tool calls after every announced block,
+// each with the full start/delta/stop lifecycle at a dense index.
+func (b *anthropicStreamBlocks) FinishToolCalls(calls []toolemulation.ToolCall) bool {
+	blockIndex := 0
+	if b.thinkingAnnounced {
+		blockIndex++
+	}
+	if b.textAnnounced {
+		blockIndex++
+	}
+	for _, tc := range calls {
+		if err := writeSSEEvent(b.w, b.flusher, "content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         blockIndex,
+			"content_block": map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Name, "input": map[string]any{}},
+		}); err != nil {
+			return false
+		}
+		argsJSON, _ := json.Marshal(tc.Arguments)
+		if err := writeSSEEvent(b.w, b.flusher, "content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": blockIndex,
+			"delta": map[string]any{"type": "input_json_delta", "partial_json": string(argsJSON)},
+		}); err != nil {
+			return false
+		}
+		if err := writeSSEEvent(b.w, b.flusher, "content_block_stop", map[string]any{
+			"type":  "content_block_stop",
+			"index": blockIndex,
+		}); err != nil {
+			return false
+		}
+		blockIndex++
+	}
+	return true
+}
+
 func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, req service.ChatRequest) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -863,13 +1202,28 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 
 	if shouldAggregateToolStream(req) {
+		// Open the stream before Generate, exactly as the incremental branch
+		// does. The aggregate turn blocks for the whole model call, and a client
+		// with no first payload inside 60s (the Qoder SDK's own rule) kills the
+		// turn. The keep-alive writer covers the silence, and a failure here is
+		// reported as the protocol's in-stream error event because the 200 and
+		// the SSE headers are already committed.
+		streamingHeaders(w)
+		flusher.Flush()
+		aggregate := newSSEKeepaliveWriter(w, flusher)
+		defer aggregate.Close()
+		w, flusher = aggregate, aggregate
+
 		result, err := s.svc.Generate(r.Context(), req)
 		if err != nil {
-			writeAnthropicUpstreamError(w, err)
+			_ = writeSSEEvent(w, flusher, "error", map[string]any{
+				"type":  "error",
+				"error": map[string]any{"type": "api_error", "message": err.Error()},
+			})
+			_ = writeSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"})
 			return
 		}
 
-		streamingHeaders(w)
 		if err := writeSSEEvent(w, flusher, "message_start", map[string]any{
 			"type": "message_start",
 			"message": map[string]any{
@@ -881,7 +1235,12 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 				"stop_reason":   nil,
 				"stop_sequence": nil,
 				"usage": map[string]any{
-					"input_tokens":  result.InputTokens,
+					// Zero, not result.InputTokens: the incremental branch below
+					// cannot know the prompt size when message_start is written,
+					// and a client that reads usage from message_start must not see
+					// it change because one env switch flipped. The real number is
+					// on the non-streaming body, which reports it directly.
+					"input_tokens":  0,
 					"output_tokens": 0,
 				},
 			},
@@ -913,6 +1272,9 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 			}
 			index++
 		}
+		// Same rule as the incremental path and the non-streaming body: a turn
+		// whose prose is only whitespace and that ends in tool calls reports no
+		// text block at all.
 		if strings.TrimSpace(result.Text) != "" {
 			if err := writeSSEEvent(w, flusher, "content_block_start", map[string]any{
 				"type":          "content_block_start",
@@ -987,6 +1349,15 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 	}
 
 	streamingHeaders(w)
+	// From here to the last frame the turn can fall silent for whole minutes
+	// (the model thinking, the tool filter holding an action block back), and
+	// clients read silence as a dead stream. The keep-alive writer beats with
+	// the official ping event: the SDK accumulators ignore it, and clients
+	// whose idle timer only counts parsed events (Codex CLI) still see it.
+	heartbeat := newSSEKeepaliveWriter(w, flusher)
+	defer heartbeat.Close()
+	heartbeat.setEventFrame(anthropicPingFrame)
+	w, flusher = heartbeat, heartbeat
 	if err := writeSSEEvent(w, flusher, "message_start", map[string]any{
 		"type": "message_start",
 		"message": map[string]any{
@@ -1012,48 +1383,18 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 	var final *service.ChatResult
 	var finalErr error
 	thinkingEnabled := thinkingRequested(req.ReasoningEffort)
-	thinkingOpen := false
-	textOpen := false
-	textIndex := 0
-	if thinkingEnabled {
-		textIndex = 1
-	}
+	blocks := &anthropicStreamBlocks{w: w, flusher: flusher}
 
-	// emitText streams already-filtered deltas, closing an open thinking block and
-	// opening the text block as needed. It reports false once the client is gone,
-	// which is the caller's signal to stop writing.
+	// emitText streams already-filtered deltas through the block allocator,
+	// which opens and closes thinking/text blocks as the turn requires. It
+	// reports false once the client is gone, which is the caller's signal to
+	// stop writing.
 	emitText := func(deltas []string) bool {
 		for _, delta := range deltas {
 			if delta == "" {
 				continue
 			}
-			if thinkingOpen {
-				if err := writeSSEEvent(w, flusher, "content_block_stop", map[string]any{
-					"type":  "content_block_stop",
-					"index": 0,
-				}); err != nil {
-					return false
-				}
-				thinkingOpen = false
-			}
-			if !textOpen {
-				if err := writeSSEEvent(w, flusher, "content_block_start", map[string]any{
-					"type":          "content_block_start",
-					"index":         textIndex,
-					"content_block": map[string]any{"type": "text", "text": ""},
-				}); err != nil {
-					return false
-				}
-				textOpen = true
-			}
-			if err := writeSSEEvent(w, flusher, "content_block_delta", map[string]any{
-				"type":  "content_block_delta",
-				"index": textIndex,
-				"delta": map[string]any{
-					"type": "text_delta",
-					"text": delta,
-				},
-			}); err != nil {
+			if !blocks.TextDelta(delta) {
 				return false
 			}
 		}
@@ -1061,22 +1402,13 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 	}
 
 	// A turn can stay silent until the model's first delta lands, which is long
-	// enough to trip the first-token timeouts in IDE clients. Anthropic defines
-	// ping for exactly this, and clients that ignore it still see a live socket.
-	keepalive := time.NewTicker(streamKeepaliveInterval)
-	defer keepalive.Stop()
+	// enough to trip the first-token timeouts in IDE clients; the keep-alive
+	// writer installed above keeps the stream alive instead.
 
 	for eventsCh != nil || doneCh != nil {
 		select {
 		case <-r.Context().Done():
 			return
-		case <-keepalive.C:
-			if textOpen || thinkingOpen {
-				continue
-			}
-			if err := writeSSEEvent(w, flusher, "ping", map[string]any{"type": "ping"}); err != nil {
-				return
-			}
 		case event, ok := <-eventsCh:
 			if !ok {
 				eventsCh = nil
@@ -1087,24 +1419,7 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 				if !thinkingEnabled || strings.TrimSpace(event.Delta) == "" {
 					continue
 				}
-				if !thinkingOpen {
-					if err := writeSSEEvent(w, flusher, "content_block_start", map[string]any{
-						"type":          "content_block_start",
-						"index":         0,
-						"content_block": map[string]any{"type": "thinking", "thinking": ""},
-					}); err != nil {
-						return
-					}
-					thinkingOpen = true
-				}
-				if err := writeSSEEvent(w, flusher, "content_block_delta", map[string]any{
-					"type":  "content_block_delta",
-					"index": 0,
-					"delta": map[string]any{
-						"type":     "thinking_delta",
-						"thinking": event.Delta,
-					},
-				}); err != nil {
+				if !blocks.ThinkingDelta(event.Delta) {
 					return
 				}
 			default:
@@ -1148,45 +1463,14 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 	if !emitText(filter.Flush()) {
 		return
 	}
-	if thinkingOpen {
-		if err := writeSSEEvent(w, flusher, "content_block_stop", map[string]any{
-			"type":  "content_block_stop",
-			"index": 0,
-		}); err != nil {
-			return
-		}
-		thinkingOpen = false
+	if !blocks.FlushLead(len(final.ToolCalls) > 0) {
+		return
 	}
-	if textOpen {
-		if err := writeSSEEvent(w, flusher, "content_block_stop", map[string]any{
-			"type":  "content_block_stop",
-			"index": textIndex,
-		}); err != nil {
-			return
-		}
+	if !blocks.CloseAnnounced() {
+		return
 	}
-	for i, tc := range final.ToolCalls {
-		blockIndex := i + 1
-		if textOpen {
-			blockIndex = textIndex + 1 + i
-		} else if thinkingEnabled {
-			blockIndex = 1 + i
-		}
-		_ = writeSSEEvent(w, flusher, "content_block_start", map[string]any{
-			"type":          "content_block_start",
-			"index":         blockIndex,
-			"content_block": map[string]any{"type": "tool_use", "id": tc.ID, "name": tc.Name, "input": map[string]any{}},
-		})
-		argsJSON, _ := json.Marshal(tc.Arguments)
-		_ = writeSSEEvent(w, flusher, "content_block_delta", map[string]any{
-			"type":  "content_block_delta",
-			"index": blockIndex,
-			"delta": map[string]any{"type": "input_json_delta", "partial_json": string(argsJSON)},
-		})
-		_ = writeSSEEvent(w, flusher, "content_block_stop", map[string]any{
-			"type":  "content_block_stop",
-			"index": blockIndex,
-		})
+	if !blocks.FinishToolCalls(final.ToolCalls) {
+		return
 	}
 	stopReason := anthropicStopReason(final)
 	if len(final.ToolCalls) > 0 {
@@ -1314,12 +1598,30 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 	created := time.Now().Unix()
 
 	if shouldAggregateToolStream(req) {
+		// Same shape as the Anthropic aggregate branch: open the stream and
+		// start beating before the blocking Generate, so the turn is never a
+		// silent socket. A failure now travels as the stream's own error chunk,
+		// which is the only shape a committed 200 can still carry.
+		streamingHeaders(w)
+		flusher.Flush()
+		aggregate := newSSEKeepaliveWriter(w, flusher)
+		defer aggregate.Close()
+		w, flusher = aggregate, aggregate
+
 		result, err := s.svc.Generate(r.Context(), req)
 		if err != nil {
-			writeOpenAIUpstreamError(w, err)
+			_ = writeOpenAIChunk(w, flusher, map[string]any{
+				"error": map[string]any{
+					"message": err.Error(),
+					"type":    "api_error",
+					"code":    nil,
+					"param":   nil,
+				},
+			})
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
 			return
 		}
-		streamingHeaders(w)
 		_ = writeOpenAIChunk(w, flusher, map[string]any{
 			"id": chatID, "object": "chat.completion.chunk", "created": created, "model": model,
 			"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}, "finish_reason": nil}},
@@ -1366,6 +1668,12 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 	}
 
 	streamingHeaders(w)
+	// Same silence hazard as the Anthropic path: the tool filter can hold the
+	// whole answer back, and the backend is mute while it works. Comment lines
+	// from the keep-alive writer keep the client's idle timer honest.
+	heartbeat := newSSEKeepaliveWriter(w, flusher)
+	defer heartbeat.Close()
+	w, flusher = heartbeat, heartbeat
 	if err := writeOpenAIChunk(w, flusher, map[string]any{
 		"id":      chatID,
 		"object":  "chat.completion.chunk",
@@ -1390,21 +1698,10 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 	var final *service.ChatResult
 	var finalErr error
 
-	// The tool filter withholds an action block until it is sure where the prose
-	// ends, and the qodercli backend is silent until its subprocess speaks, so a
-	// live turn can produce no bytes for minutes. Clients read that as a dead
-	// stream (the SDK's idle timeout is 300s); comments keep the socket honest.
-	keepalive := time.NewTicker(streamKeepaliveInterval)
-	defer keepalive.Stop()
-
 	for eventsCh != nil || doneCh != nil {
 		select {
 		case <-r.Context().Done():
 			return
-		case <-keepalive.C:
-			if err := writeSSEComment(w, flusher, "keepalive"); err != nil {
-				return
-			}
 		case event, ok := <-eventsCh:
 			if !ok {
 				eventsCh = nil
@@ -1545,7 +1842,32 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 	messageID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
 	created := time.Now().Unix()
 	streamingHeaders(w)
+	// The keep-alive writer takes over before the emitter is built, so it also
+	// covers the aggregate branch below, whose blocking Generate leaves the
+	// established stream silent for the whole model turn. Its beat is a
+	// re-sent response.in_progress: idempotent, invisible to accumulators,
+	// and a real event for clients (Codex CLI) whose idle timer only counts
+	// parsed events. response.created below opens the gate; the terminal
+	// event closes it.
+	heartbeat := newSSEKeepaliveWriter(w, flusher)
+	defer heartbeat.Close()
+	w, flusher = heartbeat, heartbeat
 	emitter := newOpenAIResponseStreamEmitter(w, flusher, responseID)
+	// Frames go out under the keep-alive writer's own lock, so the number a
+	// frame carries and the order frames reach the wire cannot disagree.
+	emitter.serial = func(name string, payload map[string]any, after func()) error {
+		return heartbeat.writeFrame(func() (string, error) {
+			emitter.mu.Lock()
+			defer emitter.mu.Unlock()
+			frame, err := emitter.marshalEventLocked(name, payload)
+			if err != nil {
+				return "", err
+			}
+			after()
+			return frame, nil
+		})
+	}
+	heartbeat.setEventFrame(emitter.heartbeatFrame)
 	if err := emitter.Event("response.created", map[string]any{
 		"type": "response.created",
 		"response": map[string]any{
@@ -1567,7 +1889,7 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 			flusher.Flush()
 			return
 		}
-		writeOpenAIResponseStreamCompleted(emitter, responseID, created, model, result, messageID, false, shouldEmitResponsesReasoning(req, result), "")
+		writeOpenAIResponseStreamCompleted(emitter, responseID, created, model, result, messageID, false, thinkingRequested(req.ReasoningEffort), false, "")
 		return
 	}
 
@@ -1587,27 +1909,16 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 	var final *service.ChatResult
 	var finalErr error
 
-	// Reserve output_index 1 for the message up front, on the request alone, so
-	// thinking can stream into index 0 instead of being buffered until the final
-	// frame decides. This mirrors the Anthropic path's block indexing.
-	// ponytail: when reasoning is requested but the backend produces none, the
-	// streamed message sits at index 1 while response.completed's single-item
-	// output array implies 0. Upgrade path: emit an empty reasoning item.
+	// output_index is handed out in announcement order. Thinking owns index 0
+	// only when it actually streams: reserving it on the request alone left a
+	// message the backend answered without thought stranded at index 1 while
+	// response.completed's array put it first, desyncing the two views. A
+	// thought that arrives after the message has opened owns no index at all.
 	reasoningReserved := thinkingRequested(req.ReasoningEffort)
 	reasoning := newResponseReasoningWriter(emitter, "rs_"+responseID, 0)
-	textOutputIndex := 0
-	if reasoningReserved {
-		textOutputIndex = 1
-	}
+	textOutputIndex := -1
 	messageOpened := false
 	var streamedText strings.Builder
-
-	// Tool emulation can hold back the whole visible answer while it looks for an
-	// action block, so the first delta may arrive long after the request. A
-	// comment line keeps intermediaries and first-token timeouts happy without
-	// inventing an event type the Responses protocol does not define.
-	keepalive := time.NewTicker(streamKeepaliveInterval)
-	defer keepalive.Stop()
 
 	// emitText streams already-filtered deltas, closing an open reasoning item and
 	// announcing the message item on the first one. Reports false once the client
@@ -1621,6 +1932,10 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 			if !messageOpened {
 				if err := reasoning.Close(); err != nil {
 					return false
+				}
+				textOutputIndex = 0
+				if reasoning.Opened() {
+					textOutputIndex = 1
 				}
 				if err := writeOpenAIResponseMessageStarted(emitter, messageID, textOutputIndex); err != nil {
 					return false
@@ -1645,13 +1960,6 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 		select {
 		case <-r.Context().Done():
 			return
-		case <-keepalive.C:
-			if messageOpened || reasoning.Opened() {
-				continue
-			}
-			if err := writeSSEComment(w, flusher, "keepalive"); err != nil {
-				return
-			}
 		case event, ok := <-eventsCh:
 			if !ok {
 				eventsCh = nil
@@ -1660,6 +1968,12 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 			switch event.Type {
 			case service.StreamEventThinking:
 				if !reasoningReserved || strings.TrimSpace(event.Delta) == "" {
+					continue
+				}
+				if messageOpened {
+					// A thought arriving after the message opened has no index
+					// left to announce at: index 0 already belongs to the text.
+					// The final frame drops it too, so the two views agree.
 					continue
 				}
 				if err := reasoning.Delta(event.Delta); err != nil {
@@ -1704,12 +2018,15 @@ func (s *Server) handleOpenAIResponsesStream(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	// A backend that reports the thought only in the final frame gets no streamed
-	// item; response.completed still carries it, which is the only honest place
-	// left once the message item has been announced.
+	// item; response.completed still carries it, replayed by the completed
+	// writer at index 0 -- unless the message already claimed that index, in
+	// which case there is no honest place left for it and it is dropped from
+	// both views.
+	reasoningWanted := reasoningReserved && (reasoning.Opened() || !messageOpened)
 	if err := reasoning.Close(); err != nil {
 		return
 	}
-	writeOpenAIResponseStreamCompleted(emitter, responseID, created, model, final, messageID, messageOpened, reasoningReserved, streamedText.String())
+	writeOpenAIResponseStreamCompleted(emitter, responseID, created, model, final, messageID, messageOpened, reasoningWanted, reasoning.Opened(), streamedText.String())
 }
 
 func shouldAggregateToolStream(req service.ChatRequest) bool {
@@ -1723,6 +2040,7 @@ func shouldAggregateToolStream(req service.ChatRequest) bool {
 type toolStreamFilter struct {
 	enabled bool
 	scan    *toolemulation.ActionBlockScanner
+	tools   []toolemulation.ToolDef
 	pending string
 }
 
@@ -1730,7 +2048,11 @@ func newToolStreamFilter(req service.ChatRequest) *toolStreamFilter {
 	// tool_choice:"none" also disables suppression: applyToolEmulation leaves such
 	// blocks in the text, so withholding them here would drop prose the client keeps.
 	enabled := len(req.Tools) > 0 && req.ToolChoice.Mode != "none"
-	return &toolStreamFilter{enabled: enabled, scan: toolemulation.NewActionBlockScanner(req.Tools)}
+	return &toolStreamFilter{
+		enabled: enabled,
+		scan:    toolemulation.NewActionBlockScanner(req.Tools),
+		tools:   req.Tools,
+	}
 }
 
 func (f *toolStreamFilter) Push(delta string) []string {
@@ -1774,14 +2096,27 @@ func (f *toolStreamFilter) Push(delta string) []string {
 
 // Flush returns whatever the filter withheld. An opening fence that never closed
 // is not an action block by the parser's own rules, so it is prose and has to go
-// back to the client instead of being dropped.
+// back to the client instead of being dropped. A hybrid block that completed on
+// its braces but never saw a close marker was undecidable mid-stream; here, at
+// end of stream, the final-text parser decides, and whatever it would consume
+// must not reach the client as prose.
 func (f *toolStreamFilter) Flush() []string {
 	if f.pending == "" {
 		return nil
 	}
 	out := f.pending
 	f.pending = ""
-	return []string{out}
+	if !f.enabled {
+		return []string{out}
+	}
+	_, clean, err := toolemulation.ParseActionBlocks(out, f.tools, toolemulation.Config{})
+	if err != nil {
+		return []string{out}
+	}
+	if strings.TrimSpace(clean) == "" {
+		return nil
+	}
+	return []string{clean}
 }
 
 // anthropicStopReason names how a turn with no pending tool call ended. Callers
@@ -1952,9 +2287,7 @@ func normalizeAnthropicRequest(req anthropicRequest) (service.ChatRequest, error
 				messages = append(messages, service.ChatMessage{Role: role, Text: text, Images: images})
 			}
 			for _, tr := range toolResults {
-				if strings.TrimSpace(tr.Content) != "" {
-					messages = append(messages, service.ChatMessage{Role: "tool", Text: tr.Content, ToolCallID: tr.ToolUseID})
-				}
+				messages = append(messages, service.ChatMessage{Role: "tool", Text: tr.Content, ToolCallID: tr.ToolUseID})
 			}
 		case "assistant":
 			text, calls := extractAnthropicAssistantContent(message.Content)
@@ -2011,22 +2344,32 @@ func normalizeOpenAIRequest(ctx context.Context, req openAIChatRequest) (service
 				messages = append(messages, service.ChatMessage{Role: role, Text: text, ToolCalls: calls})
 			}
 		case "tool":
-			output := strings.TrimSpace(extractText(message.Content))
-			if output == "" || message.ToolCallID == "" {
+			// Only a structurally valid content is a result; absent or
+			// malformed content is dropped, never fabricated into an empty
+			// result.
+			if message.ToolCallID == "" || !validToolResultContent(message.Content) {
 				continue
 			}
+			output := strings.TrimSpace(extractText(message.Content))
 			messages = append(messages, service.ChatMessage{Role: "tool", Text: output, ToolCallID: message.ToolCallID})
 		}
 	}
 	if len(messages) == 0 {
 		return service.ChatRequest{}, fmt.Errorf("no user or assistant messages found")
 	}
+	// A declaration whose flattened namespace name collides with another tool
+	// is ambiguous: extracting it first-wins would silently change which tool
+	// a call executes, so the request is rejected with the colliding name.
+	if collisions := toolemulation.FindToolNameCollisions(req.Tools); len(collisions) > 0 {
+		return service.ChatRequest{}, fmt.Errorf("ambiguous tool declaration: %q is declared more than once once namespaces are flattened", collisions[0])
+	}
+	tools := toolemulation.ExtractTools(req.Tools)
 	return service.ChatRequest{
 		Model:             strings.TrimSpace(req.Model),
 		System:            strings.Join(systemParts, "\n\n"),
 		Messages:          messages,
-		Tools:             toolemulation.ExtractTools(req.Tools),
-		ToolChoice:        toolemulation.ExtractToolChoice(req.ToolChoice),
+		Tools:             tools,
+		ToolChoice:        toolemulation.ResolveToolChoice(tools, toolemulation.ExtractToolChoice(req.ToolChoice)),
 		ParallelToolCalls: req.ParallelToolCalls,
 		Temperature:       req.Temperature,
 		TopP:              req.TopP,
@@ -2170,6 +2513,12 @@ func responsesInputToMessages(ctx context.Context, input any) ([]rawMessage, err
 
 func responsesFunctionCallToRawMessage(item map[string]any) *rawMessage {
 	name := strings.TrimSpace(stringFromAny(item["name"]))
+	// A history function_call may arrive split into leaf name plus namespace;
+	// replay it as the single qualified name the model was taught, so the
+	// model recognises its own past call.
+	if ns := strings.TrimSpace(stringFromAny(item["namespace"])); ns != "" && name != "" {
+		name = toolemulation.QualifiedToolName(ns, name)
+	}
 	if name == "" {
 		return nil
 	}
@@ -2198,13 +2547,24 @@ func responsesFunctionCallToRawMessage(item map[string]any) *rawMessage {
 
 func responsesFunctionCallOutputToRawMessage(item map[string]any) *rawMessage {
 	callID := strings.TrimSpace(stringFromAny(item["call_id"]))
-	output := strings.TrimSpace(stringFromAny(item["output"]))
-	if callID == "" || output == "" {
+	if callID == "" {
+		return nil
+	}
+	// An empty-but-present output is a legal result (a tool that produced no
+	// text); dropping it broke the call/result pairing. A missing output, or
+	// one of the wrong JSON type, is not a result at all and must not be
+	// fabricated into one.
+	raw, present := item["output"]
+	if !present {
+		return nil
+	}
+	output, isString := raw.(string)
+	if !isString {
 		return nil
 	}
 	return &rawMessage{
 		Role:       "tool",
-		Content:    output,
+		Content:    strings.TrimSpace(output),
 		ToolCallID: callID,
 	}
 }
@@ -2352,6 +2712,41 @@ func maxTokens(a, b int) int {
 	return a
 }
 
+// validToolResultContent accepts the content shapes a tool result may carry:
+// a string, or an array of content blocks, each an object with a non-empty
+// string type; a text block must carry a string text field (empty allowed),
+// and a text field on any other block, when present, must be a string. Any
+// other shape is not a result; one malformed block invalidates the whole
+// array.
+func validToolResultContent(content any) bool {
+	switch typed := content.(type) {
+	case string:
+		return true
+	case []any:
+		for _, item := range typed {
+			block, ok := item.(map[string]any)
+			if !ok {
+				return false
+			}
+			blockType := strings.TrimSpace(stringFromAny(block["type"]))
+			if blockType == "" {
+				return false
+			}
+			text, hasText := block["text"]
+			if hasText {
+				if _, ok := text.(string); !ok {
+					return false
+				}
+			} else if strings.EqualFold(blockType, "text") {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 func extractText(content any) string {
 	switch typed := content.(type) {
 	case nil:
@@ -2401,6 +2796,14 @@ func decodeJSON(r *http.Request, out any) error {
 	decoder.UseNumber()
 	if err := decoder.Decode(out); err != nil {
 		return fmt.Errorf("invalid JSON body: %w", err)
+	}
+	// A body carries exactly one JSON value. Whatever follows it -- a second
+	// concatenated value, or garbage from a proxy chain that spliced two
+	// requests -- was never part of what the client meant to send, and stopping
+	// at the first value accepted it silently. Token returns io.EOF once only
+	// whitespace is left, which is the one case that must keep decoding.
+	if _, err := decoder.Token(); !errors.Is(err, io.EOF) {
+		return errors.New("invalid JSON body: unexpected content after the top-level JSON value")
 	}
 	return nil
 }
@@ -2528,7 +2931,10 @@ func buildOpenAIResponseMessageItem(messageID string, text string, status string
 		"role":    "assistant",
 		"content": []map[string]any{},
 	}
-	if strings.TrimSpace(text) != "" {
+	// Whitespace-only text is still text: the streamed bytes are the item's
+	// identity, so trimming here would make the completed frame diverge from
+	// the deltas the client already holds.
+	if text != "" {
 		item["content"] = []map[string]any{{
 			"type": "output_text",
 			"text": text,
@@ -2537,22 +2943,49 @@ func buildOpenAIResponseMessageItem(messageID string, text string, status string
 	return item
 }
 
+// responseTextForResponses is the text of the final frame for a turn the
+// stream never opened: trimmed backend prose, tools or not. The 931 acceptance
+// caught the old rule of blanking it whenever tool calls existed -- the model's
+// answer to "read both files" vanished from response.completed and from the
+// non-streaming body even though it streamed fine.
 func responseTextForResponses(result *service.ChatResult) string {
 	if result == nil {
-		return ""
-	}
-	if len(result.ToolCalls) > 0 {
 		return ""
 	}
 	return strings.TrimSpace(result.Text)
 }
 
 func buildOpenAIResponseBody(responseID string, created int64, model string, result *service.ChatResult, messageID string, includeReasoning bool) map[string]any {
+	return buildOpenAIResponseBodyWithText(responseID, created, model, result, messageID, includeReasoning, responseTextForResponses(result))
+}
+
+// responsesFunctionCallItem renders one function_call output item with the
+// wire contract the Responses protocol round-trips: name is the leaf and the
+// namespace, when the call belongs to one, rides its own field. Un-namespaced
+// calls keep the pre-namespace shape exactly.
+func responsesFunctionCallItem(tc toolemulation.ToolCall, arguments string, status string) map[string]any {
+	item := map[string]any{
+		"type":      "function_call",
+		"id":        tc.ID,
+		"call_id":   tc.ID,
+		"name":      tc.LeafName(),
+		"arguments": arguments,
+		"status":    status,
+	}
+	if tc.Namespace != "" {
+		item["namespace"] = tc.Namespace
+	}
+	return item
+}
+
+// buildOpenAIResponseBodyWithText lets the streaming path pin the message text
+// to the bytes the client already saw, so response.completed reconciles with
+// the output_item.done events instead of re-deriving a divergent answer.
+func buildOpenAIResponseBodyWithText(responseID string, created int64, model string, result *service.ChatResult, messageID string, includeReasoning bool, text string) map[string]any {
 	output := make([]map[string]any, 0, 1+len(result.ToolCalls))
 	if includeReasoning && strings.TrimSpace(result.ThoughtText) != "" {
 		output = append(output, buildOpenAIResponseReasoningItem("rs_"+responseID, result.ThoughtText, "completed"))
 	}
-	text := responseTextForResponses(result)
 	if text != "" {
 		if strings.TrimSpace(messageID) == "" {
 			messageID = fmt.Sprintf("msg_%d", time.Now().UnixNano())
@@ -2561,14 +2994,7 @@ func buildOpenAIResponseBody(responseID string, created int64, model string, res
 	}
 	for _, tc := range result.ToolCalls {
 		argsJSON, _ := json.Marshal(tc.Arguments)
-		output = append(output, map[string]any{
-			"type":      "function_call",
-			"id":        tc.ID,
-			"call_id":   tc.ID,
-			"name":      tc.Name,
-			"arguments": string(argsJSON),
-			"status":    "completed",
-		})
+		output = append(output, responsesFunctionCallItem(tc, string(argsJSON), "completed"))
 	}
 	if strings.TrimSpace(model) == "" {
 		model = result.Model
@@ -2593,17 +3019,29 @@ type openAIResponseStreamEmitter struct {
 	w          http.ResponseWriter
 	flusher    http.Flusher
 	responseID string
-	sequence   int
+	// mu guards the fields below. The handler's Event calls and the keep-alive
+	// heartbeat goroutine both reach them.
+	mu              sync.Mutex
+	sequence        int
+	started         bool
+	terminal        bool
+	createdResponse map[string]any
+	// serial, when set, marshals and writes one frame while the stream's
+	// single-writer lock is held, so a frame's sequence_number is allocated in
+	// exactly the order frames reach the wire. Injected by the keep-alive
+	// writer; nil means this emitter owns its own (test) writer.
+	serial func(name string, payload map[string]any, after func()) error
 }
 
 func newOpenAIResponseStreamEmitter(w http.ResponseWriter, flusher http.Flusher, responseID string) *openAIResponseStreamEmitter {
 	return &openAIResponseStreamEmitter{w: w, flusher: flusher, responseID: responseID}
 }
 
-func (e *openAIResponseStreamEmitter) Event(name string, payload map[string]any) error {
-	if payload == nil {
-		payload = map[string]any{}
-	}
+// marshalEventLocked renders one SSE frame with the sequence_number and
+// response_id fields every stream event carries. The caller holds e.mu; Event
+// writes the returned frame itself because the keep-alive goroutine must not
+// call back into the writer it is beating inside of.
+func (e *openAIResponseStreamEmitter) marshalEventLocked(name string, payload map[string]any) (string, error) {
 	if _, ok := payload["sequence_number"]; !ok {
 		payload["sequence_number"] = e.sequence
 		e.sequence++
@@ -2611,7 +3049,82 @@ func (e *openAIResponseStreamEmitter) Event(name string, payload map[string]any)
 	if _, ok := payload["response_id"]; !ok && e.responseID != "" {
 		payload["response_id"] = e.responseID
 	}
-	return writeSSEEvent(e.w, e.flusher, name, payload)
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	var frame strings.Builder
+	fmt.Fprintf(&frame, "event: %s\n", name)
+	fmt.Fprintf(&frame, "data: %s\n\n", body)
+	return frame.String(), nil
+}
+
+// markEventLocked returns the closure that records an event's effect on the
+// stream's state. The caller must hold e.mu, which is what lets the keep-alive
+// writer run it under the same lock that ordered the frame: the terminal flag
+// then closes the heartbeat gate before the terminal bytes are out, not after.
+func (e *openAIResponseStreamEmitter) markEventLocked(name string, payload map[string]any) func() {
+	return func() {
+		switch name {
+		case "response.created":
+			// Remember the response object exactly as announced: heartbeat
+			// re-sends must carry the same identity, not a reconstruction.
+			if resp, ok := payload["response"].(map[string]any); ok {
+				e.createdResponse = resp
+			}
+			e.started = true
+		case "response.completed", "error":
+			e.terminal = true
+		}
+	}
+}
+
+func (e *openAIResponseStreamEmitter) Event(name string, payload map[string]any) error {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	after := e.markEventLocked(name, payload)
+	if e.serial != nil {
+		return e.serial(name, payload, after)
+	}
+	e.mu.Lock()
+	frame, err := e.marshalEventLocked(name, payload)
+	if err == nil {
+		after()
+	}
+	e.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(e.w, frame); err != nil {
+		return err
+	}
+	e.flusher.Flush()
+	return nil
+}
+
+// heartbeatFrame re-sends the idempotent response.in_progress status event
+// during a silent stretch, so event-level idle timers (Codex CLI resets only
+// on parsed events, discarding comment lines) see liveness. It stays silent
+// before response.created has actually been written — in_progress ahead of
+// created opens the event sequence out of order — and after the terminal
+// event, where a beat would roll a conforming accumulator's status back from
+// completed to in_progress. The re-sent frame consumes a sequence_number like
+// any event; the protocol requires them increasing, not contiguous.
+func (e *openAIResponseStreamEmitter) heartbeatFrame() (string, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.started || e.terminal || e.createdResponse == nil {
+		return "", false
+	}
+	frame, err := e.marshalEventLocked("response.in_progress", map[string]any{
+		"type":     "response.in_progress",
+		"response": e.createdResponse,
+	})
+	if err != nil {
+		return "", false
+	}
+	return frame, true
 }
 
 func writeOpenAIResponseMessageStarted(emitter *openAIResponseStreamEmitter, messageID string, outputIndex int) error {
@@ -2733,24 +3246,57 @@ func (r *responseReasoningWriter) Close() error {
 	})
 }
 
-func writeOpenAIResponseStreamCompleted(emitter *openAIResponseStreamEmitter, responseID string, created int64, model string, result *service.ChatResult, messageID string, messageStarted bool, reasoningEmitted bool, streamedText string) {
+// writeOpenAIResponseStreamCompleted closes one Responses stream. Indexes are
+// assigned by what the client actually saw: reasoningOpened reports an item the
+// stream already announced at index 0, reasoningWanted one the final frame
+// still owes it, and everything after follows from there -- a reserved but
+// never-delivered reasoning slot must not shift the message off index 0.
+func writeOpenAIResponseStreamCompleted(emitter *openAIResponseStreamEmitter, responseID string, created int64, model string, result *service.ChatResult, messageID string, messageStarted bool, reasoningWanted bool, reasoningOpened bool, streamedText string) {
+	includeReasoning := reasoningWanted && (reasoningOpened || (result != nil && strings.TrimSpace(result.ThoughtText) != ""))
 	outputIndex := 0
-	if reasoningEmitted {
+	if reasoningOpened || includeReasoning {
+		if !reasoningOpened {
+			// The turn owes the client a reasoning item it never streamed
+			// (aggregate mode, or a thought that only surfaced in the final
+			// frame): replay its full lifecycle at index 0 so the event stream
+			// and the completed array agree.
+			late := newResponseReasoningWriter(emitter, "rs_"+responseID, 0)
+			// Original bytes, untrimmed: the completed snapshot carries
+			// result.ThoughtText verbatim, so a trimmed replay would hand the
+			// client two different texts for one item.
+			if err := late.Delta(result.ThoughtText); err != nil {
+				return
+			}
+			if err := late.Close(); err != nil {
+				return
+			}
+		}
 		outputIndex++
 	}
 	text := responseTextForResponses(result)
-	if text == "" && messageStarted {
-		// An item already announced with output_text.delta events has to be
-		// closed with the text the client actually saw. The final frame can drop
-		// the prose once a tool call wins, which used to leave the item open
-		// forever on the client side. Not trimmed: a model that streams " " before
-		// its action block opened the item, so closing it with "" would skip the
-		// done events and resurrect the same dangling item.
+	if messageStarted {
+		// An item already announced with output_text.delta has to close -- and
+		// has to appear in response.completed -- with the text the client
+		// actually saw. Not the trimmed final frame, and not blanked because a
+		// tool call won: the streamed bytes are the history the client holds.
+		// Not trimmed either: a model that streams " " before its action block
+		// opened the item, so closing it with "" would skip the done events and
+		// resurrect the dangling-item defect.
 		text = streamedText
 	}
 	if text != "" {
 		if !messageStarted {
 			_ = writeOpenAIResponseMessageStarted(emitter, messageID, outputIndex)
+			// A message the stream never announced still owes the client the
+			// delta lifecycle: clients assemble the answer from deltas, and the
+			// done-only sequence left the aggregate turn's text invisible.
+			_ = emitter.Event("response.output_text.delta", map[string]any{
+				"type":          "response.output_text.delta",
+				"item_id":       messageID,
+				"output_index":  outputIndex,
+				"content_index": 0,
+				"delta":         text,
+			})
 		}
 		_ = emitter.Event("response.content_part.done", map[string]any{
 			"type":          "response.content_part.done",
@@ -2782,14 +3328,7 @@ func writeOpenAIResponseStreamCompleted(emitter *openAIResponseStreamEmitter, re
 		_ = emitter.Event("response.output_item.added", map[string]any{
 			"type":         "response.output_item.added",
 			"output_index": outputIndex,
-			"item": map[string]any{
-				"type":      "function_call",
-				"id":        tc.ID,
-				"call_id":   tc.ID,
-				"name":      tc.Name,
-				"arguments": "",
-				"status":    "in_progress",
-			},
+			"item":         responsesFunctionCallItem(tc, "", "in_progress"),
 		})
 		_ = emitter.Event("response.function_call_arguments.delta", map[string]any{
 			"type":         "response.function_call_arguments.delta",
@@ -2797,30 +3336,27 @@ func writeOpenAIResponseStreamCompleted(emitter *openAIResponseStreamEmitter, re
 			"output_index": outputIndex,
 			"delta":        argsText,
 		})
-		_ = emitter.Event("response.function_call_arguments.done", map[string]any{
+		argsDone := map[string]any{
 			"type":         "response.function_call_arguments.done",
 			"item_id":      tc.ID,
 			"output_index": outputIndex,
-			"name":         tc.Name,
+			"name":         tc.LeafName(),
 			"arguments":    argsText,
-		})
+		}
+		if tc.Namespace != "" {
+			argsDone["namespace"] = tc.Namespace
+		}
+		_ = emitter.Event("response.function_call_arguments.done", argsDone)
 		_ = emitter.Event("response.output_item.done", map[string]any{
 			"type":         "response.output_item.done",
 			"output_index": outputIndex,
-			"item": map[string]any{
-				"type":      "function_call",
-				"id":        tc.ID,
-				"call_id":   tc.ID,
-				"name":      tc.Name,
-				"arguments": argsText,
-				"status":    "completed",
-			},
+			"item":         responsesFunctionCallItem(tc, argsText, "completed"),
 		})
 		outputIndex++
 	}
 	_ = emitter.Event("response.completed", map[string]any{
 		"type":     "response.completed",
-		"response": buildOpenAIResponseBody(responseID, created, model, result, messageID, reasoningEmitted),
+		"response": buildOpenAIResponseBodyWithText(responseID, created, model, result, messageID, includeReasoning, text),
 	})
 	_, _ = fmt.Fprint(emitter.w, "data: [DONE]\n\n")
 	emitter.flusher.Flush()
@@ -2860,15 +3396,19 @@ func streamingHeaders(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusOK)
 }
 
+// writeSSEEvent emits one complete SSE frame in a single Write call. The
+// keep-alive writer serializes at Write granularity, so a frame split across
+// two Writes could have a comment spliced between its event and data lines,
+// where the comment's trailing blank line would dispatch a data-less event.
 func writeSSEEvent(w http.ResponseWriter, flusher http.Flusher, event string, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, "data: %s\n\n", body); err != nil {
+	var frame strings.Builder
+	fmt.Fprintf(&frame, "event: %s\n", event)
+	fmt.Fprintf(&frame, "data: %s\n\n", body)
+	if _, err := io.WriteString(w, frame.String()); err != nil {
 		return err
 	}
 	flusher.Flush()
@@ -2886,6 +3426,160 @@ func writeSSEComment(w http.ResponseWriter, flusher http.Flusher, text string) e
 	return nil
 }
 
+// sseKeepaliveWriter keeps an established SSE stream from going silent: when
+// nothing has left the proxy for streamKeepaliveInterval it emits a heartbeat
+// frame. The default is a comment line, which the SSE spec defines as
+// carrying no event — enough for byte-level idle timeouts. Clients whose
+// idle timer only counts parsed events (Codex CLI's eventsource layer
+// discards comments) need setEventFrame: a real protocol event, invisible to
+// the protocol's own accumulators, that still resets an event-level timer.
+// All three protocol streams share this one writer instead of each carrying
+// its own timer. Frames and heartbeats hold the same mutex, so a beat can
+// only ever land between frames, never inside one.
+type sseKeepaliveWriter struct {
+	mu      sync.Mutex
+	w       http.ResponseWriter
+	flusher http.Flusher
+	last    time.Time
+	once    sync.Once
+	stop    chan struct{}
+	done    chan struct{}
+	// event, when set, replaces the comment beat with a protocol event frame.
+	// Called with mu held; ok=false skips this beat without pushing last
+	// forward, so the next tick retries as soon as the gate opens.
+	event func() (frame string, ok bool)
+}
+
+// newSSEKeepaliveWriter starts the heartbeat for a stream whose headers are
+// already on the wire. The returned writer must take over as the handler's
+// ResponseWriter and Flusher for the rest of the response, and Close must be
+// called when the stream ends. A non-positive interval disables the heartbeat;
+// the writer then only serializes writes.
+func newSSEKeepaliveWriter(w http.ResponseWriter, flusher http.Flusher) *sseKeepaliveWriter {
+	k := &sseKeepaliveWriter{
+		w:       w,
+		flusher: flusher,
+		last:    time.Now(),
+		stop:    make(chan struct{}),
+		done:    make(chan struct{}),
+	}
+	if interval := streamKeepaliveInterval; interval > 0 {
+		go k.run(interval)
+	} else {
+		close(k.done)
+	}
+	return k
+}
+
+func (k *sseKeepaliveWriter) run(interval time.Duration) {
+	defer close(k.done)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-k.stop:
+			return
+		case <-ticker.C:
+			// A failed write means the client is gone; stop beating.
+			if k.emit(interval) != nil {
+				return
+			}
+		}
+	}
+}
+
+// setEventFrame upgrades the heartbeat from a comment line to a real protocol
+// event. Safe to call right after construction, while the stream is young.
+func (k *sseKeepaliveWriter) setEventFrame(event func() (string, bool)) {
+	k.mu.Lock()
+	k.event = event
+	k.mu.Unlock()
+}
+
+// emit writes the heartbeat frame once the stream has been silent for the
+// whole interval. The mutex it shares with Write is what keeps the beat from
+// ever interleaving with a frame. A gated event beat (ok=false) writes
+// nothing and leaves last untouched, so it retries on the next tick.
+func (k *sseKeepaliveWriter) emit(interval time.Duration) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if time.Since(k.last) < interval {
+		return nil
+	}
+	if k.event != nil {
+		frame, ok := k.event()
+		if !ok {
+			return nil
+		}
+		if _, err := io.WriteString(k.w, frame); err != nil {
+			return err
+		}
+		k.flusher.Flush()
+	} else if err := writeSSEComment(k.w, k.flusher, "keep-alive"); err != nil {
+		return err
+	}
+	k.last = time.Now()
+	return nil
+}
+
+// writeFrame runs fn and writes the frame it returns while the stream is held
+// exclusively, then stamps it as activity. The Responses emitter installs this
+// as its write path: a frame's sequence_number is then allocated under the same
+// lock that orders the bytes, so a keep-alive beat can no longer take the next
+// number and overtake a real event that was mid-write. Lock order is k.mu then
+// e.mu, the same order emit already takes through heartbeatFrame.
+func (k *sseKeepaliveWriter) writeFrame(fn func() (string, error)) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	frame, err := fn()
+	if err != nil {
+		return err
+	}
+	if _, err := io.WriteString(k.w, frame); err != nil {
+		return err
+	}
+	k.flusher.Flush()
+	k.last = time.Now()
+	return nil
+}
+
+// anthropicPingFrame is the official Anthropic stream ping, byte for byte:
+// the API itself emits these to hold a stream open, the official SDK
+// accumulators ignore them, and repeats are harmless — exactly the shape a
+// heartbeat needs. Comment lines were not enough on this protocol: Codex
+// CLI's idle timer only counts parsed events and discards comments.
+func anthropicPingFrame() (string, bool) {
+	return "event: ping\ndata: {\"type\":\"ping\"}\n\n", true
+}
+
+func (k *sseKeepaliveWriter) Header() http.Header { return k.w.Header() }
+
+func (k *sseKeepaliveWriter) WriteHeader(code int) { k.w.WriteHeader(code) }
+
+func (k *sseKeepaliveWriter) Write(p []byte) (int, error) {
+	k.mu.Lock()
+	n, err := k.w.Write(p)
+	if err == nil {
+		k.flusher.Flush()
+		k.last = time.Now()
+	}
+	k.mu.Unlock()
+	return n, err
+}
+
+func (k *sseKeepaliveWriter) Flush() {
+	k.mu.Lock()
+	k.flusher.Flush()
+	k.mu.Unlock()
+}
+
+// Close stops the heartbeat and waits for it to leave, so no comment line can
+// land after the handler has returned. Safe to call more than once.
+func (k *sseKeepaliveWriter) Close() {
+	k.once.Do(func() { close(k.stop) })
+	<-k.done
+}
+
 func writeOpenAIChunk(w http.ResponseWriter, flusher http.Flusher, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -2898,10 +3592,62 @@ func writeOpenAIChunk(w http.ResponseWriter, flusher http.Flusher, payload any) 
 	return nil
 }
 
+// recordedTailBytes is how much of the response tail the recorder keeps on top
+// of the truncated head, so a terminal SSE error frame -- which always lands at
+// the very end of a stream -- is still recognisable after the head was capped.
+const recordedTailBytes = 8 << 10
+
+// sseTerminalError reports whether a recorded response carried a terminal error
+// event. A stream that has already committed its 200 and the text/event-stream
+// headers cannot change its status line afterwards, so the failure reached the
+// access log and every status-code-driven retry policy as a success. Only the
+// recorded status is rewritten; the client sees exactly the same bytes.
+//
+// The named `error` event is the Anthropic and Responses terminal frame. The
+// chat stream has no named event for it, so there a chunk whose only payload is
+// a top-level error object is the same thing; a successful chunk has choices,
+// never error.
+func sseTerminalError(contentType string, tail []byte) bool {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "text/event-stream") {
+		return false
+	}
+	for _, block := range strings.Split(string(tail), "\n\n") {
+		var data string
+		for _, line := range strings.Split(block, "\n") {
+			switch {
+			case strings.HasPrefix(line, "event: "):
+				if strings.TrimSpace(strings.TrimPrefix(line, "event: ")) == "error" {
+					return true
+				}
+			case strings.HasPrefix(line, "data: "):
+				data = strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+			}
+		}
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		// A block cut in half by the tail window is not JSON; skipping it can
+		// only miss a detection, never invent one.
+		var chunk struct {
+			Error *struct {
+				Type string `json:"type"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if chunk.Error != nil && chunk.Error.Type != "" {
+			return true
+		}
+	}
+	return false
+}
+
 type recordingResponseWriter struct {
 	http.ResponseWriter
 	statusCode int
 	body       []byte
+	tail       []byte
 	wrote      bool
 	truncated  bool
 	total      int
@@ -2925,12 +3671,65 @@ func (rw *recordingResponseWriter) Write(b []byte) (int, error) {
 		rw.body = append(rw.body, b...)
 		rw.truncated = len(rw.body) > recordedBodyLimit
 	}
+	// A terminal error frame lives at the end of a stream, which is exactly what
+	// the truncated head above throws away.
+	rw.tail = append(rw.tail, b...)
+	if len(rw.tail) > recordedTailBytes {
+		rw.tail = append(rw.tail[:0], rw.tail[len(rw.tail)-recordedTailBytes:]...)
+	}
 	return rw.ResponseWriter.Write(b)
 }
 
 func (rw *recordingResponseWriter) Flush() {
 	if flusher, ok := rw.ResponseWriter.(http.Flusher); ok {
 		flusher.Flush()
+	}
+}
+
+// slotContextKey marks a request whose slot the recorder already decided, so
+// the generation handlers do not queue for it a second time.
+type slotContextKey struct{}
+
+// enterSlot returns the slot decision withRecorder already made for this
+// request, if any. The recorder holds that slot until the handler returns, so
+// the handler must neither take a second one nor release it.
+func enterSlot(r *http.Request) (slotOutcome, bool) {
+	outcome, ok := r.Context().Value(slotContextKey{}).(slotOutcome)
+	return outcome, ok
+}
+
+// acquireRequestSlot resolves the execution slot for a generation request. On
+// the routes withRecorder pre-acquires, the decision is already in the context
+// and that slot is held for the whole request; everywhere else the handler
+// takes and releases its own, exactly as before. The returned release is always
+// safe to defer.
+func (s *Server) acquireRequestSlot(r *http.Request) (slotOutcome, func()) {
+	if outcome, ok := enterSlot(r); ok {
+		return outcome, func() {}
+	}
+	outcome := s.acquire(r.Context())
+	if outcome == slotAcquired {
+		return outcome, s.release
+	}
+	return outcome, func() {}
+}
+
+// generationPath reports whether a POST route runs a model turn. Those are the
+// only routes that take an execution slot, and the only ones whose request body
+// can run to the 32 MiB image ceiling, so they are the only ones whose body the
+// recorder reads under a held slot. count_tokens is a local estimate and never
+// took a slot, so pre-acquiring one there would only add queueing to a cheap
+// endpoint.
+func generationPath(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	switch r.URL.Path {
+	case "/v1/messages", "/v1/chat/completions", "/api/v1/chat/completions",
+		"/v1/responses", "/api/v1/responses":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2947,17 +3746,38 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 		// ReadAll let a handful of huge POSTs OOM the proxy ahead of the
 		// concurrency semaphore. Reading past the limit surfaces to handlers as
 		// the existing decodeJSON 400 exit.
-		//
-		// The honest ceiling is this cap times the number of open sockets, NOT
-		// times LINGMA_PROXY_MAX_CONCURRENT: this read still happens before
-		// acquire, and net/http bounds neither connections nor a total body
-		// budget here. Tightening it for real means draining the body inside the
-		// acquired slot.
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 
-		// Read request body for recording, then restore for downstream handler
+		// Read request body for recording, then restore for downstream handler.
+		// The read happens with an execution slot already held, so the worst
+		// case resident body is maxRequestBytes times the concurrency and not
+		// times every connection the listener has accepted; that bound was the
+		// documented upgrade path for the ceiling above. A request that cannot
+		// take a slot is left unbuffered -- a generation route is about to be
+		// refused with 429, and pulling 32 MiB in to throw it away was the leak.
 		var reqBody string
-		if r.Body != nil && r.Body != http.NoBody {
+		slotHeld := false
+		canRead := r.Body != nil && r.Body != http.NoBody && r.Method == http.MethodPost
+		if canRead && generationPath(r) {
+			// A generation route holds its slot for the whole request: the
+			// handler must not queue a second time for a slot it already has,
+			// and the body must not stay resident after the handler lets go.
+			outcome := s.acquire(r.Context())
+			r = r.WithContext(context.WithValue(r.Context(), slotContextKey{}, outcome))
+			slotHeld = outcome == slotAcquired
+			canRead = slotHeld
+		} else if canRead {
+			// A body that is only read to record it. Take a slot if one is
+			// free; never queue a cheap local endpoint (count_tokens) behind
+			// model turns for a debug record.
+			select {
+			case s.sem <- struct{}{}:
+				defer s.release()
+			default:
+				canRead = false
+			}
+		}
+		if canRead {
 			body, readErr := io.ReadAll(r.Body)
 			if readErr != nil {
 				// Hand the capped reader's error to the decoder too, so an
@@ -2972,6 +3792,9 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 
 		rw := &recordingResponseWriter{ResponseWriter: w, statusCode: 200}
 		next.ServeHTTP(rw, r)
+		if slotHeld {
+			s.release()
+		}
 		duration := time.Since(start)
 
 		// The client hung up while a subprocess was still working. Answering that
@@ -2979,6 +3802,13 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 		// log and dashboard; 499 is the "client closed request" code nginx uses.
 		if rw.statusCode >= 500 && r.Context().Err() != nil {
 			rw.statusCode = 499
+		}
+		// A stream that failed after committing its 200 cannot say so in a
+		// status line, so the failure is invisible to the access log and to
+		// every client that retries on status codes. Reclassify the record; the
+		// bytes the client received are untouched.
+		if rw.statusCode == http.StatusOK && sseTerminalError(rw.Header().Get("Content-Type"), rw.tail) {
+			rw.statusCode = http.StatusBadGateway
 		}
 
 		respBody := sanitizeRecordedBody(rw.body)
@@ -2993,7 +3823,18 @@ func (s *Server) withRecorder(next http.Handler) http.Handler {
 
 		s.recordRequest(r.Method, r.URL.Path, rw.statusCode, duration, reqBody, respBody)
 		if s.OnRequest != nil {
-			go s.OnRequest(r.Method, r.URL.Path, rw.statusCode, duration, reqBody, respBody)
+			callback, method, path, status := s.OnRequest, r.Method, r.URL.Path, rw.statusCode
+			go func() {
+				// This goroutine belongs to the caller, not to the handler: the
+				// desktop console's callback runs here, and an unrecovered panic
+				// in a goroutine takes the whole proxy process down with it.
+				defer func() {
+					if rec := recover(); rec != nil {
+						s.logf("OnRequest callback for %s %s panicked: %v\n%s", method, path, rec, debug.Stack())
+					}
+				}()
+				callback(method, path, status, duration, reqBody, respBody)
+			}()
 		}
 	})
 }
@@ -3045,6 +3886,22 @@ func (s *Server) debugRecords(limit int) []debugRequestRecord {
 		out = append(out, s.records[i])
 	}
 	return out
+}
+
+// logf appends one line to the in-process log the debug console reads. It is
+// also what a recovered panic in a caller-supplied callback lands in: the
+// console is the only place this process reports anything to a human.
+func (s *Server) logf(level, format string, args ...any) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	s.logs = append(s.logs, debugLogRecord{
+		Time:    time.Now().Format(time.RFC3339),
+		Level:   level,
+		Message: fmt.Sprintf(format, args...),
+	})
+	if len(s.logs) > 200 {
+		s.logs = s.logs[len(s.logs)-200:]
+	}
 }
 
 func (s *Server) debugLogs(limit int) []debugLogRecord {
@@ -3224,6 +4081,10 @@ func maxConcurrentRequests() int {
 // and kills the turn, which is how a fan-out of agents loses workers. Refusing
 // inside that window hands the client a retryable answer instead.
 // Var so the httpapi test can shrink it and still cover the refusal path.
+//
+// CONCURRENCY: plain package-level var, rewritten by the httpapi tests while
+// the package's other tests run. t.Parallel() anywhere in this package is
+// immediately a data race on it. Same warning as streamKeepaliveInterval.
 var slotQueueWait = 45 * time.Second
 
 type slotOutcome int
@@ -3265,6 +4126,17 @@ func (s *Server) release() {
 	}
 }
 
+// historicalToolCallID is the id a replayed assistant tool call must carry. An
+// empty id cannot be paired with the tool_result that follows it in the same
+// conversation, and it goes back out on the wire as id:"", which is not a
+// legal value on any of the three protocols. The Responses entry point already
+// dropped such calls; the Chat and Anthropic ones kept them, so the same history
+// was served or lost depending on which protocol the client spoke.
+func historicalToolCallID(id string) (string, bool) {
+	id = strings.TrimSpace(id)
+	return id, id != ""
+}
+
 func extractOpenAIToolCalls(raw []any) []toolemulation.ToolCall {
 	if len(raw) == 0 {
 		return nil
@@ -3275,7 +4147,10 @@ func extractOpenAIToolCalls(raw []any) []toolemulation.ToolCall {
 		if !ok {
 			continue
 		}
-		id := stringFromAny(m["id"])
+		id, ok := historicalToolCallID(stringFromAny(m["id"]))
+		if !ok {
+			continue
+		}
 		fn, ok := m["function"].(map[string]any)
 		if !ok {
 			continue
@@ -3325,13 +4200,17 @@ func extractAnthropicUserContent(content any) (string, []anthropicToolResult) {
 			continue
 		case "tool_result":
 			toolUseID := stringFromAny(m["tool_use_id"])
-			resultText := extractText(m["content"])
-			if resultText != "" {
-				results = append(results, anthropicToolResult{
-					ToolUseID: toolUseID,
-					Content:   resultText,
-				})
+			content, present := m["content"]
+			// Only a structurally valid content is a result; an absent key or
+			// a malformed shape is dropped, never fabricated into an empty
+			// result.
+			if !present || !validToolResultContent(content) {
+				continue
 			}
+			results = append(results, anthropicToolResult{
+				ToolUseID: toolUseID,
+				Content:   extractText(content),
+			})
 		}
 	}
 	text := ""
@@ -3362,7 +4241,10 @@ func extractAnthropicAssistantContent(content any) (string, []toolemulation.Tool
 			// Skip thinking blocks — they are not part of the conversation text
 			continue
 		case "tool_use":
-			id := stringFromAny(m["id"])
+			id, ok := historicalToolCallID(stringFromAny(m["id"]))
+			if !ok {
+				continue
+			}
 			name := stringFromAny(m["name"])
 			if name == "" {
 				continue
@@ -3664,19 +4546,29 @@ func fetchImageAsBase64(ctx context.Context, rawURL string) (*service.Image, err
 	}
 
 	mediaType := resp.Header.Get("Content-Type")
-	if mediaType == "" {
-		mediaType = "image/jpeg"
-	} else {
+	if idx := strings.Index(mediaType, ";"); idx >= 0 {
 		// Strip parameters like "image/png; charset=utf-8"
-		if idx := strings.Index(mediaType, ";"); idx >= 0 {
-			mediaType = strings.TrimSpace(mediaType[:idx])
-		}
+		mediaType = strings.TrimSpace(mediaType[:idx])
+	}
+	// The Origin gate stops a browser page from naming a target; this stops
+	// every other caller from turning the proxy into "base64 whatever that URL
+	// returns". A service that answers with JSON, HTML or plain text is not an
+	// image, and its bytes must never reach the model prompt. Go's own HTTP
+	// server sniffs a missing Content-Type off the first bytes, so a real image
+	// host still presents image/* here.
+	if !isImageMediaType(mediaType) {
+		return nil, fmt.Errorf("fetch image failed: %q is not an image content type", mediaType)
 	}
 
 	return &service.Image{
 		MediaType: mediaType,
 		Data:      base64.StdEncoding.EncodeToString(data),
 	}, nil
+}
+
+// isImageMediaType is the content-type half of the image read policy.
+func isImageMediaType(mediaType string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(mediaType)), "image/")
 }
 
 func normalizeImage(img *service.Image) *service.Image {

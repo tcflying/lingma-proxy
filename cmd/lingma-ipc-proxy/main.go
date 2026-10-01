@@ -10,7 +10,9 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -51,6 +53,23 @@ type fileConfig struct {
 	RemoteFallbackModels  []string `json:"remote_fallback_models"`
 	QoderCLISites         []string `json:"qodercli_sites"`
 }
+
+// qodercliTurnCeilingEnv is where internal/qodercli reads the CLI turn backstop
+// from. The name is repeated here rather than imported because that constant is
+// unexported and belongs to the package that applies the deadline; this entry
+// only names it so the flag has something to hand over and -h has something to
+// point at.
+const qodercliTurnCeilingEnv = "LINGMA_QODERCLI_TURN_CEILING"
+
+// qodercliTurnCeilingUsage documents the backstop at the place an operator
+// actually looks. The line that matters is the last one: with -timeout 0 there
+// is no proxy deadline at all, and the ceiling is what stops a wedged CLI child
+// from holding one of the backend's few concurrency slots forever. It stays a
+// separate setting rather than a shorter -timeout, so an operator who asked for
+// an hour of budget is not cut off at half an hour by a safety net.
+const qodercliTurnCeilingUsage = "Backstop ceiling for one Qoder CLI turn, as a Go duration (e.g. 20m; 0 switches the backstop off). " +
+	"It only applies when -timeout is 0, and then replaces nothing: an operator who asked for a deadline still gets exactly the one they asked for. " +
+	"The CLI backend reads it from " + qodercliTurnCeilingEnv + ", which this flag sets."
 
 // headlessLog takes the log off the console. Task Scheduler starts this build
 // inside an interactive console, and a console that stops servicing writes (a
@@ -108,6 +127,12 @@ func main() {
 	log.Printf("mode: %s", cfg.Mode)
 	if configPath != "" {
 		log.Printf("config file: %s", configPath)
+	}
+	// The backstop's default lives inside internal/qodercli, so this reports the
+	// override in force rather than a number copied here that could drift out of
+	// step with it. Silence means the CLI backend's own default is in effect.
+	if ceiling := strings.TrimSpace(os.Getenv(qodercliTurnCeilingEnv)); ceiling != "" {
+		log.Printf("qodercli turn ceiling: %s", ceiling)
 	}
 
 	errCh := make(chan error, 1)
@@ -198,7 +223,7 @@ func loadConfig() (service.Config, string) {
 	mode := flag.String("mode", cfg.Mode, "Lingma/QoderCN ACP mode value")
 	model := flag.String("model", cfg.Model, "Default Lingma/QoderCN model when API request omits model")
 	shellType := flag.String("shell-type", cfg.ShellType, "Shell type sent through ACP meta")
-	timeoutSeconds := flag.Int("timeout", int(cfg.Timeout/time.Second), "Per-request timeout in seconds; 0 disables the proxy deadline")
+	timeoutSeconds := flag.Int("timeout", int(cfg.Timeout/time.Second), "Per-request timeout in seconds; 0 disables the proxy deadline (the Qoder CLI backend then bounds a turn by -qodercli-turn-ceiling instead)")
 	remoteFallbackEnabled := flag.Bool("remote-fallback", cfg.RemoteFallbackEnabled, "Enable remote timeout/5xx fallback to the next available model")
 	remoteFallbackModels := flag.String("remote-fallback-models", strings.Join(cfg.RemoteFallbackModels, ","), "Comma-separated remote fallback model IDs")
 	qodercliSites := flag.String("qodercli-sites", strings.Join(cfg.QoderCLISites, ","), "Qoder sites the CLI backend serves: cn, global (empty serves both)")
@@ -207,7 +232,16 @@ func loadConfig() (service.Config, string) {
 	remoteAuthPick := flag.String("remote-auth-pick", "auto", "Remote login cache pick policy for export: auto, newest, or longest")
 	sessionMode := flag.String("session-mode", string(cfg.SessionMode), "Session mode: auto, fresh, reuse")
 	config := flag.String("config", valueOr(configPath, filepath.Join(currentDir(), "lingma-proxy.json")), "Path to JSON config file")
+	qodercliTurnCeiling := flag.String("qodercli-turn-ceiling", os.Getenv(qodercliTurnCeilingEnv), qodercliTurnCeilingUsage)
 	flag.Parse()
+
+	// The turn backstop is the one setting this entry does not carry in
+	// service.Config: it bounds a Qoder CLI subprocess turn rather than a proxy
+	// request, and the package that owns the subprocess is the one that applies
+	// it. It is read from the environment on every turn, so handing the value
+	// over here is enough -- and only an operator who actually passed the flag
+	// writes anything, leaving every other startup byte-for-byte unchanged.
+	applyQoderCLITurnCeiling(*qodercliTurnCeiling, flagWasSet("qodercli-turn-ceiling"))
 
 	parsedSessionMode := parseSessionMode(*sessionMode)
 	parsedTransport := parseTransport(*transport)
@@ -310,7 +344,11 @@ func printExportResult(kind string, result deploy.ServerBundleResult) {
 }
 
 func resolveConfigPath() (string, bool) {
-	if path := strings.TrimSpace(lookupArgValue("--config")); path != "" {
+	// The pre-scan runs before flag.Parse, so it has to accept every spelling
+	// flag.Parse would accept: "-config v" is the same flag as "--config v", and
+	// a pre-scan that only knows the double-dash form silently loads the default
+	// file while the startup log prints the path the operator actually named.
+	if path := strings.TrimSpace(lookupArgValue("config")); path != "" {
 		return path, true
 	}
 	if path := strings.TrimSpace(os.Getenv("LINGMA_PROXY_CONFIG")); path != "" {
@@ -334,7 +372,51 @@ func readFileConfig(path string) (fileConfig, error) {
 	if err := json.Unmarshal(body, &cfg); err != nil {
 		return cfg, err
 	}
+	// Unknown keys are reported, not rejected. The file is hand-written and also
+	// shipped by -export-server-bundle, and its only error path is log.Fatalf in
+	// loadConfig: turning one stale key nobody reads into a refusal to start is a
+	// far worse outage than the typo it would catch. The console write API can
+	// reject unknown fields because it owns the payload it is handed; this file
+	// belongs to whoever edited it last, so the complaint goes to the log.
+	for _, key := range unknownFileConfigKeys(body) {
+		log.Printf("config file %s: ignoring unknown key %q", path, key)
+	}
 	return cfg, nil
+}
+
+// unknownFileConfigKeys lists the top-level keys no field of fileConfig claims.
+// A misspelling such as "remoate_base_url" used to be dropped without a word, so
+// the operator saw a setting that silently never took effect.
+func unknownFileConfigKeys(body []byte) []string {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil
+	}
+	known := knownFileConfigKeys()
+	unknown := make([]string, 0, len(raw))
+	for key := range raw {
+		if _, ok := known[key]; !ok {
+			unknown = append(unknown, key)
+		}
+	}
+	sort.Strings(unknown)
+	return unknown
+}
+
+// knownFileConfigKeys derives the accepted set from the struct tags instead of a
+// hand-maintained list, so a field added to fileConfig is accepted without a
+// second edit here that can be forgotten.
+func knownFileConfigKeys() map[string]struct{} {
+	typ := reflect.TypeOf(fileConfig{})
+	keys := make(map[string]struct{}, typ.NumField())
+	for i := 0; i < typ.NumField(); i++ {
+		name := strings.Split(typ.Field(i).Tag.Get("json"), ",")[0]
+		if name == "" || name == "-" {
+			continue
+		}
+		keys[name] = struct{}{}
+	}
+	return keys
 }
 
 func overlayFileConfig(dst *service.Config, src fileConfig) {
@@ -496,30 +578,46 @@ func parseTransport(value string) lingmaipc.Transport {
 	return transport
 }
 
+// lookupArgValue reads one flag out of the raw command line, before flag.Parse
+// has had a chance to. It matches both the single-dash and the double-dash
+// spelling, in the separated and the "=" form, because the flag package treats
+// "-config", "--config" and "-config=v" as the same flag and a pre-scan that
+// disagrees with the parser hands the caller the wrong file.
 func lookupArgValue(flagName string) string {
+	names := []string{"-" + flagName, "--" + flagName}
 	for i := 1; i < len(os.Args); i++ {
 		arg := os.Args[i]
-		if arg == flagName {
-			if i+1 < len(os.Args) {
-				return os.Args[i+1]
+		for _, name := range names {
+			if arg == name {
+				if i+1 < len(os.Args) {
+					return os.Args[i+1]
+				}
+				return ""
 			}
-			return ""
-		}
-		prefix := flagName + "="
-		if strings.HasPrefix(arg, prefix) {
-			return strings.TrimPrefix(arg, prefix)
+			prefix := name + "="
+			if strings.HasPrefix(arg, prefix) {
+				return strings.TrimPrefix(arg, prefix)
+			}
 		}
 	}
 	return ""
 }
 
+// envInt reads an integer override, and says so when the value it was handed is
+// not one. A silent fallback makes a typo'd LINGMA_PROXY_PORT look exactly like
+// an unset one, and "my setting does nothing" is the most expensive kind of
+// misconfiguration to diagnose.
 func envInt(key string, fallback int) int {
-	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-		if n, err := strconv.Atoi(value); err == nil {
-			return n
-		}
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
 	}
-	return fallback
+	n, err := strconv.Atoi(value)
+	if err != nil {
+		log.Printf("%s=%q is not an integer; keeping %d", key, value, fallback)
+		return fallback
+	}
+	return n
 }
 
 func envBool(key string) (bool, bool) {
@@ -529,9 +627,39 @@ func envBool(key string) (bool, bool) {
 		return true, true
 	case "0", "false", "no", "off":
 		return false, true
+	case "":
+		return false, false
 	default:
+		log.Printf("%s=%q is not a boolean (want 1/0, true/false, yes/no or on/off); ignoring it", key, value)
 		return false, false
 	}
+}
+
+// applyQoderCLITurnCeiling hands the flag's value to the CLI backend. Only an
+// explicit flag writes it, so an unset flag leaves the environment exactly as
+// the operator handed it to us, including "unset", which is the CLI backend's
+// own signal to use its default backstop.
+func applyQoderCLITurnCeiling(value string, explicit bool) {
+	if !explicit {
+		return
+	}
+	if err := os.Setenv(qodercliTurnCeilingEnv, strings.TrimSpace(value)); err != nil {
+		log.Printf("set %s: %v", qodercliTurnCeilingEnv, err)
+	}
+}
+
+// flagWasSet reports whether the operator passed the flag, as opposed to it
+// merely carrying a default. Every other flag in this file layers its default
+// from the file config and lets the command line win; this one layers from the
+// environment, and only a real override may be pushed back into it.
+func flagWasSet(name string) bool {
+	set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			set = true
+		}
+	})
+	return set
 }
 
 func splitCSV(value string) []string {

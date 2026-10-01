@@ -2,7 +2,10 @@ package qodercli
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"lingma-ipc-proxy/internal/remote"
 )
@@ -194,5 +197,116 @@ func TestParseResultReportsTheBackendStopReason(t *testing.T) {
 	}
 	if result.StopReason != "max_tokens" {
 		t.Fatalf("stop reason = %q", result.StopReason)
+	}
+}
+
+// TestParseResultReadsLinesTheCaptureWouldAdmit: the second parse ran a scanner
+// with its own hardcoded 8 MB while the capture used maxCLIOutputLineBytes, so
+// raising the var (which is a var for exactly that) only moved the failure -- the
+// capture admitted the frame and the parse called the turn silent. The frame here
+// is past the literal the parse used to hold.
+func TestParseResultReadsLinesTheCaptureWouldAdmit(t *testing.T) {
+	prev := maxCLIOutputLineBytes
+	maxCLIOutputLineBytes = 16 * 1024 * 1024
+	t.Cleanup(func() { maxCLIOutputLineBytes = prev })
+
+	// 8.4 MB of payload, which is over the 8 MB the parse used to allow and well
+	// under the cap the capture is now configured with.
+	answer := strings.Repeat("字", 2_800_000)
+	stdout := `{"type":"result","subtype":"success","result":"` + answer + `"}` + "\n"
+	if len(stdout) <= 8*1024*1024 {
+		t.Fatalf("the fixture is %d bytes, which does not clear the old 8 MB ceiling", len(stdout))
+	}
+
+	result, sawResult, err := parseResult(stdout, "Qwen3.8-Flash", "CN", SiteCN)
+	if err != nil {
+		t.Fatalf("a frame the capture admitted must not read as an unanswered turn: %v", err)
+	}
+	if !sawResult {
+		t.Fatal("the oversized result frame was dropped, so the turn looks unfinished")
+	}
+	if result.Text != answer {
+		t.Fatalf("text is %d bytes, want the %d byte answer", len(result.Text), len(answer))
+	}
+}
+
+// TestTruncateNeverSplitsARune: the CLI answers and fails in Chinese, and a byte
+// cut leaves half a multi-byte rune for the client to render as mojibake.
+func TestTruncateNeverSplitsARune(t *testing.T) {
+	text := strings.Repeat("错", 200) // 600 bytes, three per rune
+	// 401 lands inside the third rune, at offset 2 of the bytes 402..404.
+	got := truncate(text, 401)
+	if !utf8.ValidString(got) {
+		t.Fatalf("truncate cut a rune in half: %q", got)
+	}
+	if want := strings.Repeat("错", 133) + "…"; got != want {
+		t.Fatalf("truncate = %q, want the rune-aligned prefix %q", got, want)
+	}
+
+	// A limit that lands exactly on a boundary keeps every byte it was given.
+	aligned := truncate(text, 402)
+	if want := strings.Repeat("错", 134) + "…"; aligned != want {
+		t.Fatalf("truncate at a boundary = %q, want %q", aligned, want)
+	}
+
+	// Short enough to pass through untouched, and a limit of zero must not slice
+	// the string into something unprintable.
+	if got := truncate("  已经够短  ", 400); got != "已经够短" {
+		t.Fatalf("truncate changed a short string: %q", got)
+	}
+	if got := truncate(text, 0); !utf8.ValidString(got) || got != "…" {
+		t.Fatalf("truncate at 0 = %q", got)
+	}
+}
+
+// TestWorkerLocationRunsTheRuntimeBeforeTheFlags covers the argv shape a desktop
+// install produces, which is the primary install: the Electron host is launched
+// as a node runtime, so the worker script is argv[0] and every CLI flag follows
+// it. Nothing checked that the two argv shapes are not swapped.
+func TestWorkerLocationRunsTheRuntimeBeforeTheFlags(t *testing.T) {
+	loc := Location{HostExe: `C:\Qoder CN\Qoder CN.exe`, RuntimeJS: `C:\Qoder CN\worker.mjs`}
+	if !loc.useWorker() {
+		t.Fatal("a location with a runtime JS must be a worker location")
+	}
+	c := NewClient(loc, 0)
+	name, argv := c.commandArgs([]string{"--print", "--tools", ""})
+	if name != loc.HostExe {
+		t.Fatalf("host = %q, want the Electron executable %q", name, loc.HostExe)
+	}
+	want := []string{loc.RuntimeJS, "--print", "--tools", ""}
+	if strings.Join(argv, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("argv = %q, want %q", argv, want)
+	}
+
+	// The standalone install has no runtime script, so the flags stand alone.
+	standalone := NewClient(Location{HostExe: `/usr/local/bin/qodercli`}, 0)
+	name, argv = standalone.commandArgs([]string{"--print"})
+	if name != `/usr/local/bin/qodercli` || strings.Join(argv, "\x00") != "--print" {
+		t.Fatalf("standalone argv = %q %q", name, argv)
+	}
+}
+
+// TestTurnCeilingReadsTheOperatorOverride covers the switch itself: empty means
+// the default, 0 means off, and a value that is not a duration must not silently
+// become "no ceiling at all" -- the default is the safe answer to a typo.
+func TestTurnCeilingReadsTheOperatorOverride(t *testing.T) {
+	t.Setenv(turnCeilingEnv, "")
+	if got := turnCeiling(); got != defaultTurnCeiling {
+		t.Fatalf("unset = %s, want the %s default", got, defaultTurnCeiling)
+	}
+	t.Setenv(turnCeilingEnv, "0")
+	if got := turnCeiling(); got != 0 {
+		t.Fatalf("0 = %s, want the backstop switched off", got)
+	}
+	t.Setenv(turnCeilingEnv, "90s")
+	if got := turnCeiling(); got != 90*time.Second {
+		t.Fatalf("90s = %s", got)
+	}
+	t.Setenv(turnCeilingEnv, "half an hour")
+	if got := turnCeiling(); got != defaultTurnCeiling {
+		t.Fatalf("a bad value = %s, want the default rather than no ceiling", got)
+	}
+	if defaultTurnCeiling != 30*time.Minute {
+		t.Fatalf("the default ceiling is %s, not the documented 30 minutes", defaultTurnCeiling)
 	}
 }

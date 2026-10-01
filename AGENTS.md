@@ -9,7 +9,7 @@ lingma-ipc-proxy — Lingma IDE Plugin API 适配层，提供 OpenAI/Anthropic �
 ## 命令
 
 ```bash
-cd /Users/tiancheng/OpenSources/lingma-ipc-proxy
+cd /Users/yourname/OpenSources/lingma-ipc-proxy
 gofmt -w .                          # 格式化
 go build -o lingma-ipc-proxy ./cmd/lingma-ipc-proxy  # 编译
 ./lingma-ipc-proxy                  # 运行（前台）

@@ -40,9 +40,14 @@ const (
 	feedbackDesktopFolderName  = "Lingma Proxy Feedback"
 	serverBundleFolderName     = "Lingma Proxy Server Bundles"
 	proxyWarmupTimeout         = 30 * time.Second
-	appStatePersistRequestMax  = 300
-	appStatePersistLogMax      = 1000
-	listSummaryMessageLimit    = 240
+	// primeWarmupTimeout bounds the detached startup prime. It is generous on
+	// purpose -- nothing is waiting on it -- but finite, so a wedged backend stops
+	// trying instead of holding a CLI child for the life of the process. The
+	// per-site budget inside the warmup is the service's, not this one.
+	primeWarmupTimeout        = 45 * time.Minute
+	appStatePersistRequestMax = 300
+	appStatePersistLogMax     = 1000
+	listSummaryMessageLimit   = 240
 	// statsModelKeyLimit caps how many distinct model strings the token stats
 	// track: the key comes from the request body, so a client controls it.
 	statsModelKeyLimit = 200
@@ -148,10 +153,29 @@ type App struct {
 	stateFlushAt    time.Time
 	stateDirtySince time.Time
 
+	// stateWrite* hand the persisted-state snapshot to a single writer goroutine
+	// so marshal and the file write happen off a.mu; see flushAppStateLocked.
+	// stateWriteAsync is false on the zero value so tests get a deterministic
+	// inline write; production turns it on once in startup.
+	stateWriteMu      sync.Mutex
+	stateWritePending *appStateFile
+	stateWriteWake    chan struct{}
+	stateWriteAsync   bool
+
+	// usageEmit* throttle the usage:updated event; see emitUsageUpdated.
+	usageEmitMu    sync.Mutex
+	lastUsageEmit  time.Time
+	usageEmitTimer *time.Timer
+
 	// console and consoleToken are guarded by mu; startup publishes both before
 	// any binding can read them, but the proxy it spawns already can.
 	console      *console
 	consoleToken string
+
+	// domReady is set by the frontend's own DOM-ready callback, which Wails only
+	// fires from navigationCompleted. The shell watchdog reads it to learn that a
+	// first frame never arrived.
+	domReady atomic.Bool
 }
 
 // ModelInfo represents a model returned by /v1/models
@@ -245,6 +269,11 @@ func NewApp() *App {
 // startup is called when the app starts
 func (a *App) startup(ctx context.Context) {
 	a.setWailsCtx(ctx)
+	// The async state writer needs the wails context for its rare error logs,
+	// so it switches on here rather than on the zero value (tests stay inline).
+	a.mu.Lock()
+	a.stateWriteAsync = true
+	a.mu.Unlock()
 	service.SweepImageTemps()
 	a.cfg = defaultConfig()
 	if err := a.loadAppState(); err != nil {
@@ -265,6 +294,7 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}()
 
+	a.armShellShowWatchdog()
 	a.startConsole()
 }
 
@@ -276,7 +306,52 @@ func (a *App) startup(ctx context.Context) {
 // unsynchronised writer racing the auto-start goroutine and every per-request
 // recording goroutine, which is what could tear the interface value inside
 // EventsEmit.
-func (a *App) onDomReady(_ context.Context) {}
+func (a *App) onDomReady(_ context.Context) { a.domReady.Store(true) }
+
+// shellShowWatchdog is how long the app waits for the WebView's first frame
+// before showing the window by hand.
+const shellShowWatchdog = 3 * time.Second
+
+// armShellShowWatchdog keeps the desktop from becoming a headless process.
+//
+// Wails shows the Windows shell only from its navigationCompleted callback
+// (internal/frontend/desktop/windows/frontend.go), and that callback is not
+// guaranteed to arrive: on a box where WebView2 renders the page but never
+// reports the navigation as done, the proxy and the console keep serving behind
+// a window that was never made visible.
+//
+// Showing is not enough either. Wails' own show path ends in ShowWindow(SW_SHOW),
+// which by definition leaves the window in whatever show state it already had, and
+// a process started by a shell that passes a minimised start state gets one: the
+// window then reports visible=true while sitting at the iconic coordinates
+// (-25600,-25600), which reads to the user as "the app never opened". So re-ask
+// until the shell is demonstrably not minimised.
+func (a *App) armShellShowWatchdog() {
+	ctx := a.wailsCtx()
+	if ctx == nil {
+		return
+	}
+	go func() {
+		time.Sleep(shellShowWatchdog)
+		if a.domReady.Load() {
+			return
+		}
+		for i := 0; i < 8; i++ {
+			a.ShowWindow()
+			// The inherited start state can land after the first show, so check
+			// after a settle rather than right after asking.
+			time.Sleep(250 * time.Millisecond)
+			if !runtime.WindowIsMinimised(ctx) {
+				break
+			}
+		}
+		panel := ""
+		if info := a.ConsoleInfo(); info.Serving {
+			panel = strings.TrimSuffix(info.URL, "/") + "/#token=" + info.Token
+		}
+		a.emitLog("warn", "界面首帧未在 "+shellShowWatchdog.String()+" 内到达，已强制显示窗口（若窗口仍然空白，请改用浏览器面板 "+panel+"）")
+	}()
+}
 
 // setWailsCtx publishes the lifecycle context for every runtime.* call.
 func (a *App) setWailsCtx(ctx context.Context) {
@@ -774,9 +849,7 @@ func (a *App) startProxy(prebound net.Listener) error {
 		a.mu.Unlock()
 		a.runtimeEvents("requests:updated")
 		a.publishEvent("requests:updated", nil)
-		stats := a.GetTokenStats()
-		a.runtimeEvents("usage:updated", stats)
-		a.publishEvent("usage:updated", stats)
+		a.emitUsageUpdated()
 	}
 
 	// Claim this generation and bind it in one critical section. A listener that
@@ -828,6 +901,36 @@ func (a *App) startProxy(prebound net.Listener) error {
 	msg := fmt.Sprintf("Proxy started on http://%s", addr)
 	runtime.LogInfof(a.wailsCtx(), msg)
 	a.emitLog("info", msg)
+
+	// Prime the backend outside every client-facing budget.
+	//
+	// The probe below asks our own /v1/models for a list, and a request-path
+	// discovery is capped at the catalog's own cold budget -- which is below what
+	// one CLI spawn actually costs on a busy box, so on that hardware the desktop
+	// never gets a catalog written and every cold start re-runs the discovery and
+	// fails. Service.Warmup is the only caller of the priming budget, and until
+	// now the desktop was the one entry point that never called it: the prime
+	// pass exists for the case where nobody is waiting, which is exactly this.
+	//
+	// It runs after the mu.Unlock above on purpose. Warmup can sit inside a
+	// child process wait for its whole budget, and every binding call and
+	// emitLog on the other side of this mu would queue behind it.
+	go func(svc *service.Service) {
+		primeCtx, cancel := context.WithTimeout(context.Background(), primeWarmupTimeout)
+		defer cancel()
+		if err := svc.Warmup(primeCtx); err != nil {
+			runtime.LogWarningf(a.wailsCtx(), "backend prime warmup failed: %v", err)
+			a.emitLog("warn", fmt.Sprintf("后端预热失败：%v", err))
+			return
+		}
+		// Both sinks, not just the Wails log: runtime.LogInfof goes to the runtime
+		// log only, and the log ring is the one an operator can read back from the
+		// console API or the state file. A prime that is silent is indistinguishable
+		// from one that never ran, and "did the catalog get primed" is the first
+		// question anyone asks when a cold start comes back empty.
+		runtime.LogInfof(a.wailsCtx(), "backend prime warmup completed")
+		a.emitLog("info", "后端预热完成，模型目录已落盘")
+	}(svc)
 
 	// Fetching /v1/models warms up the selected backend and refreshes the model
 	// cache. Keep startup probing shorter than manual probing so a slow runtime
@@ -1266,6 +1369,53 @@ func (a *App) GetTokenStats() TokenStats {
 	return stats
 }
 
+// logWarnf logs through the Wails runtime only when a lifecycle context
+// exists. The runtime treats a call with any other context as fatal misuse and
+// exits the process, and error paths reachable from a hand-built App in tests
+// would otherwise take the whole test binary down with them.
+func (a *App) logWarnf(format string, args ...any) {
+	if ctx := a.wailsCtx(); ctx != nil {
+		runtime.LogWarningf(ctx, format, args...)
+	}
+}
+
+// usageEmitInterval throttles the usage:updated event. Every recorded request
+// used to clone the whole ByModel map and push it to two frontends on
+// completion; a streaming coding session fires that per turn and the panel
+// cannot render faster than this anyway.
+const usageEmitInterval = 500 * time.Millisecond
+
+// emitUsageUpdated publishes the usage event at most once per interval. The
+// trailing timer is what keeps the final count from being the one dropped: a
+// burst emits the first event immediately and one more after the interval,
+// carrying whatever accumulated in between.
+func (a *App) emitUsageUpdated() {
+	a.usageEmitMu.Lock()
+	defer a.usageEmitMu.Unlock()
+	now := time.Now()
+	if a.lastUsageEmit.IsZero() || now.Sub(a.lastUsageEmit) >= usageEmitInterval {
+		a.lastUsageEmit = now
+		a.publishUsageUpdated()
+		return
+	}
+	if a.usageEmitTimer == nil {
+		delay := usageEmitInterval - now.Sub(a.lastUsageEmit)
+		a.usageEmitTimer = time.AfterFunc(delay, func() {
+			a.usageEmitMu.Lock()
+			a.lastUsageEmit = time.Now()
+			a.usageEmitTimer = nil
+			a.usageEmitMu.Unlock()
+			a.publishUsageUpdated()
+		})
+	}
+}
+
+func (a *App) publishUsageUpdated() {
+	stats := a.GetTokenStats()
+	a.runtimeEvents("usage:updated", stats)
+	a.publishEvent("usage:updated", stats)
+}
+
 // RefreshModels probes the running proxy for the latest model list.
 func (a *App) RefreshModels() ([]ModelInfo, error) {
 	a.mu.RLock()
@@ -1318,8 +1468,12 @@ func startupModelProbeTimeout(cfg service.Config, hasCachedModels bool) time.Dur
 		}
 		return timeout
 	}
-	if timeout > 12*time.Second {
-		return 12 * time.Second
+	// Nothing cached: this probe goes through the same process's own backend, and
+	// that backend is allowed to spend its cold budget. Capping the caller below it
+	// made the desktop give up at 12s while the CLI still needed 44-130s, so the GUI
+	// opened on an empty catalog until someone pressed refresh by hand.
+	if floor := service.CLIColdProbeTimeout(); timeout < floor {
+		return floor
 	}
 	return timeout
 }
@@ -1360,41 +1514,65 @@ func (a *App) SelectModel(modelID string) (ProxyStatus, error) {
 }
 
 func (a *App) fetchModels(addr string, timeout time.Duration) ([]ModelInfo, error) {
-	url := fmt.Sprintf("http://%s/v1/models", addr)
 	if timeout <= 0 {
 		timeout = proxyWarmupTimeout
 	}
 	reqCtx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
-	}
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		runtime.LogWarningf(a.wailsCtx(), "fetch models failed: %v", err)
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, fmt.Errorf("模型探测超时（%ds）", int(timeout.Seconds()))
+
+	var models []ModelInfo
+	// Prefer the in-process service over a loopback HTTP call to ourselves: the
+	// detour allocated a client per probe and, worse, went through the request
+	// recorder, so every desktop refresh landed in the user's request history
+	// next to real chats. svc.ListModels is exactly what the /v1/models handler
+	// serializes (id, name, no transformation), so the lists are identical.
+	a.mu.RLock()
+	svc := a.svc
+	a.mu.RUnlock()
+	if svc != nil {
+		list, err := svc.ListModels(reqCtx)
+		if err != nil {
+			a.logWarnf("fetch models failed: %v", err)
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("模型探测超时（%ds）", int(timeout.Seconds()))
+			}
+			return nil, err
 		}
-		return nil, err
-	}
-	defer resp.Body.Close()
+		models = make([]ModelInfo, 0, len(list))
+		for _, m := range list {
+			models = append(models, ModelInfo{ID: m.ID, Name: m.Name})
+		}
+	} else {
+		url := fmt.Sprintf("http://%s/v1/models", addr)
+		req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, err
+		}
+		client := &http.Client{}
+		resp, err := client.Do(req)
+		if err != nil {
+			a.logWarnf("fetch models failed: %v", err)
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("模型探测超时（%ds）", int(timeout.Seconds()))
+			}
+			return nil, err
+		}
+		defer resp.Body.Close()
 
-	var result struct {
-		Data []struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		runtime.LogWarningf(a.wailsCtx(), "decode models failed: %v", err)
-		return nil, err
-	}
-
-	models := make([]ModelInfo, 0, len(result.Data))
-	for _, m := range result.Data {
-		models = append(models, ModelInfo{ID: m.ID, Name: m.Name})
+		var result struct {
+			Data []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			a.logWarnf("decode models failed: %v", err)
+			return nil, err
+		}
+		models = make([]ModelInfo, 0, len(result.Data))
+		for _, m := range result.Data {
+			models = append(models, ModelInfo{ID: m.ID, Name: m.Name})
+		}
 	}
 
 	a.mu.Lock()
@@ -1550,20 +1728,31 @@ func (a *App) saveAppStateLocked() {
 	})
 }
 
-// renderAppStateLocked clones the persisted state and marshals it. It is separate
-// from the write so the two costs can be measured apart: Stats.ByModel is a live
-// map, so anything that marshals off a.mu has to clone it first.
-func (a *App) renderAppStateLocked() ([]byte, bool) {
+// snapshotAppStateLocked clones the persisted state just deep enough that no
+// later mutation can reach it: requests and logs get fresh backing arrays from
+// the trim helpers, models are copied the same way, and the stats map -- the one
+// live map in here -- is cloned outright. Marshal and the file write happen off
+// a.mu in the writer goroutine; this is the only part that holds the lock.
+func (a *App) snapshotAppStateLocked() *appStateFile {
 	state := appStateFile{
 		Requests:   trimPersistedRequests(a.requests),
 		Logs:       trimPersistedLogs(a.logs),
 		Stats:      a.stats,
-		Models:     a.models,
+		Models:     append([]ModelInfo(nil), a.models...),
 		AdminToken: a.consoleToken,
 	}
-	data, err := json.MarshalIndent(state, "", "  ")
+	if state.Stats.ByModel != nil {
+		state.Stats.ByModel = cloneIntMap(state.Stats.ByModel)
+	}
+	return &state
+}
+
+// renderAppStateLocked stays as the measurable half the payload-bounding test
+// pins: what one flush asks the writer to marshal, clone plus encode together.
+func (a *App) renderAppStateLocked() ([]byte, bool) {
+	data, err := json.MarshalIndent(a.snapshotAppStateLocked(), "", "  ")
 	if err != nil {
-		runtime.LogWarningf(a.wailsCtx(), "marshal app state failed: %v", err)
+		a.logWarnf("marshal app state failed: %v", err)
 		return nil, false
 	}
 	return data, true
@@ -1576,25 +1765,86 @@ func (a *App) flushAppStateLocked() {
 	}
 	a.stateFlushAt = time.Time{}
 	a.stateDirtySince = time.Time{}
+	a.enqueueStateWrite(a.snapshotAppStateLocked())
+}
+
+// enqueueStateWrite hands the latest snapshot to the writer. Latest wins: a
+// burst of flushes coalesces to whichever snapshot arrived last, which is the
+// same convergence the debounce was buying, without the marshal (~5MB with the
+// ring full, measured ~45ms) ever running under a.mu. The channel is buffered
+// to one and non-blocking, so the enqueue side can never stall the lock holder.
+// The zero value runs inline, which keeps tests deterministic and stops writer
+// goroutines from outliving the App a test built by hand.
+func (a *App) enqueueStateWrite(state *appStateFile) {
+	if !a.stateWriteAsync {
+		a.writeAppStateFile(state)
+		return
+	}
+	a.stateWriteMu.Lock()
+	if a.stateWriteWake == nil {
+		a.stateWriteWake = make(chan struct{}, 1)
+		go a.stateWriter()
+	}
+	a.stateWritePending = state
+	wake := a.stateWriteWake
+	a.stateWriteMu.Unlock()
+	select {
+	case wake <- struct{}{}:
+	default:
+	}
+}
+
+// stateWriter serializes writes: it drains one snapshot per wake and re-checks
+// pending afterwards, so a snapshot enqueued while a write is in flight still
+// gets written rather than dropped.
+func (a *App) stateWriter() {
+	for range a.stateWriteWake {
+		for {
+			a.stateWriteMu.Lock()
+			state := a.stateWritePending
+			a.stateWritePending = nil
+			a.stateWriteMu.Unlock()
+			if state == nil {
+				break
+			}
+			a.writeAppStateFile(state)
+		}
+	}
+}
+
+// writeAppStateFile marshals and persists one snapshot. The write goes to a
+// sibling temp file first and renames into place, so a crash mid-write cannot
+// truncate the only copy of a state that carries the console bearer token.
+func (a *App) writeAppStateFile(state *appStateFile) {
 	path, err := appStatePath()
 	if err != nil {
-		runtime.LogWarningf(a.wailsCtx(), "resolve app state path failed: %v", err)
+		a.logWarnf("resolve app state path failed: %v", err)
 		return
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		runtime.LogWarningf(a.wailsCtx(), "create app state dir failed: %v", err)
+		a.logWarnf("create app state dir failed: %v", err)
 		return
 	}
-	data, ok := a.renderAppStateLocked()
-	if !ok {
+	data, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		a.logWarnf("marshal app state failed: %v", err)
 		return
 	}
-	// The console bearer token lives here, so the file must not be world-readable.
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		runtime.LogWarningf(a.wailsCtx(), "write app state failed: %v", err)
-	} else {
-		_ = os.Chmod(path, 0600)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0600); err != nil {
+		a.logWarnf("write app state failed: %v", err)
+		return
 	}
+	_ = os.Chmod(tmp, 0600)
+	if err := os.Rename(tmp, path); err != nil {
+		// Rename over an existing target can be denied while a scanner holds it
+		// open; the direct write behind it keeps the flush from being lost.
+		if werr := os.WriteFile(path, data, 0600); werr != nil {
+			a.logWarnf("write app state failed: rename: %v, direct: %v", err, werr)
+			return
+		}
+	}
+	_ = os.Chmod(path, 0600)
 }
 
 func trimPersistedRequests(records []RequestRecord) []RequestRecord {

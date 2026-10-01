@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"lingma-ipc-proxy/internal/qodercli"
+	"lingma-ipc-proxy/internal/remote"
 	"lingma-ipc-proxy/internal/toolemulation"
 )
 
@@ -843,5 +844,449 @@ func TestLazyBackendResolutionKeepsTheLockFree(t *testing.T) {
 				t.Fatalf("backend = %q on a machine with no credentials, want %q", got, BackendRemote)
 			}
 		})
+	}
+}
+
+// scriptedChatClient records every ChatRequest it serves and replays scripted
+// results in order, so a test can drive generateRemoteWithModel through its
+// retry paths and inspect exactly what the proxy put on the wire.
+type scriptedChatClient struct {
+	requests []remote.ChatRequest
+	results  []*remote.ChatResult
+	// wire, when set, marks the span of each Chat call so the collector can
+	// tell deltas that arrived during the call from ones released after it.
+	wire *wireCollector
+}
+
+func (c *scriptedChatClient) Chat(ctx context.Context, request remote.ChatRequest, onDelta func(string)) (*remote.ChatResult, error) {
+	c.requests = append(c.requests, request)
+	if len(c.requests) <= len(c.results) {
+		result := c.results[len(c.requests)-1]
+		if c.wire != nil {
+			c.wire.callOpen = true
+			defer func() { c.wire.callOpen = false }()
+		}
+		if onDelta != nil && result.Text != "" {
+			onDelta(result.Text)
+		}
+		return result, nil
+	}
+	return &remote.ChatResult{}, nil
+}
+
+func (c *scriptedChatClient) ListModels(ctx context.Context) ([]remote.Model, error) {
+	return nil, nil
+}
+
+// The emulation retry must carry the same System the first attempt carried:
+// it answers the same turn under the same framing, and a retry that drops the
+// system constraint is a different conversation.
+func TestGenerateRemoteWithModelEmulationRetryKeepsSystemAndUserContext(t *testing.T) {
+	svc := New(Config{Model: "kmodel", Timeout: time.Second})
+	client := &scriptedChatClient{results: []*remote.ChatResult{
+		// A refusal that names no native-retry cue, so the only retry that fires
+		// is the tool-emulation one under test.
+		{Text: "i don't have tools"},
+		{Text: "```json action\n{\"tool\":\"read_fixture\",\"parameters\":{\"path\":\"alpha.txt\"}}\n```"},
+	}}
+	req := ChatRequest{
+		Tools: []toolemulation.ToolDef{{
+			Name:        "read_fixture",
+			Description: "read one fixture file",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+		Messages: []ChatMessage{{Role: "user", Text: "read the alpha fixture"}},
+	}
+
+	result, _, err := svc.generateRemoteWithModel(context.Background(), client, req, "proxy tool schema system", "read the alpha fixture", "kmodel", nil, true)
+	if err != nil {
+		t.Fatalf("generateRemoteWithModel: %v", err)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("chat calls = %d, want the initial attempt plus one emulation retry: %#v", len(client.requests), client.requests)
+	}
+	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Name != "read_fixture" {
+		t.Fatalf("retry result = %#v, want the retried action block parsed into a call", result)
+	}
+
+	retry := client.requests[1]
+	if retry.System != "proxy tool schema system" {
+		t.Fatalf("emulation retry System = %q, want the tool-schema system the first attempt carried", retry.System)
+	}
+	if !strings.Contains(retry.Prompt, "read the alpha fixture") {
+		t.Fatalf("emulation retry dropped the user prompt: %q", retry.Prompt)
+	}
+	if len(retry.Messages) != 1 || retry.Messages[0].Role != "user" || !strings.Contains(retry.Messages[0].Content, "read the alpha fixture") {
+		t.Fatalf("emulation retry messages = %#v, want the user turn preserved", retry.Messages)
+	}
+	if len(retry.Tools) != 1 || retry.Tools[0].Name != "read_fixture" {
+		t.Fatalf("emulation retry tools = %#v, want the schema re-sent", retry.Tools)
+	}
+}
+
+// wireCollector is the client side of the stream in these tests: it collects
+// the text deltas that actually reached the wire, and notes whether any
+// arrived while the backend Chat call was still open -- the observable
+// difference between a pass-through stream and one the proxy is holding back
+// for a retry verdict.
+type wireCollector struct {
+	streamed   strings.Builder
+	callOpen   bool
+	duringCall bool
+}
+
+func (w *wireCollector) onDelta(event StreamEvent) {
+	if event.Type != StreamEventText || event.Delta == "" {
+		return
+	}
+	if w.callOpen {
+		w.duringCall = true
+	}
+	w.streamed.WriteString(event.Delta)
+}
+
+// 931 real acceptance (postfix-cn-chat-sse): the first attempt streamed a full
+// unknown-dialect tool call as prose -- <tool_call><function=Read>... -- and
+// after the native-tool retry succeeded with the declared read_fixture call,
+// the client's SSE held both: the leaked XML text and the accepted tool_calls
+// from different attempts. Bytes already sent cannot be unsent, so on a
+// request whose turn a retry can still replace, the first attempt must not
+// reach the wire until it is known final. Here the retry supersedes it, so
+// nothing from the first attempt may be streamed.
+func TestGenerateRemoteWithModelNativeRetryHoldsFirstAttemptDeltas(t *testing.T) {
+	svc := New(Config{Model: "kmodel", Timeout: time.Second})
+	const leakedXML = "<tool_call><function=Read><parameter=file_path>alpha.txt</parameter></function></tool_call>我需要工具来读取："
+	wire := &wireCollector{}
+	client := &scriptedChatClient{results: []*remote.ChatResult{
+		{Text: leakedXML},
+		{ToolCalls: []toolemulation.ToolCall{{ID: "call_retry", Name: "read_fixture", Arguments: map[string]any{"path": "alpha.txt"}}}},
+	}, wire: wire}
+	req := ChatRequest{
+		Tools: []toolemulation.ToolDef{{
+			Name:        "read_fixture",
+			Description: "read one fixture file",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+		ToolChoice: toolemulation.ToolChoice{Mode: "auto"},
+		Messages:   []ChatMessage{{Role: "user", Text: "read the alpha fixture"}},
+	}
+
+	result, emitted, err := svc.generateRemoteWithModel(context.Background(), client, req, "", "read the alpha fixture", "kmodel", wire.onDelta, false)
+	if err != nil {
+		t.Fatalf("generateRemoteWithModel: %v", err)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("chat calls = %d, want the initial attempt plus the native retry", len(client.requests))
+	}
+	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Name != "read_fixture" {
+		t.Fatalf("result = %#v, want the retry's read_fixture call", result)
+	}
+	if got := wire.streamed.String(); got != "" {
+		t.Fatalf("streamed %q, want nothing: the superseded attempt's prose must not reach the client", got)
+	}
+	if emitted {
+		t.Fatal("emitted = true, want false: no byte of the superseded attempt reached the wire")
+	}
+	if wire.duringCall {
+		t.Fatal("the first attempt streamed while its Chat call was still running; a retryable turn must hold it back")
+	}
+}
+
+// The emulation retry is the same hazard as the native one: the refused first
+// attempt already streamed, and the retry that replaces it cannot unsay those
+// bytes. Holding the first attempt until the retry verdict is in keeps the
+// stream to exactly the accepted attempt.
+func TestGenerateRemoteWithModelEmulationRetryHoldsFirstAttemptDeltas(t *testing.T) {
+	svc := New(Config{Model: "kmodel", Timeout: time.Second})
+	wire := &wireCollector{}
+	client := &scriptedChatClient{results: []*remote.ChatResult{
+		{Text: "i don't have tools"},
+		{Text: "```json action\n{\"tool\":\"read_fixture\",\"parameters\":{\"path\":\"alpha.txt\"}}\n```"},
+	}, wire: wire}
+	req := ChatRequest{
+		Tools: []toolemulation.ToolDef{{
+			Name:        "read_fixture",
+			Description: "read one fixture file",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+		Messages: []ChatMessage{{Role: "user", Text: "read the alpha fixture"}},
+	}
+
+	result, _, err := svc.generateRemoteWithModel(context.Background(), client, req, "", "read the alpha fixture", "kmodel", wire.onDelta, true)
+	if err != nil {
+		t.Fatalf("generateRemoteWithModel: %v", err)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("chat calls = %d, want the initial attempt plus one emulation retry", len(client.requests))
+	}
+	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Name != "read_fixture" {
+		t.Fatalf("result = %#v, want the retried action block parsed into a call", result)
+	}
+	if got := wire.streamed.String(); got != "" {
+		t.Fatalf("streamed %q, want nothing: the refused attempt must not reach the client once the retry replaced it", got)
+	}
+	if wire.duringCall {
+		t.Fatal("the first attempt streamed while its Chat call was still running; a retryable turn must hold it back")
+	}
+}
+
+// The emulation retry can also come back with native tool calls instead of an
+// action block; the retry closure installs them into result directly, and the
+// hold must hear about that replacement too -- otherwise the refused first
+// attempt is released onto the wire next to the retry's calls, which is the
+// same two-attempt mix the 931 acceptance caught on the wire.
+func TestGenerateRemoteWithModelEmulationRetryNativeCallsHoldsFirstAttemptDeltas(t *testing.T) {
+	svc := New(Config{Model: "kmodel", Timeout: time.Second})
+	wire := &wireCollector{}
+	client := &scriptedChatClient{results: []*remote.ChatResult{
+		{Text: "i don't have tools"},
+		{Text: "accepted reply", ToolCalls: []toolemulation.ToolCall{{ID: "call_retry", Name: "read_fixture", Arguments: map[string]any{"path": "alpha.txt"}}}},
+	}, wire: wire}
+	req := ChatRequest{
+		Tools: []toolemulation.ToolDef{{
+			Name:        "read_fixture",
+			Description: "read one fixture file",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+		ToolChoice: toolemulation.ToolChoice{Mode: "any"},
+		Messages:   []ChatMessage{{Role: "user", Text: "read the alpha fixture"}},
+	}
+
+	result, emitted, err := svc.generateRemoteWithModel(context.Background(), client, req, "", "read the alpha fixture", "kmodel", wire.onDelta, true)
+	if err != nil {
+		t.Fatalf("generateRemoteWithModel: %v", err)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("chat calls = %d, want the initial attempt plus one emulation retry", len(client.requests))
+	}
+	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Name != "read_fixture" {
+		t.Fatalf("result = %#v, want the retry's native call kept", result)
+	}
+	if got := wire.streamed.String(); got != "" {
+		t.Fatalf("streamed %q, want nothing: the retry's native calls superseded the refused attempt", got)
+	}
+	if emitted {
+		t.Fatal("emitted = true, want false: nothing from the superseded attempt reached the wire")
+	}
+}
+
+// A retry that fails to produce a call leaves the first attempt as the answer,
+// and that answer's prose is the client's -- the hold must release it, not
+// swallow it.
+func TestGenerateRemoteWithModelFailedRetryKeepsFirstAttemptProse(t *testing.T) {
+	svc := New(Config{Model: "kmodel", Timeout: time.Second})
+	wire := &wireCollector{}
+	client := &scriptedChatClient{results: []*remote.ChatResult{
+		{Text: "i don't have tools"},
+		{Text: "still no tools available, sorry"},
+	}, wire: wire}
+	req := ChatRequest{
+		Tools: []toolemulation.ToolDef{{
+			Name:        "read_fixture",
+			Description: "read one fixture file",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+		Messages: []ChatMessage{{Role: "user", Text: "read the alpha fixture"}},
+	}
+
+	result, _, err := svc.generateRemoteWithModel(context.Background(), client, req, "", "read the alpha fixture", "kmodel", wire.onDelta, true)
+	if err != nil {
+		t.Fatalf("generateRemoteWithModel: %v", err)
+	}
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("result = %#v, want no calls from a retry that produced none", result)
+	}
+	if got := wire.streamed.String(); got != "i don't have tools" {
+		t.Fatalf("streamed %q, want the surviving first attempt verbatim", got)
+	}
+	if result.Text != "i don't have tools" {
+		t.Fatalf("result.Text = %q, want the surviving first attempt", result.Text)
+	}
+}
+
+// An accepted first attempt (its action block parses) must still stream out in
+// full once the verdict is in -- the emitter-side filter decides what a block
+// means; the service must not silently drop the answer it accepted.
+func TestGenerateRemoteWithModelAcceptedFirstAttemptReleasesDeltas(t *testing.T) {
+	svc := New(Config{Model: "kmodel", Timeout: time.Second})
+	const firstAttempt = "Reading now.\n```json action\n{\"tool\":\"read_fixture\",\"parameters\":{\"path\":\"alpha.txt\"}}\n```"
+	wire := &wireCollector{}
+	client := &scriptedChatClient{results: []*remote.ChatResult{{Text: firstAttempt}}, wire: wire}
+	req := ChatRequest{
+		Tools: []toolemulation.ToolDef{{
+			Name:        "read_fixture",
+			Description: "read one fixture file",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+		ToolChoice: toolemulation.ToolChoice{Mode: "any"},
+		Messages:   []ChatMessage{{Role: "user", Text: "read the alpha fixture"}},
+	}
+
+	result, emitted, err := svc.generateRemoteWithModel(context.Background(), client, req, "", "read the alpha fixture", "kmodel", wire.onDelta, true)
+	if err != nil {
+		t.Fatalf("generateRemoteWithModel: %v", err)
+	}
+	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Name != "read_fixture" {
+		t.Fatalf("result = %#v, want the parsed action block call", result)
+	}
+	if got := wire.streamed.String(); got != firstAttempt {
+		t.Fatalf("streamed %q, want the accepted attempt released verbatim", got)
+	}
+	if !emitted {
+		t.Fatal("emitted = false, want true: the accepted attempt reached the wire")
+	}
+	if wire.duringCall {
+		t.Fatal("tool_choice any holds the first attempt until the verdict; it must not stream during the Chat call")
+	}
+}
+
+// Plain chat carries no retry hazard, so its stream must stay direct: the
+// delta arrives while the backend call is still open, not after a hold.
+func TestGenerateRemoteWithModelPlainChatStreamsImmediately(t *testing.T) {
+	svc := New(Config{Model: "kmodel", Timeout: time.Second})
+	wire := &wireCollector{}
+	client := &scriptedChatClient{results: []*remote.ChatResult{{Text: "hello there"}}, wire: wire}
+	req := ChatRequest{Messages: []ChatMessage{{Role: "user", Text: "say hi"}}}
+
+	_, emitted, err := svc.generateRemoteWithModel(context.Background(), client, req, "", "say hi", "kmodel", wire.onDelta, false)
+	if err != nil {
+		t.Fatalf("generateRemoteWithModel: %v", err)
+	}
+	if got := wire.streamed.String(); got != "hello there" {
+		t.Fatalf("streamed %q, want the plain answer", got)
+	}
+	if !emitted {
+		t.Fatal("emitted = false, want true")
+	}
+	if !wire.duringCall {
+		t.Fatal("plain chat buffered its deltas; only retryable tool turns may be held")
+	}
+}
+
+// tool_choice:"none" forbids calls, so no retry can ever rewrite the turn and
+// the stream must pass through untouched -- including a literal block the
+// parser would otherwise consume.
+func TestGenerateRemoteWithModelToolChoiceNoneStreamsImmediately(t *testing.T) {
+	svc := New(Config{Model: "kmodel", Timeout: time.Second})
+	const answer = "```json action\n{\"tool\":\"read_fixture\",\"parameters\":{\"path\":\"alpha.txt\"}}\n```"
+	wire := &wireCollector{}
+	client := &scriptedChatClient{results: []*remote.ChatResult{{Text: answer}}, wire: wire}
+	req := ChatRequest{
+		Tools: []toolemulation.ToolDef{{
+			Name:        "read_fixture",
+			Description: "read one fixture file",
+			InputSchema: map[string]any{"type": "object"},
+		}},
+		ToolChoice: toolemulation.ToolChoice{Mode: "none"},
+		Messages:   []ChatMessage{{Role: "user", Text: "read the alpha fixture"}},
+	}
+
+	result, _, err := svc.generateRemoteWithModel(context.Background(), client, req, "", "read the alpha fixture", "kmodel", wire.onDelta, true)
+	if err != nil {
+		t.Fatalf("generateRemoteWithModel: %v", err)
+	}
+	if got := wire.streamed.String(); got != answer {
+		t.Fatalf("streamed %q, want the verbatim answer; none-forbidden turns must not be held", got)
+	}
+	if !wire.duringCall {
+		t.Fatal("tool_choice none buffered its deltas; a turn that cannot be retried must stream directly")
+	}
+	if len(result.ToolCalls) != 0 || result.Text != answer {
+		t.Fatalf("result = %#v, want the block kept as prose", result)
+	}
+}
+
+// 931 real acceptance: the second turn of a tool conversation lost the calls
+// entirely. filteredMessages skipped a message whose Text was empty -- which is
+// exactly the shape of a completed assistant tool call -- and the transcript
+// loop rebuilt each message as Role+Text only, so even calls that arrived with
+// prose dropped their name, arguments and id. The model then re-asked for files
+// it had already read. The projection below is history replay, not execution:
+// the calls render in the model's own action-block dialect next to the results
+// the proxy already returned for them.
+func TestBuildLingmaPromptSectionsPreservesAssistantToolCallHistory(t *testing.T) {
+	fixtureTool := toolemulation.ToolDef{
+		Name:        "read_fixture",
+		InputSchema: map[string]any{"type": "object"},
+	}
+	baseMessages := []ChatMessage{
+		{Role: "user", Text: "Read both fixtures."},
+		{Role: "assistant", Text: "Reading now.", ToolCalls: []toolemulation.ToolCall{
+			{ID: "call_with_prose", Name: "read_fixture", Arguments: map[string]any{"path": "history_alpha_931.txt"}},
+		}},
+		{Role: "tool", ToolCallID: "call_with_prose", Text: "ONLY_RETURNED_NONCE_A"},
+		{Role: "assistant", ToolCalls: []toolemulation.ToolCall{
+			{ID: "call_silent_a", Name: "read_fixture", Arguments: map[string]any{"path": "history_beta_931.txt"}},
+			{ID: "call_silent_b", Name: "read_fixture", Arguments: map[string]any{"path": "history_gamma_931.txt"}},
+		}},
+		{Role: "tool", ToolCallID: "call_silent_a", Text: "ONLY_RETURNED_NONCE_B"},
+		{Role: "tool", ToolCallID: "call_silent_b", Text: "   "},
+		{Role: "user", Text: "Now summarise."},
+	}
+
+	_, prompt, err := buildLingmaPromptSections(ChatRequest{
+		System:   "Answer only after reading the actual files.",
+		Tools:    []toolemulation.ToolDef{fixtureTool},
+		Messages: baseMessages,
+	}, SessionModeFresh, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every completed call keeps its tool name, its arguments verbatim, and the
+	// result pairing the proxy already answered with.
+	for _, want := range []string{
+		"\"tool\":\"read_fixture\"",
+		"\"path\":\"history_alpha_931.txt\"",
+		"\"path\":\"history_beta_931.txt\"",
+		"\"path\":\"history_gamma_931.txt\"",
+		"ONLY_RETURNED_NONCE_A",
+		"ONLY_RETURNED_NONCE_B",
+		"call_with_prose",
+		"call_silent_a",
+		"call_silent_b",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("history projection lost %q", want)
+		}
+	}
+	// Prose that accompanied a call stays alongside it.
+	if !strings.Contains(prompt, "Reading now.") {
+		t.Errorf("assistant prose beside a call was dropped: %q", prompt)
+	}
+	// An empty tool result must still pair with the call that produced it
+	// instead of vanishing with the association.
+	if !strings.Contains(prompt, "Tool result for call_silent_b") {
+		t.Errorf("empty tool result lost its call pairing: %q", prompt)
+	}
+	// The replayed calls use the dialect the tooling prompt itself teaches.
+	if !strings.Contains(prompt, "```json action\n") {
+		t.Errorf("history calls must render as action blocks: %q", prompt)
+	}
+
+	// Deliberate client-side repeats are history too: two identical calls stay
+	// two blocks, no dedup, no parameter guessing.
+	repeatMessages := []ChatMessage{
+		{Role: "user", Text: "read it twice please"},
+		{Role: "assistant", ToolCalls: []toolemulation.ToolCall{
+			{ID: "call_dup_1", Name: "read_fixture", Arguments: map[string]any{"path": "repeat_931.txt"}},
+			{ID: "call_dup_2", Name: "read_fixture", Arguments: map[string]any{"path": "repeat_931.txt"}},
+		}},
+		{Role: "tool", ToolCallID: "call_dup_1", Text: "once"},
+		{Role: "tool", ToolCallID: "call_dup_2", Text: "twice"},
+		{Role: "user", Text: "done?"},
+	}
+	_, repeatPrompt, err := buildLingmaPromptSections(ChatRequest{
+		Tools:    []toolemulation.ToolDef{fixtureTool},
+		Messages: repeatMessages,
+	}, SessionModeFresh, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(repeatPrompt, "\"path\":\"repeat_931.txt\""); got != 2 {
+		t.Errorf("identical repeated calls = %d blocks, want 2 (client repeats are intentional)", got)
+	}
+	if !strings.Contains(repeatPrompt, "Tool result for call_dup_1") || !strings.Contains(repeatPrompt, "Tool result for call_dup_2") {
+		t.Errorf("repeat results lost their pairing: %q", repeatPrompt)
 	}
 }

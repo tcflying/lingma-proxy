@@ -30,3 +30,15 @@ ITERATION.md
 
 # Local probe scripts and their落盘 output; several carry the LAN passphrase
 .scratch/
+
+# CodeGraph local index (large, machine-local)
+.codegraph/
+
+# Security-scan hook accounting (160k+ files, carries session ids)
+.mimosa/
+
+# Runtime pid file written by the launcher
+proxy.pid
+
+# Local build/run logs (wails, proxy stdout)
+*.log

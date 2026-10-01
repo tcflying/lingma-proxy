@@ -234,11 +234,33 @@ a fresh bundle when the server starts returning authentication errors.
 `, port)
 }
 
+// bundleFileMode is the mode the archive is created with. The archive carries a
+// portable credentials.json, so it must not be readable by the other users on the
+// server it is copied to.
+const bundleFileMode = 0o600
+
+// createBundleFile is the seam the tests replace, and it takes the mode as an
+// argument precisely so a test can observe the request without reimplementing it.
+//
+// The finished file's Perm() cannot serve that purpose on Windows: the OS emulates
+// the POSIX bits, so it reports something derived from the read-only attribute
+// rather than what was asked for, and a check built on it fails even when the
+// request was correct. An earlier version of that check responded by logging
+// instead of failing, which is how a world-readable bundle shipped while the
+// ledger still called the item fixed.
+var createBundleFile = func(path string, perm os.FileMode) (*os.File, error) {
+	return os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+}
+
 func writeZip(path string, entries []zipEntry) error {
 	// The bundle carries a portable credentials.json, so the archive itself must
 	// not be readable by the other users on a shared server. os.Create yields
 	// 0644; the zip entry modes are only metadata until something unpacks them.
-	file, err := os.Create(path)
+	//
+	// OpenFile rather than Create so the mode is the one we asked for at creation
+	// time. Chmod afterwards would be the same intent with a wider window: on a
+	// shared box the file is 0644 for as long as the archive takes to write.
+	file, err := createBundleFile(path, bundleFileMode)
 	if err != nil {
 		return err
 	}

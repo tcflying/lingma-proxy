@@ -9,6 +9,8 @@ export function ClearLogs():Promise<void>;
 
 export function ClearRequests():Promise<void>;
 
+export function ConsoleInfo():Promise<main.ConsoleInfo>;
+
 export function ExportFeedbackBundle(arg1:main.FeedbackExportOptions):Promise<main.FeedbackExportResult>;
 
 export function ExportServerDeploymentBundle(arg1:main.ServerDeploymentExportOptions):Promise<main.ServerDeploymentExportResult>;

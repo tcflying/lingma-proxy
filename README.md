@@ -1,10 +1,12 @@
 # Lingma Proxy
 
-[English](./README.md) | [简体中文](./README.zh-CN.md)
+[English](./README.md) | [简体中文](./README.zh-CN.md) | [📘 使用教程 USAGE.md](./USAGE.md)
 
 Lingma Proxy exposes Tongyi Lingma / QoderCN as standard **OpenAI-compatible** and **Anthropic-compatible** HTTP APIs. It can use either the recommended Remote API backend or the local IDE IPC channel, and ships as a CLI proxy service for macOS, Windows, and Linux, plus a desktop app for macOS, Windows, and Linux.
 
 The project is designed for tools such as Claude Code, Hermes, CodeBuddy, Codex CLI, OpenCode, custom agents, and any client that can talk to OpenAI or Anthropic style APIs.
+
+> **New here?** Start with **[USAGE.md](./USAGE.md)** — a step-by-step tutorial covering install, client setup for Claude Code / Codex CLI / CodeBuddy / Hermes / any OpenAI- or Anthropic-compatible client, the full endpoint and configuration reference, tool calling, image input, and a troubleshooting table. This README is the reference manual: architecture, capability matrix, model metadata, and release flow.
 
 ## Model Availability Disclaimer
 
@@ -294,8 +296,8 @@ Image support is implemented at the proxy protocol layer and then validated agai
 | Anthropic Messages base64 image block | Verified | Tested through `/v1/messages`; the model correctly described the image content. |
 | Claude Code pasted image | Verified | Tested with Claude Code style Anthropic messages containing long history, tools, a base64 image block, and Claude's image-cache path marker. |
 | Claude Code pasted image + tools | Verified | Remote mode extracts the latest image turn through IPC, then continues with Remote API native tool calling. |
-| QoderCN IPC image requests | Verified | The proxy now emits QoderCN's native `qodercn:///agent/file?path=...` image URI scheme instead of the legacy Lingma URI; verified with `/Users/tiancheng/Pictures/ik2.jpg`. |
-| Hermes CLI `hermes chat --image` | Verified | Tested with `--provider custom --model kmodel --image /Users/tiancheng/Pictures/ik2.jpg`; Hermes sends OpenAI `image_url` to `/v1/chat/completions` and the model described the image correctly. |
+| QoderCN IPC image requests | Verified | The proxy now emits QoderCN's native `qodercn:///agent/file?path=...` image URI scheme instead of the legacy Lingma URI; verified with `/Users/yourname/Pictures/ik2.jpg`. |
+| Hermes CLI `hermes chat --image` | Verified | Tested with `--provider custom --model kmodel --image /Users/yourname/Pictures/ik2.jpg`; Hermes sends OpenAI `image_url` to `/v1/chat/completions` and the model described the image correctly. |
 | OpenClaw `infer image describe --file` | Verified | Tested with a `lingma-proxy/kmodel` provider configured as `text+image`; OpenClaw sends OpenAI `image_url` and the model described the image correctly. |
 | OpenClaw `agent` image marker | Partially verified | Works after the referenced image is available inside OpenClaw's per-session sandbox. A host path such as `/Users/.../Pictures/ik2.jpg` is rejected by OpenClaw's own sandbox before it reaches the proxy as an image. |
 | Custom agents using standard OpenAI or Anthropic image requests | Expected compatible | These are covered when they send the same OpenAI `image_url` or Anthropic base64 image shapes. Their own chat gateways, screenshot delivery, or file-sending features are outside the proxy layer. |
@@ -812,7 +814,7 @@ Example image command:
 ```bash
 export OPENAI_API_KEY="any"
 codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --json \
-  --image /Users/tiancheng/Pictures/ik2.jpg \
+  --image /Users/yourname/Pictures/ik2.jpg \
   -- '先用一句话描述这张图片的氛围，再运行 pwd，并只返回命令结果。'
 ```
 
@@ -1111,7 +1113,7 @@ If you need a temporary packaging tag without changing the app's internal versio
 Use the following as the GitHub Release body draft for the next mainline tag:
 
 - Fixed QoderCN IPC image input by using QoderCN's native `qodercn:///agent/file?path=...` URI scheme while keeping `lingma:///...` compatibility for legacy Lingma runtimes.
-- Verified the QoderCN IPC image path with `/Users/tiancheng/Pictures/ik2.jpg`; the model correctly described the coastal rocks and waves, and QoderCN logs reported `image detect success` / `upload image success` with no `invalid uri`.
+- Verified the QoderCN IPC image path with `/Users/yourname/Pictures/ik2.jpg`; the model correctly described the coastal rocks and waves, and QoderCN logs reported `image detect success` / `upload image success` with no `invalid uri`.
 - Kept the WebView inspector available in packaged desktop releases as well as local builds, so right-click `Inspect Element` can be used to debug installed UI/style/runtime issues.
 - Retained the normal release gate: version sync, release-note check, Go tests, frontend build, and local desktop rebuild before tagging.
 

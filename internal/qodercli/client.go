@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"lingma-ipc-proxy/internal/remote"
 )
@@ -27,6 +28,12 @@ type Client struct {
 	loc     Location
 	tokens  *TokenSource
 	timeout time.Duration
+	// partialStreamUnsupported latches when this site's CLI install refuses
+	// --include-partial-messages, so one old build does not fail every streamed
+	// turn. It is per site and not per process: the flag is worth 51s of average
+	// first-byte latency (see Chat), and a CN install old enough to reject it
+	// says nothing about the global build installed next to it.
+	partialStreamUnsupported atomic.Bool
 }
 
 // maxSystemPromptArgChars keeps the CLI command line below the ~32767 character
@@ -37,10 +44,20 @@ const maxSystemPromptArgChars = 20000
 // goroutine after the CLI process itself has exited.
 const cliStdoutDrainDelay = 3 * time.Second
 
-// cliResultTeardownGrace is how long the CLI process gets to leave on its own
-// after its terminal result frame. It exists for installs that answer and then
-// keep an Electron host alive for minutes.
+// cliResultTeardownGrace is the fallback teardown delay for an answered turn: the
+// terminal result frame arrived, the read stopped, and the process is still with
+// us. What normally ends it is the job guard's release on the way out of the run
+// (closing a kill-on-close job handle is the kill), so this delay only decides
+// what happens to a tree the guard could not cover -- a child the Task Scheduler
+// re-homed into another job, and every install off Windows, where the guard is a
+// no-op and this timer is the only thing left.
 const cliResultTeardownGrace = 5 * time.Second
+
+// cliReaperSlowLogDelay is how long the answered-path reaper stays quiet about a
+// child that has not finished leaving after the result frame. Observability for
+// wedge diagnostics, nothing more: a kill that reached the child is over before
+// this threshold, so a wait past it means the kill did not reach.
+const cliReaperSlowLogDelay = 10 * time.Second
 
 // maxCLIOutputLineBytes caps a single JSONL frame: the terminal result frame
 // carries the whole answer, and 8 MB is far above any measured turn. A var so the
@@ -54,9 +71,43 @@ var maxCLIOutputLineBytes = 8 * 1024 * 1024
 // so the regression test can reach the ceiling without allocating 64 MB.
 var maxCLICapturedOutputBytes = 64 * 1024 * 1024
 
-// partialStreamUnsupported latches after a CLI install refuses
-// --include-partial-messages, so one old build does not fail every streamed turn.
-var partialStreamUnsupported atomic.Bool
+// maxCLICapturedStderrBytes caps the diagnostic stream, which had no cap at all:
+// the same error loop that fills the stdout capture fills this one, and nothing
+// ever reads more than the last few lines of it. 4 MB keeps every transcript an
+// operator has ever needed to read intact. A var for the same test reason as
+// maxCLICapturedOutputBytes.
+var maxCLICapturedStderrBytes = 4 * 1024 * 1024
+
+// turnCeilingEnv is the operator's backstop for a turn that was given no
+// deadline. Empty means the default, and 0 switches the backstop off.
+const turnCeilingEnv = "LINGMA_QODERCLI_TURN_CEILING"
+
+// defaultTurnCeiling bounds a turn that has nothing else to end it. A wedged
+// read and a capture-ceiling drain both park forever when Timeout is 0, and each
+// parked turn holds one of the service's four CLI slots, so four of them take
+// the whole proxy offline. Half an hour is far above any measured turn (the
+// longest on record is ~50s) and far below the point where an operator has
+// stopped watching.
+const defaultTurnCeiling = 30 * time.Minute
+
+// turnCeiling reads the backstop. It is not the proxy deadline: Timeout keeps its
+// own meaning (0 = no proxy deadline) and wins whenever it is set, because an
+// operator who asked for an hour of budget does not get cut off at half an hour
+// by a safety net. A caller's own context is a deadline too, and this never
+// lengthens it -- the model probes run on their own 8s/120s/15m budgets and end
+// there long before this one is in reach.
+func turnCeiling() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(turnCeilingEnv))
+	if raw == "" {
+		return defaultTurnCeiling
+	}
+	ceiling, err := time.ParseDuration(raw)
+	if err != nil || ceiling < 0 {
+		log.Printf("qodercli: %s=%q is not a duration, keeping the %s backstop ceiling", turnCeilingEnv, raw, defaultTurnCeiling)
+		return defaultTurnCeiling
+	}
+	return ceiling
+}
 
 func NewClient(loc Location, timeout time.Duration) *Client {
 	return &Client{
@@ -89,6 +140,11 @@ func (c *Client) credential(ctx context.Context) (string, error) {
 func (c *Client) ListModels(ctx context.Context) ([]remote.Model, error) {
 	stdout, err := c.run(ctx, "--list-models")
 	if err != nil {
+		// A discovery that dies mid-probe is the failure this file keeps chasing,
+		// and whatever the child did manage to print is the only clue about why.
+		// The timeout case already carries it inside err; log it too, so the
+		// headless log records the byte count even when the caller logs only err.
+		log.Printf("qodercli: %s CLI model discovery failed after %d bytes on stdout: %v", c.label(), len(stdout), err)
 		return nil, err
 	}
 	var models []remote.Model
@@ -128,8 +184,8 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 	// it the CLI reports nothing until the whole turn is over, which measured a
 	// 51s average and 88s worst-case before the client saw a single character.
 	// Older installs reject the flag outright, so the first such failure disables
-	// it for the rest of the process instead of failing every request.
-	partial := onDelta != nil && !partialStreamUnsupported.Load()
+	// it for the rest of this client's life instead of failing every request.
+	partial := onDelta != nil && !c.partialStreamUnsupported.Load()
 	if partial {
 		args = append(args, "--include-partial-messages")
 	}
@@ -173,7 +229,11 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 
 	stdout, runErr := c.runWithStdinData(ctx, frame, onLine, args...)
 	if runErr != nil && partial && !streamed && strings.Contains(runErr.Error(), "include-partial-messages") {
-		partialStreamUnsupported.Store(true)
+		if c.partialStreamUnsupported.CompareAndSwap(false, true) {
+			// One line, naming the site: without it a degraded stream looks like a
+			// slow model, and the flag that is missing is the whole reason.
+			log.Printf("qodercli: %s CLI refused --include-partial-messages; streamed turns on this site now arrive whole", c.label())
+		}
 		// args ends with "--tools", "" so dropping the last element would orphan
 		// --tools and keep the flag the CLI just rejected.
 		args = withoutArg(args, "--include-partial-messages")
@@ -289,6 +349,77 @@ func partialTextDelta(line string) (string, bool) {
 	return frame.Event.Delta.Text, true
 }
 
+// tailWriter keeps the newest limit bytes and drops the rest. The cause of a CLI
+// failure is in what it printed last, and the volume that pushed it past a cap is
+// the volume nobody reads, so a head cut is the wrong one to make.
+type tailWriter struct {
+	limit int
+	buf   []byte
+}
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	// Trim on a band rather than on every write past the cap: dropping the head
+	// copies the retained window, and a loop writing 4 KB at a time would pay
+	// that copy a thousand times per megabyte.
+	if w.limit > 0 && len(w.buf) > 2*w.limit {
+		w.buf = append(w.buf[:0], w.buf[len(w.buf)-w.limit:]...)
+	}
+	return len(p), nil
+}
+
+func (w *tailWriter) String() string { return string(w.buf) }
+
+// capturedOutput is one turn's stdout. The scan loop appends whole lines to it;
+// in the rare StdoutPipe fallback the process writes into it directly, and then
+// it keeps a tail instead of growing without end, because a process that never
+// comes back would otherwise fill memory at whatever rate it likes.
+//
+// It deliberately does not embed bytes.Buffer: that promotes ReadFrom, which
+// io.Copy prefers over Write, and the fallback capture would fill the buffer it
+// was built to avoid while reporting itself empty.
+type capturedOutput struct {
+	buf  bytes.Buffer
+	tail *tailWriter
+}
+
+func (o *capturedOutput) capAt(limit int) { o.tail = &tailWriter{limit: limit} }
+
+func (o *capturedOutput) Write(p []byte) (int, error) {
+	if o.tail != nil {
+		return o.tail.Write(p)
+	}
+	return o.buf.Write(p)
+}
+
+func (o *capturedOutput) WriteString(s string) (int, error) {
+	if o.tail != nil {
+		return o.tail.Write([]byte(s))
+	}
+	return o.buf.WriteString(s)
+}
+
+func (o *capturedOutput) WriteByte(b byte) error {
+	if o.tail != nil {
+		_, err := o.tail.Write([]byte{b})
+		return err
+	}
+	return o.buf.WriteByte(b)
+}
+
+func (o *capturedOutput) Len() int { return o.buf.Len() }
+
+func (o *capturedOutput) String() string {
+	if o.tail != nil {
+		return o.tail.String()
+	}
+	return o.buf.String()
+}
+
+// openStdoutPipe is the seam the tests use to reach the fallback: StdoutPipe only
+// fails when the OS refuses one more pipe, which a test cannot ask this box for.
+var openStdoutPipe = func(cmd *exec.Cmd) (io.ReadCloser, error) { return cmd.StdoutPipe() }
+
 func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func(string), args ...string) (string, error) {
 	credential, err := c.credential(ctx)
 	if err != nil {
@@ -297,9 +428,22 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 
 	runCtx := ctx
 	var cancel context.CancelFunc
+	// ceiling is the backstop that bounds what no proxy deadline bounds. cmd.Cancel
+	// only fires from a deadline, so without one the two ways this function can
+	// park -- a wedged read with no terminal frame, and the drain after a capture
+	// ceiling -- stay parked, and the request holds its CLI slot until the client
+	// gives up. A configured Timeout wins outright: the backstop is a net under
+	// "no deadline asked for", not a shorter version of the deadline that was.
+	ceiling := time.Duration(0)
 	if c.timeout > 0 {
 		runCtx, cancel = context.WithTimeout(ctx, c.timeout)
 		defer cancel()
+	} else {
+		ceiling = turnCeiling()
+		if ceiling > 0 {
+			runCtx, cancel = context.WithTimeout(ctx, ceiling)
+			defer cancel()
+		}
 	}
 
 	name, argv := c.commandArgs(args)
@@ -323,7 +467,8 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	// then close the pipe and take what was written".
 	cmd.WaitDelay = cliStdoutDrainDelay
 	cmd.Env = c.environment(credential)
-	var stdout, stderr bytes.Buffer
+	var stdout capturedOutput
+	stderr := &tailWriter{limit: maxCLICapturedStderrBytes}
 	// teardown kills the CLI process once the answer is complete but the process is
 	// still with us; declared here so the Wait below can stop it.
 	var teardown *time.Timer
@@ -334,12 +479,18 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	} else {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}
-	cmd.Stderr = &stderr
+	cmd.Stderr = stderr
 	// stdout always goes through a pipe, even when nobody streams: the loop below
 	// is the only place that can tell "the turn is over" from "the CLI is still
 	// running", and that distinction is what the teardown timer needs.
 	var pipe io.ReadCloser
-	if opened, pipeErr := cmd.StdoutPipe(); pipeErr != nil {
+	if opened, pipeErr := openStdoutPipe(cmd); pipeErr != nil {
+		// No pipe means no frame detection, so this capture is written by the
+		// child itself and nothing checks the turn ceiling below: the cap moves
+		// into the buffer.
+		log.Printf("qodercli: %s CLI stdout pipe unavailable, capturing its last %d bytes instead: %v",
+			c.label(), maxCLICapturedOutputBytes, pipeErr)
+		stdout.capAt(maxCLICapturedOutputBytes)
 		cmd.Stdout = &stdout
 	} else {
 		pipe = opened
@@ -366,7 +517,9 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 		var scanErr error
 		for scanner.Scan() {
 			line := scanner.Text()
-			if stdout.Len()+len(line) > maxCLICapturedOutputBytes {
+			// The newline is written too, so it counts against the ceiling: checking
+			// the line alone let the buffer finish one byte past the cap.
+			if stdout.Len()+len(line)+1 > maxCLICapturedOutputBytes {
 				scanErr = fmt.Errorf("capture ceiling of %d bytes reached", maxCLICapturedOutputBytes)
 				break
 			}
@@ -383,9 +536,12 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 			// /v1/chat/completions that started with it was still unanswered at 400 s.
 			if isTerminalFrame(line) {
 				answered = true
-				// The process gets five seconds to leave on its own, then the tree is
-				// taken down. Killing it is not what unblocks us -- stopping the read
-				// is -- but leaving an answered CLI running leaks a process per turn.
+				// The tree is taken down when this function returns, by the deferred
+				// guard.release: closing a kill-on-close job handle is itself the
+				// kill. This timer is the fallback for the two shapes the guard does
+				// not reach -- a child the Task Scheduler already put in another job,
+				// and every turn off Windows, where the guard is a no-op. Killing the
+				// tree is not what unblocks us either way; stopping the read is.
 				teardown = time.AfterFunc(cliResultTeardownGrace, func() {
 					// Best-effort tree kill: a child that the Task Scheduler already
 					// put in another job cannot be assigned here, so the guard may
@@ -405,9 +561,19 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 			// until the deadline, turning an answer that already arrived into a
 			// timeout, so the rest is drained first. The drain has to be synchronous:
 			// a goroutine races cmd.Wait, which closes this read end, and loses.
-			// The cancelled path stays bounded because killing the process closes
-			// the write end and io.Copy returns on EOF.
 			log.Printf("qodercli: %s CLI stdout stopped after %d bytes: %v", c.label(), stdout.Len(), scanErr)
+			// The drain only ends when the child stops writing, and cmd.Cancel --
+			// the thing that would close the write end -- is driven by a deadline.
+			// With no configured timeout nothing else ever stops it, so the read
+			// goes on until the CLI itself dies, which is the failure this whole
+			// path exists to avoid. Take the tree down before draining.
+			// A configured timeout is left alone: its deadline closes the write end
+			// moments later, and killing the child here instead would turn "the
+			// answer arrived, then one huge line followed" into a failed turn.
+			if c.timeout == 0 {
+				guard.release()
+				_ = cmd.Process.Kill()
+			}
 			_, _ = io.Copy(io.Discard, pipe)
 		}
 	}
@@ -416,9 +582,23 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 		if answered {
 			// Stopping the read is not enough: cmd.Wait() would then block on the
 			// process leaving instead, and an answered CLI that lingers for minutes
-			// is exactly the shape this box has. Reap it in the background; the
-			// teardown timer and the deferred guard release are what take it down.
-			go func() { _ = cmd.Wait() }()
+			// is exactly the shape this box has. Reap it in the background. What takes
+			// the process down is the deferred guard.release() on the way out of this
+			// function, not the teardown timer -- with a healthy job object the handle
+			// closes the moment this returns, and the timer only ever fires for a tree
+			// the guard could not cover. The timer is deliberately left to run out.
+			go func() {
+				// Diagnostics only, and quiet in the normal case: a kill already
+				// happened before this goroutine started, so a Wait that takes this
+				// long is a child the kill did not reach.
+				waitStart := time.Now()
+				reapErr := cmd.Wait()
+				if took := time.Since(waitStart); took > cliReaperSlowLogDelay {
+					log.Printf("qodercli: %s CLI process took %s to leave after its result frame, "+
+						"which is longer than a kill that reached it should: %v",
+						c.label(), took.Round(time.Millisecond), reapErr)
+				}
+			}()
 			return stdout.String(), nil
 		}
 		waitErr = cmd.Wait()
@@ -430,10 +610,26 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	}
 	if waitErr != nil {
 		if runCtx.Err() != nil {
-			if c.timeout > 0 {
-				return stdout.String(), fmt.Errorf("%s CLI timed out after %s", c.label(), c.timeout)
+			// The deadline won, but the child still spoke: fold what it said into the
+			// error instead of reporting the deadline as if it were the cause.
+			note := cancelledChildNote(stdout.Len(), stderr.String())
+			switch {
+			// Only the deadline itself reads as a timeout: a configured timeout
+			// with a caller that hung up dies as context.Canceled, and calling
+			// that "timed out" blames the CLI for the client's disconnect.
+			case c.timeout > 0 && errors.Is(runCtx.Err(), context.DeadlineExceeded):
+				return stdout.String(), fmt.Errorf("%s CLI timed out after %s (%s)", c.label(), c.timeout, note)
+			case ceiling > 0 && ctx.Err() == nil && errors.Is(runCtx.Err(), context.DeadlineExceeded):
+				// ctx.Err() is nil while runCtx is dead, so the deadline that fired
+				// is the backstop this function added and not one the caller
+				// brought. It is named apart from "timed out after <timeout>" because
+				// nobody configured it and no Timeout field will explain it.
+				return stdout.String(), fmt.Errorf(
+					"%s CLI hit the %s backstop ceiling, which is what ends a turn given no timeout (%s)",
+					c.label(), ceiling, note)
+			default:
+				return stdout.String(), fmt.Errorf("%s CLI was cancelled before it finished: %w (%s)", c.label(), runCtx.Err(), note)
 			}
-			return stdout.String(), fmt.Errorf("%s CLI was cancelled before it finished: %w", c.label(), runCtx.Err())
 		}
 		detail := errorLines(stderr.String(), 6)
 		if reason := rejectedCredential(stderr.String()); reason != "" {
@@ -558,7 +754,10 @@ func parseResult(stdout, model, label string, site Site) (*remote.ChatResult, bo
 		requestID string
 	)
 	scanner := bufio.NewScanner(strings.NewReader(stdout))
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	// The same cap the capture used, or raising it there only moves the failure:
+	// a frame the capture admitted and this scanner refuses reads as a turn that
+	// answered nothing.
+	scanner.Buffer(make([]byte, 0, 64*1024), maxCLIOutputLineBytes)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || !strings.HasPrefix(line, "{") {
@@ -883,6 +1082,26 @@ func errorLines(text string, count int) string {
 	return strings.Join(meaningful, " | ")
 }
 
+// cancelledChildNote explains a child that was killed by its deadline instead of
+// exiting on its own.
+//
+// By the time this runs the child's stderr is already fully captured, so throwing
+// it away is what collapses every distinct failure -- a rejected credential, a lost
+// session, a startup crash -- into the same opaque "context deadline exceeded".
+// The stdout byte count rides along because the known shape of this failure is a
+// child that writes a hundred-odd bytes and then closes its pipe without ever
+// reaching a terminal frame: the count is what tells "it answered nothing" apart
+// from "it answered at length and we still cut it off".
+//
+// It is a note, not a verdict: callers fold it into their own error text.
+func cancelledChildNote(stdoutLen int, stderr string) string {
+	parts := []string{fmt.Sprintf("child wrote %d bytes to stdout", stdoutLen)}
+	if detail := errorLines(stderr, 6); detail != "" {
+		parts = append(parts, "stderr: "+detail)
+	}
+	return strings.Join(parts, "; ")
+}
+
 func isCLINoise(line string) bool {
 	for _, prefix := range cliNoisePrefixes {
 		if strings.HasPrefix(line, prefix) {
@@ -897,5 +1116,12 @@ func truncate(text string, limit int) string {
 	if len(trimmed) <= limit {
 		return trimmed
 	}
-	return trimmed[:limit] + "…"
+	// Back off to a rune boundary: the CLI answers and fails in Chinese, and a
+	// byte cut leaves half of a multi-byte rune for the client to render as
+	// mojibake. Same reasoning as remote's truncate.
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(trimmed[cut]) {
+		cut--
+	}
+	return trimmed[:cut] + "…"
 }

@@ -346,20 +346,23 @@ func TestReleaseProxyOnlyClearsItsOwnGeneration(t *testing.T) {
 	}
 }
 
-// 924 §4.3 measured, not assumed: flushAppStateLocked marshals and writes while
-// holding a.mu, which every request log line also needs. Measured here with the
-// ring full: rendering ~5 MB is ~45ms plain and ~600ms under -race, and the
-// WriteFile behind it is ~1ms -- so moving the write off the lock would buy the
-// cheap half of a cost that is really the render, and a wall-clock budget would
-// just fail in the instrumented build. What has to stay true is how much there is
-// to render, which is what this pins. If a change grows the persisted payload past
-// its designed bound (300 requests x two 8KB bodies, 1000 log lines), it goes red
-// here instead of quietly lengthening the stall every request waits behind.
+// 924 §4.3 originally measured the flush as marshal-plus-write under a.mu and
+// bounded the payload instead of moving the cost. The 930 re-audit (O7) split
+// it for real: the lock now pays only the snapshot (fresh backing arrays plus
+// one map clone, microseconds with the ring full), and marshal plus the
+// temp-file write happen in the single writer goroutine. This test still pins
+// the payload bound -- anything that grows the persisted state past its
+// designed size (300 requests x two 8KB bodies, 1000 log lines) goes red here
+// rather than quietly growing what the writer marshals -- and now also pins
+// that the lock-held half stays cheap even with the ring full.
 func TestStateFlushPayloadStaysBounded(t *testing.T) {
 	useTempInstanceProfile(t)
 
 	body := strings.Repeat("x", 8<<10)
 	app := &App{}
+	// Zero value keeps the write inline, so the file this test stats exists the
+	// moment the flush returns; the async writer's lock duty is pinned by its
+	// own test below.
 	app.mu.Lock()
 	for i := 0; i < appStatePersistRequestMax; i++ {
 		app.requests = append(app.requests, RequestRecord{
@@ -395,24 +398,177 @@ func TestStateFlushPayloadStaysBounded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the flush wrote nothing: %v", err)
 	}
-	// Measured on this box with the ring completely full: rendering the ~5 MB is
-	// the whole cost (~40ms) and the WriteFile behind it is ~1ms, which is why the
-	// write was not moved off a.mu -- the restructure would only buy the 1ms half.
-	// The budget below is ~5x the quiet median so contention cannot make this flap,
-	// while anything that pushes the payload past its designed bound still trips it.
-	// The mechanism that decides lock duty is how much state there is to render, so
-	// that is what gets bounded: 300 requests x two 8KB bodies plus 1000 log lines.
-	// Timing is the consequence, and it is build-mode dependent (~45ms plain, ~600ms
-	// under -race on this box), so it is only logged and held to the loose ceiling
-	// that a real pathology (an accidental re-scan per request) would break.
-	t.Logf("flushed %.2f MB of app state under a.mu for %s, of which rendering took %s",
+	// The payload budget is the invariant that survived both designs: bounding
+	// what one flush marshals is what bounds the writer's duty cycle and the
+	// on-disk size alike. The inline-mode ceiling stays loose on purpose --
+	// it holds marshal plus write, which is race-build sensitive.
+	t.Logf("flushed %.2f MB of app state inline for %s, of which rendering took %s",
 		float64(info.Size())/(1<<20), held.Round(time.Millisecond), rendered.Round(time.Millisecond))
 	if info.Size() > stateFlushPayloadBudget {
-		t.Fatalf("app state file is %.2f MB, over the %.1f MB budget: the flush renders it under a.mu, so bounding the payload is what bounds the stall",
+		t.Fatalf("app state file is %.2f MB, over the %.1f MB budget: the payload bound is what keeps the writer's marshal cheap",
 			float64(info.Size())/(1<<20), float64(stateFlushPayloadBudget)/(1<<20))
 	}
 	if held > appStateFlushInterval {
-		t.Fatalf("one flush held a.mu for %s, longer than the %s debounce interval it is supposed to fit inside",
+		t.Fatalf("one inline flush took %s, longer than the %s debounce interval it is supposed to fit inside",
 			held.Round(time.Millisecond), appStateFlushInterval)
+	}
+}
+
+// TestStateWriterPersistsAsyncWithoutBlockingTheLock pins the O7 restructure
+// itself: in async mode (the production default) a flush returns while holding
+// a.mu for microseconds, the file appears shortly after via the writer, and no
+// temp file is left behind -- rename either succeeded or the direct-write
+// fallback replaced the target.
+func TestStateWriterPersistsAsyncWithoutBlockingTheLock(t *testing.T) {
+	useTempInstanceProfile(t)
+	app := &App{}
+	// Production shape: async writer, so the flush under a.mu pays only the
+	// snapshot and the marshal lands in the writer goroutine.
+	app.stateWriteAsync = true
+	// Fill the ring the way the payload test does: with ~5 MB of state, an
+	// inline marshal inside the flush would take the ~30ms+ measured in 924,
+	// which is exactly the regression this bound exists to catch.
+	body := strings.Repeat("x", 8<<10)
+	app.mu.Lock()
+	for i := 0; i < appStatePersistRequestMax; i++ {
+		app.requests = append(app.requests, RequestRecord{ID: "r" + strconv.Itoa(i), ReqBody: body, RespBody: body})
+	}
+	started := time.Now()
+	app.flushAppStateLocked()
+	held := time.Since(started)
+	app.mu.Unlock()
+	if held > 25*time.Millisecond {
+		t.Fatalf("flushAppStateLocked held a.mu for %s; the async hand-off must be immediate", held.Round(time.Millisecond))
+	}
+
+	statePath, err := appStatePath()
+	if err != nil {
+		t.Fatalf("appStatePath() error = %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	var info os.FileInfo
+	for time.Now().Before(deadline) {
+		info, err = os.Stat(statePath)
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("the async writer never wrote the state file: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("the async writer wrote an empty state file")
+	}
+	if _, err := os.Stat(statePath + ".tmp"); err == nil {
+		t.Fatal("a temp file survived the flush; rename must consume it")
+	}
+}
+
+// TestUsageUpdatedIsThrottledWithTrailingEmit pins O9: the first event goes out
+// immediately, events inside the interval are coalesced into one trailing
+// emission, and the timer arms once rather than per call. State is inspected
+// directly because both real sinks (Wails runtime, console publish) are no-ops
+// without a live frontend, which is exactly why the throttle must not depend
+// on them.
+func TestUsageUpdatedIsThrottledWithTrailingEmit(t *testing.T) {
+	app := &App{}
+	app.emitUsageUpdated()
+	if app.lastUsageEmit.IsZero() {
+		t.Fatal("the first emit did not record its time")
+	}
+	if app.usageEmitTimer != nil {
+		t.Fatal("the first emit armed a trailing timer; only a suppressed emit may")
+	}
+	app.emitUsageUpdated()
+	app.emitUsageUpdated()
+	if app.usageEmitTimer == nil {
+		t.Fatal("a suppressed emit did not arm the trailing timer")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		app.usageEmitMu.Lock()
+		fired := app.usageEmitTimer == nil
+		app.usageEmitMu.Unlock()
+		if fired {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	app.usageEmitMu.Lock()
+	fired := app.usageEmitTimer == nil
+	app.usageEmitMu.Unlock()
+	if !fired {
+		t.Fatal("the trailing timer never fired within its interval")
+	}
+}
+
+// TestFetchModelsPrefersTheInProcessService pins O6: with a claimed proxy the
+// desktop must ask its own service object for the model list instead of making
+// a loopback HTTP request to itself (which allocated a client per probe and
+// landed every refresh in the user's request history). The discriminator is the
+// error source: the service is configured with a remote base URL on a closed
+// local port, so the direct path fails with that address in the error within
+// milliseconds, while the loopback path on an empty address fails with a
+// malformed-URL error that names neither the port nor the service.
+func TestFetchModelsPrefersTheInProcessService(t *testing.T) {
+	useTempInstanceProfile(t)
+
+	svc := service.New(service.Config{
+		Backend:       service.BackendRemote,
+		RemoteBaseURL: "http://127.0.0.1:1",
+	})
+	app := &App{}
+	app.mu.Lock()
+	app.svc = svc
+	app.mu.Unlock()
+
+	started := time.Now()
+	_, err := app.fetchModels("", 2*time.Second)
+	elapsed := time.Since(started)
+	if err == nil {
+		t.Fatal("fetchModels against a closed port succeeded; the discriminator is broken")
+	}
+	// Either marker proves the in-process service was consulted: a box with a
+	// real login cache dials and fails naming 127.0.0.1:1, while a box without
+	// one fails earlier in credential resolution. Neither error can come from
+	// the loopback path, whose empty address fails in URL handling.
+	if !strings.Contains(err.Error(), "127.0.0.1:1") && !strings.Contains(err.Error(), "登录缓存") {
+		t.Fatalf("fetchModels error = %v; it must come from the in-process service, not the loopback fallback", err)
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("the probe took %s; a refused connection or a cache miss should fail fast", elapsed.Round(time.Millisecond))
+	}
+}
+
+// TestFetchModelsFallsBackToLoopbackWithoutService pins the other half of O6:
+// before a proxy is claimed there is no service to ask, and the loopback HTTP
+// path remains for exactly that case.
+func TestFetchModelsFallsBackToLoopbackWithoutService(t *testing.T) {
+	useTempInstanceProfile(t)
+	app := &App{}
+	_, err := app.fetchModels("", 2*time.Second)
+	if err == nil {
+		t.Fatal("a loopback fetch on an empty address should not succeed")
+	}
+	if strings.Contains(err.Error(), "127.0.0.1:1") || strings.Contains(err.Error(), "登录缓存") {
+		t.Fatalf("fetchModels error = %v; with no service claimed the loopback path must be the one that answers", err)
+	}
+}
+
+// D14: the desktop's cold model probe must not give up before the backend it is
+// calling is allowed to finish. On this box a cold CLI catalog takes 44-130s while
+// the startup probe was capped at 12s, so the GUI opened on an empty model list
+// until somebody pressed refresh by hand.
+func TestStartupColdProbeCoversTheBackendsOwnBudget(t *testing.T) {
+	cold := startupModelProbeTimeout(service.Config{WarmupTimeout: 30 * time.Second}, false)
+	if cold < service.CLIColdProbeTimeout() {
+		t.Fatalf("cold probe = %v, want >= the service's own budget %v", cold, service.CLIColdProbeTimeout())
+	}
+	if got := startupModelProbeTimeout(service.Config{WarmupTimeout: 300 * time.Second}, false); got != 300*time.Second {
+		t.Fatalf("a longer configured budget must survive the floor, got %v", got)
+	}
+	if got := startupModelProbeTimeout(service.Config{WarmupTimeout: 30 * time.Second}, true); got > 5*time.Second {
+		t.Fatalf("the cached path stays fast, got %v", got)
 	}
 }

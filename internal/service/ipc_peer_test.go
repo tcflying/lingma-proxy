@@ -285,9 +285,13 @@ func TestReuseTurnKeepsASessionItAnswered(t *testing.T) {
 	}
 }
 
-// TestToolEmulationRetryDoesNotRestreamTheFirstAttempt pins S3. The retry replaces
-// result.Text, so streaming it as well handed a streaming client the prose attempt
-// and then the retry, while a stream:false client got only the retry tail.
+// TestToolEmulationRetryDoesNotRestreamTheFirstAttempt pins S3 and the 931
+// retry-isolation read-through. The retry replaces result.Text, and bytes
+// already streamed cannot be unsaid, so a turn a retry can rewrite must not
+// stream its first attempt at all: once the retry's action block is the
+// accepted answer, the superseded prose attempt stays off the wire, exactly
+// like the postfix-cn-chat-sse XML leak where the client received the refused
+// attempt and the retried tool call from two different attempts.
 func TestToolEmulationRetryDoesNotRestreamTheFirstAttempt(t *testing.T) {
 	peer := startPeer(t)
 	const prose = "我先看看项目结构。"
@@ -327,8 +331,54 @@ func TestToolEmulationRetryDoesNotRestreamTheFirstAttempt(t *testing.T) {
 	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Name != "Bash" {
 		t.Fatalf("retry did not produce a tool call: %+v", result.ToolCalls)
 	}
+	if got := streamed.String(); got != "" {
+		t.Fatalf("streamed %q, want nothing: the retry superseded the prose attempt, so the client must see only the accepted attempt", got)
+	}
+}
+
+// A retry that answers without a tool call leaves the first attempt as the
+// turn's answer; holding it was only ever temporary, so the held prose must be
+// released verbatim once the verdict is in.
+func TestToolEmulationFailedRetryReleasesFirstAttemptProse(t *testing.T) {
+	peer := startPeer(t)
+	const prose = "我先看看项目结构。"
+	peer.onPrompt = func(p *ipcPeer, requestID string, attempt int) {
+		if attempt == 1 {
+			p.chunk(requestID, prose)
+		} else {
+			p.chunk(requestID, "抱歉，当前环境没有可用的工具。")
+		}
+		p.finish(requestID)
+	}
+	svc := newIPCService(t, peer, Config{Timeout: time.Minute})
+
+	req := chatRequest("list the files")
+	req.Tools = []toolemulation.ToolDef{{
+		Name: "Bash",
+		InputSchema: map[string]any{
+			"properties": map[string]any{"command": map[string]any{"type": "string"}},
+			"required":   []any{"command"},
+		},
+	}}
+	req.ToolChoice = toolemulation.ToolChoice{Mode: "any"}
+
+	var streamed strings.Builder
+	result, err := svc.generateWithReconnect(context.Background(), req, func(event StreamEvent) {
+		if event.Type == StreamEventText {
+			streamed.WriteString(event.Delta)
+		}
+	})
+	if err != nil {
+		t.Fatalf("generate failed: %v", err)
+	}
+	if len(peer.promptTexts()) != 2 {
+		t.Fatalf("prompts = %d, want the answer plus the forced-tooling retry", len(peer.promptTexts()))
+	}
+	if len(result.ToolCalls) != 0 {
+		t.Fatalf("result calls = %+v, want none from a retry that produced none", result.ToolCalls)
+	}
 	if got := streamed.String(); got != prose {
-		t.Fatalf("streamed %q, want only the first attempt %q: the retry is not part of the answer the client saw", got, prose)
+		t.Fatalf("streamed %q, want the surviving first attempt released verbatim", got)
 	}
 }
 

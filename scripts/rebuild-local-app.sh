@@ -8,7 +8,11 @@ APP_NAME="Lingma Proxy.app"
 APP_BUNDLE_NAME="LingmaProxy"
 BUILD_APP_PATH="$DESKTOP_DIR/build/bin/$APP_NAME"
 INSTALL_APP_PATH="/Applications/$APP_NAME"
-WAILS_BIN="${WAILS_BIN:-/Users/tiancheng/go/bin/wails}"
+# Resolve the Wails CLI from PATH by default. A per-developer absolute path used
+# to be hardcoded here, which broke the script for everyone else and leaked a
+# personal home directory into a tracked file. Override with WAILS_BIN=/abs/path
+# when the binary is not on PATH (e.g. $(go env GOPATH)/bin/wails).
+WAILS_BIN="${WAILS_BIN:-wails}"
 OPEN_AFTER_BUILD="${OPEN_AFTER_BUILD:-1}"
 ENABLE_DEVTOOLS="${ENABLE_DEVTOOLS:-1}"
 

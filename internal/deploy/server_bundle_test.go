@@ -72,6 +72,26 @@ func TestServerBundleKeepsCredentialsPrivate(t *testing.T) {
 		t.Fatalf("SaveCredentialFile() error = %v", err)
 	}
 	outputPath := filepath.Join(dir, "bundle.zip")
+
+	// On the target server the archive is the credential: anything group or
+	// other readable leaks it without unpacking.
+	//
+	// The mode is asserted from the *request*, recorded through the seam and then
+	// delegated to the real creator, so the production path is what gets checked.
+	// Reading it off the finished file instead would be a check that cannot work on
+	// Windows -- the OS emulates the POSIX bits there -- and an earlier version of
+	// it responded to that by logging instead of failing, which is how a
+	// world-readable bundle shipped while the ledger still called the item fixed.
+	var requested os.FileMode
+	var requests int
+	realCreate := createBundleFile
+	createBundleFile = func(path string, perm os.FileMode) (*os.File, error) {
+		requests++
+		requested = perm
+		return realCreate(path, perm)
+	}
+	t.Cleanup(func() { createBundleFile = realCreate })
+
 	if _, err := WriteServerBundle(ServerBundleOptions{
 		AuthFile:   sourceCredPath,
 		OutputPath: outputPath,
@@ -79,17 +99,23 @@ func TestServerBundleKeepsCredentialsPrivate(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("WriteServerBundle() error = %v", err)
 	}
+	if requests != 1 {
+		t.Fatalf("bundle opened through the seam %d times, want exactly 1", requests)
+	}
+	if requested != 0o600 {
+		t.Errorf("bundle requested mode = %o, want 0600 (group and other must not read it)", requested)
+	}
+	if bundleFileMode != 0o600 {
+		t.Errorf("bundleFileMode = %o, want 0600", bundleFileMode)
+	}
 
-	// On the target server the archive is the credential: anything group or
-	// other readable leaks it without unpacking.
 	info, err := os.Stat(outputPath)
 	if err != nil {
 		t.Fatalf("stat bundle: %v", err)
 	}
-	switch perm := info.Mode().Perm(); {
-	case goruntime.GOOS == "windows":
-		t.Logf("bundle file mode %o not asserted: Windows emulates the POSIX bits", perm)
-	case perm&0o077 != 0:
+	// Belt and braces where the OS can actually answer it: a real POSIX run also
+	// proves the mode reached the filesystem, not just the call site.
+	if perm := info.Mode().Perm(); goruntime.GOOS != "windows" && perm&0o077 != 0 {
 		t.Errorf("bundle file mode = %o, want group/other bits cleared", perm)
 	}
 

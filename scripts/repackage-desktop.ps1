@@ -22,12 +22,21 @@ $exeName = 'LingmaProxy.exe'
 $installed = Join-Path $TargetDir $exeName
 
 function Swap-In($from, $to) {
-  # A process that was just killed can still hold the target open, so the
-  # delete-then-copy has to retry rather than assume the first attempt works.
+  # Replace by rename, never by delete-then-copy. In the gap between the two the
+  # folder holds no executable at all, and this box runs the app under a scheduled
+  # task that restarts it on failure -- so the restart lands in the gap, the copy
+  # then retries against a folder it can never fill, and the deploy ends with
+  # nothing installed. Staging beside the target and renaming over it keeps a
+  # working binary in place for every instant of the swap.
+  $staged = "$to.new"
   for ($i = 1; $i -le 8; $i++) {
     try {
-      if (Test-Path $to) { Remove-Item -Force $to }
-      Copy-Item -Force $from $to
+      Copy-Item -Force $from $staged
+      $wantStaged = (Get-FileHash -Algorithm SHA256 $from).Hash
+      if ((Get-FileHash -Algorithm SHA256 $staged).Hash -ne $wantStaged) {
+        throw "staged copy of $from does not match its source"
+      }
+      Move-Item -Force $staged $to
       return $i
     } catch {
       Start-Sleep -Seconds 2
@@ -53,6 +62,14 @@ if ($running) {
   Start-Sleep -Seconds 3
 }
 
+# Keep whatever is being replaced. A rollback target that exists only because
+# someone remembered to copy it by hand is not a rollback path.
+if (Test-Path $installed) {
+  $prev = "$installed.prev"
+  Copy-Item -Force $installed $prev
+  Write-Output ("PREV sha=" + (Get-FileHash -Algorithm SHA256 $prev).Hash + " -> " + $prev)
+}
+
 $attempt = Swap-In $src $installed
 $got = (Get-FileHash -Algorithm SHA256 $installed).Hash
 if ($got -ne $want) { throw "installed hash mismatch: $got != $want" }
@@ -69,7 +86,15 @@ foreach ($variant in @('both', 'cn', 'intl')) {
   New-Item -ItemType Directory -Force $stage | Out-Null
   Expand-Archive -Path $zip -DestinationPath $probe -Force
   Copy-Item $installed (Join-Path $stage $exeName)
-  Copy-Item (Join-Path $probe 'lingma-proxy.json') (Join-Path $stage 'lingma-proxy.json')
+  # Take the sidecar from the installed folder, not from inside the zip. The one in
+  # the zip is whatever shipped when that zip was built; the one in the folder is
+  # the tuned copy. Refilling from the zip on every repack silently reverts the hand
+  # tuning -- warmup_timeout, the fallback model list, the state-isolating
+  # instance_id -- and the revert only shows up as "the GUI is slow again" on the
+  # next boot, long after the deploy that caused it.
+  $deployedSidecar = Join-Path (Join-Path $TargetDir $variant) 'lingma-proxy.json'
+  $sidecarSource = if (Test-Path $deployedSidecar) { $deployedSidecar } else { Join-Path $probe 'lingma-proxy.json' }
+  Copy-Item $sidecarSource (Join-Path $stage 'lingma-proxy.json')
   # Build the replacement beside the original and only swap it in once it reads
   # back correctly: a failed Compress-Archive must not cost the variant zip.
   # Compress-Archive insists on a .zip suffix, hence the staging name.
@@ -79,9 +104,12 @@ foreach ($variant in @('both', 'cn', 'intl')) {
   Expand-Archive -Path $fresh -DestinationPath $probe -Force
   $inside = (Get-FileHash -Algorithm SHA256 (Join-Path $probe $exeName)).Hash
   if ($inside -ne $want) { Remove-Item -Recurse -Force $stage, $probe, $fresh; throw "$variant zip holds $inside, expected $want" }
+  $wantSidecar = (Get-FileHash -Algorithm SHA256 $sidecarSource).Hash
+  $gotSidecar = (Get-FileHash -Algorithm SHA256 (Join-Path $probe 'lingma-proxy.json')).Hash
+  if ($gotSidecar -ne $wantSidecar) { Remove-Item -Recurse -Force $stage, $probe, $fresh; throw "$variant zip sidecar does not match $sidecarSource" }
   Move-Item -Force $fresh $zip
   Remove-Item -Recurse -Force $probe
-  Write-Output ("ZIP $variant size=$((Get-Item $zip).Length) exe_sha=$inside ok=True")
+  Write-Output ("ZIP $variant size=$((Get-Item $zip).Length) exe_sha=$inside sidecar_from=$sidecarSource ok=True")
   Remove-Item -Recurse -Force $stage
 }
 

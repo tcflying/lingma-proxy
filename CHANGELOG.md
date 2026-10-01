@@ -85,12 +85,12 @@
 - Fixed Remote API prompt delivery for emulated tools by sending the full tool contract as the upstream chat message when tool emulation is active, instead of building a prompt that the remote message path ignored.
 - Tightened tool instructions for local shell workflows: tool calls should be emitted before explanatory text, `cd` must be combined with the dependent command or replaced by absolute paths, dependent shell commands should not be split across calls, and optional commands such as `tree` should not be assumed available.
 - Preserved the default incremental streaming behavior for tool requests; full tool-turn aggregation remains an explicit compatibility mode via `LINGMA_AGGREGATE_TOOL_STREAM=1`.
-- Verified the fix with real Claude Code v2.1.158 pointed at a temporary Remote API proxy: the natural request to inspect `/Users/tiancheng/ai-workspace` produced an immediate Bash `tool_use` and completed against the correct directory.
+- Verified the fix with real Claude Code v2.1.158 pointed at a temporary Remote API proxy: the natural request to inspect `/Users/yourname/ai-workspace` produced an immediate Bash `tool_use` and completed against the correct directory.
 - 加强 Remote API 工具调用兼容：当 Claude Code 这类客户端请求携带 tools 时，代理会启用 prompt tool-emulation 兜底，同时继续透传原生 `tools/tool_choice`。
 - 修复 Remote API 工具提示生成后没有真正进入上游消息的问题：启用工具模拟时，完整工具契约会作为上游 chat message 发送。
 - 收紧本地 shell 工具提示：需要工具时先输出 tool call；`cd` 必须和后续命令放在同一次调用或改用绝对路径；依赖 shell 命令不能跨调用拆分；不默认假设 `tree` 等可选命令存在。
 - 保持 tools 请求默认增量流式输出；如需先内部完成工具轮次再输出最终 `tool_use`，仍通过 `LINGMA_AGGREGATE_TOOL_STREAM=1` 显式开启。
-- 已用真实 Claude Code v2.1.158 指向临时 Remote API 代理验证：自然提示检查 `/Users/tiancheng/ai-workspace` 时首轮直接产出 Bash `tool_use`，并基于正确目录结果完成回答。
+- 已用真实 Claude Code v2.1.158 指向临时 Remote API 代理验证：自然提示检查 `/Users/yourname/ai-workspace` 时首轮直接产出 Bash `tool_use`，并基于正确目录结果完成回答。
 
 ## v1.6.7 - 2026-05-27
 
@@ -110,11 +110,11 @@
 - Enabled the desktop WebView inspector in packaged release builds, so installed desktop apps keep the right-click `Inspect Element` menu for UI/style/runtime troubleshooting.
 - Fixed QoderCN IPC image requests by using QoderCN's native `qodercn:///agent/file?path=...` image URI scheme while preserving `lingma:///agent/file?path=...` compatibility for legacy Lingma runtimes.
 - Removed the ineffective IPC image `contextParams` branch and restored image payloads to the `session/prompt` image item shape that both QoderCN and Lingma consume.
-- Verified the full IPC image path with `/Users/tiancheng/Pictures/ik2.jpg` on both QoderCN and Lingma runtimes; both returned correct visual descriptions of the coastal rocks / cloudy seascape.
+- Verified the full IPC image path with `/Users/yourname/Pictures/ik2.jpg` on both QoderCN and Lingma runtimes; both returned correct visual descriptions of the coastal rocks / cloudy seascape.
 - 正式 Release 桌面包保留 WebView Inspector，安装后的桌面 App 也可以通过右键 `Inspect Element` 排查 UI 样式和运行时问题。
 - 修复 QoderCN IPC 图片请求：连接 QoderCN 时使用原生 `qodercn:///agent/file?path=...` 图片 URI，同时保留旧 Lingma 运行时的 `lingma:///agent/file?path=...` 兼容。
 - 移除无效的 IPC 图片 `contextParams` 挂载分支，恢复为 QoderCN 与 Lingma 都实际消费的 `session/prompt` image item 结构。
-- 已用 `/Users/tiancheng/Pictures/ik2.jpg` 分别验证 QoderCN 与 Lingma 两条 IPC 图片链路，二者均能正确描述海边礁石 / 阴云海景。
+- 已用 `/Users/yourname/Pictures/ik2.jpg` 分别验证 QoderCN 与 Lingma 两条 IPC 图片链路，二者均能正确描述海边礁石 / 阴云海景。
 
 ## v1.6.5 - 2026-05-22
 

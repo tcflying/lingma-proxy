@@ -156,21 +156,28 @@ type State struct {
 }
 
 type Service struct {
-	cfg              Config
-	backendOnce      sync.Once
-	mu               sync.Mutex
-	connectMu        sync.Mutex // serialises the IPC handshake only; see ensureConnected
-	client           *lingmaipc.Client
-	pipePath         string
-	endpoint         string
-	transport        lingmaipc.Transport
-	stickySessionID  string
-	stickyModelID    string
-	modelMap         map[string]string // official name -> internal id
-	remoteClient     *remote.Client
-	cliClients       map[qodercli.Site]*qodercli.Client
-	cliModels        map[qodercli.Site][]string
-	cliCatalog       map[qodercli.Site]cliCatalogEntry
+	cfg             Config
+	backendOnce     sync.Once
+	mu              sync.Mutex
+	connectMu       sync.Mutex // serialises the IPC handshake only; see ensureConnected
+	client          *lingmaipc.Client
+	pipePath        string
+	endpoint        string
+	transport       lingmaipc.Transport
+	stickySessionID string
+	stickyModelID   string
+	modelMap        map[string]string // official name -> internal id
+	remoteClient    *remote.Client
+	cliClients      map[qodercli.Site]*qodercli.Client
+	cliModels       map[qodercli.Site][]string
+	cliCatalog      map[qodercli.Site]cliCatalogEntry
+	// cliProbeGate lets one catalog discovery run at a time. It is a gate, not a
+	// queue: a caller that finds it held does not wait, because the holder may be
+	// the startup warm-up, which is allowed the priming budget rather than the
+	// request-path one, and a client must not inherit that. See cachedCLIModels
+	// for who it serves, and listCLIMergedModels for the /v1/models caller that
+	// deliberately does not take it.
+	cliProbeGate     sync.Mutex
 	detectedCLISites []qodercli.Site
 	cliSitesOnce     sync.Once
 	remoteProbeCache map[string]remoteModelProbeEntry
@@ -412,23 +419,44 @@ func (s *Service) Warmup(ctx context.Context) error {
 // warmCLISites mints a job token for each served site and caches its model list.
 // A site that cannot authenticate is only fatal when no site can: a stale CN
 // login must not stop a working international one, and vice versa.
+//
+// Sites warm in parallel. Serially, one wedged CN spawn held the international
+// site's warm-up hostage for the whole prime budget, and the two probes share
+// nothing -- separate clients, separate catalogs -- so there is no ordering to
+// preserve. First error wins for the fatal case, same as before.
 func (s *Service) warmCLISites(ctx context.Context) error {
+	sites := s.cliSites()
+	type siteResult struct {
+		err    error
+		warmed bool
+	}
+	results := make([]siteResult, len(sites))
+	var wg sync.WaitGroup
+	for i, site := range sites {
+		wg.Add(1)
+		go func(i int, site qodercli.Site) {
+			defer wg.Done()
+			client, err := s.cliClientFor(site)
+			if err == nil {
+				err = client.Warmup(ctx)
+			}
+			if err != nil {
+				log.Printf("backend: %s CLI warmup failed: %v", site.Label(), err)
+				results[i].err = err
+				return
+			}
+			s.cachedCLIModels(ctx, site, cliPrimeProbeTimeout)
+			results[i].warmed = true
+		}(i, site)
+	}
+	wg.Wait()
 	var firstErr error
 	warmed := false
-	for _, site := range s.cliSites() {
-		client, err := s.cliClientFor(site)
-		if err == nil {
-			err = client.Warmup(ctx)
+	for _, res := range results {
+		if res.err != nil && firstErr == nil {
+			firstErr = res.err
 		}
-		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
-			log.Printf("backend: %s CLI warmup failed: %v", site.Label(), err)
-			continue
-		}
-		s.cachedCLIModels(ctx, site, cliPrimeProbeTimeout)
-		warmed = true
+		warmed = warmed || res.warmed
 	}
 	if !warmed {
 		return firstErr
@@ -561,11 +589,29 @@ const (
 	// cli-catalog-*.json files never appear at all. Raising the client-visible cap
 	// instead would make a caller wait minutes for a list, which is its own outage.
 	cliPrimeProbeTimeout = 15 * time.Minute
+	// A probe that fails gets no cliCatalogTTL -- only a success does -- so without
+	// this every /v1/models while a site is unreachable paid the full
+	// cliProbeTimeout again: measured live, three consecutive calls at 8046/8028/
+	// 8030ms each, all serving the same stale disk list. The failure TTL keeps the
+	// stale answer instant for a short window and lets exactly one caller per
+	// window pay the probe. Short on purpose: it only masks a dead site's list
+	// refresh, never a chat turn, and recovery is one window away.
+	cliProbeFailureTTL = 30 * time.Second
 )
+
+// CLIColdProbeTimeout publishes the budget a first, cache-less model discovery is
+// allowed to spend. Callers that ask this same process for its model list must not
+// give up sooner, or the UI shows an empty catalog while the backend is still
+// working inside its own budget.
+func CLIColdProbeTimeout() time.Duration { return cliColdProbeTimeout }
 
 type cliCatalogEntry struct {
 	names     []string
 	expiresAt time.Time
+	// failedAt is when the last probe against this site failed. It is only
+	// consulted when names is non-nil: there is nothing to serve negatively for a
+	// site that never answered, so that path keeps probing.
+	failedAt time.Time
 }
 
 // persistedCLICatalog is one site's last good model list on disk. Without it a
@@ -655,9 +701,38 @@ func (s *Service) setCLICatalog(site qodercli.Site, names []string, expiresAt ti
 	if s.cliCatalog == nil {
 		s.cliCatalog = map[qodercli.Site]cliCatalogEntry{}
 	}
+	// A success supersedes any recorded failure: the entry is replaced whole, so
+	// failedAt goes back to zero with it.
 	s.cliCatalog[site.Normalized()] = cliCatalogEntry{names: names, expiresAt: expiresAt}
 	s.mu.Unlock()
 	writeCLICatalog(site, names, expiresAt)
+}
+
+// markCLIProbeFailed records a failed probe without disturbing the stale names
+// or the old expiry: the failure TTL in listCLIMergedModels is what reads it.
+func (s *Service) markCLIProbeFailed(site qodercli.Site) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	key := site.Normalized()
+	entry := s.cliCatalog[key]
+	if entry.names == nil {
+		// After a restart the only record of this site's names is the on-disk
+		// tier, and the map lookup above cannot see it. Pull the disk entry in
+		// so the mark has something to annotate -- otherwise a dead site
+		// re-probes on every /v1/models forever, which is the exact tax the
+		// mark exists to stop. Measured before this seeding: three consecutive
+		// calls at 8.0s each against a TLS-dead CN, all serving stale names
+		// that were already on disk.
+		entry = readCLICatalog(key)
+	}
+	if entry.names == nil {
+		return
+	}
+	entry.failedAt = time.Now()
+	if s.cliCatalog == nil {
+		s.cliCatalog = map[qodercli.Site]cliCatalogEntry{}
+	}
+	s.cliCatalog[key] = entry
 }
 
 // listCLIMergedModels lists the models of every served site. The international
@@ -673,6 +748,17 @@ func (s *Service) setCLICatalog(site qodercli.Site, names []string, expiresAt ti
 // or not. The probe budgets and the catalog TTL are what bound this. If concurrent
 // probes ever measure as the cost, fix cmd.Wait() to kill the whole process tree.
 //
+// This is also why /v1/models does not take cliProbeGate, which is the other half
+// of the story and used to read as a contradiction: that gate serves callers that
+// have an answer in hand to fall back on, so a held gate costs them nothing, while
+// a listing has nothing but the probe. Queueing it behind the warm-up's priming
+// budget would turn "a second discovery" into "no answer at all", which is worse
+// than the overlap. So the tradeoff is stated rather than papered over: a cold
+// catalog under N concurrent listings still starts N discoveries, one per site
+// each, and what bounds them is the per-site budget and the catalog TTL. A client
+// that needs this deduplicated needs a shared result, not a lock -- single-flight
+// keyed on the site, where a late caller reads the answer the first one published.
+//
 // probeBudget raises the per-site bound above the client-facing ones; that is what
 // the warm-up pass passes so priming can win on a box where one probe costs more
 // than a client should ever wait. 0 keeps the request-path behaviour.
@@ -684,6 +770,14 @@ func (s *Service) listCLIMergedModels(ctx context.Context, probeBudget time.Dura
 	for i, site := range sites {
 		entry := s.cliCatalogEntry(site)
 		if entry.names != nil && now.Before(entry.expiresAt) {
+			listings[i].names = entry.names
+			continue
+		}
+		// Negative cache: a probe that failed less than cliProbeFailureTTL ago
+		// fails the same way again (the 8s was a TLS handshake, not a race), so
+		// serve the stale list now and let the next window retry. Without this
+		// a dead site taxed every /v1/models with the full probe timeout.
+		if entry.names != nil && now.Before(entry.failedAt.Add(cliProbeFailureTTL)) {
 			listings[i].names = entry.names
 			continue
 		}
@@ -719,6 +813,7 @@ func (s *Service) listCLIMergedModels(ctx context.Context, probeBudget time.Dura
 			}
 			if err != nil {
 				log.Printf("backend: %s CLI model discovery failed: %v", site.Label(), err)
+				s.markCLIProbeFailed(site)
 				listings[i] = cliSiteListing{names: stale, err: err}
 				return
 			}
@@ -796,6 +891,9 @@ func (s *Service) setCLIModels(site qodercli.Site, ids []string) {
 	s.cliModels[site.Normalized()] = ids
 }
 
+// ListModels answers a model listing. On the CLI backend it discovers, which is
+// the one request path that does not take cliProbeGate; the reason, and what
+// bounds the resulting overlap instead, is on listCLIMergedModels.
 func (s *Service) ListModels(ctx context.Context) ([]Model, error) {
 	if s.backend() == BackendQoderCLI {
 		return s.listCLIMergedModels(ctx, 0)
@@ -923,9 +1021,15 @@ func (s *Service) generateRemoteInternal(
 			req = requestWithCurrentTurnImagesOnly(req)
 		} else if len(req.Tools) > 0 && req.ToolChoice.Mode != "none" {
 			return s.generateRemoteWithImageContext(ctx, req, onDelta)
-		} else {
+		} else if s.backend() != BackendRemote {
 			return s.generateWithReconnect(ctx, req, onDelta)
 		}
+		// BackendRemote without tools: the gateway takes the pictures on the
+		// request itself, through remoteImagesFromRequest below -- the image_urls
+		// the is_vl switch in its own payload keys off. Routing this turn over
+		// the local IPC pipe instead made vision depend on an installed desktop:
+		// every image request on a headless deployment died in the IPC dial, and
+		// the remote client's image projection stayed unreachable.
 	}
 	if strings.TrimSpace(req.Model) == "" {
 		req.Model = s.DefaultModel()
@@ -947,7 +1051,13 @@ func (s *Service) generateRemoteInternal(
 			return nil, err
 		}
 		site = resolved
-		req.Model = s.resolveCLIModel(ctx, base, site)
+		// Resolution can discover the catalog (8s warm / 120s cold), and it runs
+		// before attemptCtx below. Sharing the per-attempt budget here means a
+		// configured timeout bounds discovery + turn together instead of letting
+		// a cold resolution prefix every request with an unbudgeted 120s.
+		resolveCtx, cancelResolve := contextWithOptionalTimeout(ctx, s.cfg.Timeout)
+		req.Model = s.resolveCLIModel(resolveCtx, base, site)
+		cancelResolve()
 	}
 	// The CLI backend keeps the instructions out of the user turn: the gateway
 	// reroutes user content that names another product's identity, so they travel
@@ -1000,6 +1110,60 @@ func (s *Service) generateRemoteWithImageContext(
 	return s.generateRemoteInternal(ctx, remoteReq, onDelta, true)
 }
 
+// firstAttemptStream keeps the first attempt of a turn a tool retry can still
+// rewrite off the wire: bytes already handed to the client cannot be taken
+// back, so the attempt is held until it is known final -- released when it
+// survives every retry decision, dropped when a retry supersedes it. Both
+// resolutions are idempotent, so a deferred release after an explicit drop is
+// a no-op. Turns with no tools, or tool_choice:"none", never retry and keep
+// the direct low-latency stream.
+type firstAttemptStream struct {
+	onDelta func(StreamEvent)
+	held    []StreamEvent
+	holding bool
+	wrote   bool
+}
+
+func newFirstAttemptStream(onDelta func(StreamEvent), req ChatRequest) *firstAttemptStream {
+	return &firstAttemptStream{
+		onDelta: onDelta,
+		holding: onDelta != nil && len(req.Tools) > 0 && req.ToolChoice.Mode != "none",
+	}
+}
+
+func (h *firstAttemptStream) delta(text string) {
+	h.event(StreamEvent{Type: StreamEventText, Delta: text})
+}
+
+func (h *firstAttemptStream) event(event StreamEvent) {
+	if event.Delta == "" || h.onDelta == nil {
+		return
+	}
+	if !h.holding {
+		h.wrote = true
+		h.onDelta(event)
+		return
+	}
+	h.held = append(h.held, event)
+}
+
+func (h *firstAttemptStream) release() {
+	if !h.holding {
+		return
+	}
+	h.holding = false
+	for _, event := range h.held {
+		h.wrote = true
+		h.onDelta(event)
+	}
+	h.held = nil
+}
+
+func (h *firstAttemptStream) drop() {
+	h.holding = false
+	h.held = nil
+}
+
 func (s *Service) generateRemoteWithModel(
 	ctx context.Context,
 	client chatClient,
@@ -1009,16 +1173,15 @@ func (s *Service) generateRemoteWithModel(
 	model string,
 	onDelta func(StreamEvent),
 	emulateTools bool,
-) (*ChatResult, bool, error) {
-	emitted := false
-	delta := func(text string) {
-		if text != "" {
-			emitted = true
-		}
-		if onDelta != nil {
-			onDelta(StreamEvent{Type: StreamEventText, Delta: text})
-		}
-	}
+) (result *ChatResult, emitted bool, err error) {
+	hold := newFirstAttemptStream(onDelta, req)
+	// Every exit resolves the hold first: an aborted attempt's partial prose is
+	// real output the client keeps, and emitted must report the wire truth
+	// after that release, not before.
+	defer func() {
+		hold.release()
+		emitted = hold.wrote
+	}()
 	remoteResult, err := client.Chat(ctx, remote.ChatRequest{
 		Model:           model,
 		Prompt:          prompt,
@@ -1030,10 +1193,17 @@ func (s *Service) generateRemoteWithModel(
 		ReasoningEffort: req.ReasoningEffort,
 		Tools:           req.Tools,
 		ToolChoice:      req.ToolChoice,
-	}, delta)
+	}, hold.delta)
 	if err != nil {
-		return nil, emitted, err
+		return nil, hold.wrote, err
 	}
+	// Dialect fallback for the native channel: the model answered a
+	// native-tools request in the action-block dialect instead. The attempt is
+	// finished and still held, so converting here reuses the emulated channel's
+	// own acceptance gate before any retry is weighed -- a call the parser
+	// accepts is already a legal native call and must not cost another round
+	// trip, least of all the forced-tooling ones below.
+	convertDialectToolCalls(remoteResult, req)
 	if len(remoteResult.ToolCalls) == 0 && shouldRetryRemoteNativeTool(req, remoteResult.Text) {
 		retryResult, retryErr := client.Chat(ctx, remote.ChatRequest{
 			Model:           model,
@@ -1047,14 +1217,26 @@ func (s *Service) generateRemoteWithModel(
 			Tools:           req.Tools,
 			ToolChoice:      toolemulation.ToolChoice{Mode: "any"},
 		}, nil)
+		if retryErr == nil {
+			// The forced retry answers the same turn under the same framing, so it
+			// gets the same dialect fallback the first attempt had. A model that
+			// obeys "call a tool" in the dialect the prompt taught it has produced a
+			// legal call; dropping it would spend the whole round trip on an answer
+			// the client could have run.
+			convertDialectToolCalls(retryResult, req)
+		}
 		if retryErr == nil && len(retryResult.ToolCalls) > 0 {
 			remoteResult = retryResult
-			emitted = false
+			hold.drop()
 		}
 	}
 
 	finishReason, stopReason := backendFinishReasons(remoteResult.StopReason)
-	result := &ChatResult{
+	// Native calls echo the qualified names we declared, but never learned
+	// their namespace; stamp it here so Responses emitters can split them
+	// back into leaf plus namespace.
+	toolemulation.DecorateToolCallNamespaces(remoteResult.ToolCalls, req.Tools)
+	result = &ChatResult{
 		Text:             remoteResult.Text,
 		Model:            valueOr(strings.TrimSpace(model), "lingma"),
 		InputTokens:      remoteResult.InputTokens,
@@ -1072,10 +1254,11 @@ func (s *Service) generateRemoteWithModel(
 		result.Endpoint = ""
 	}
 	if emulateTools {
-		s.applyToolEmulation(ctx, req, prompt, result, func(hintPrompt string) (string, int, error) {
+		if s.applyToolEmulation(ctx, req, prompt, result, func(hintPrompt string) (string, int, bool, error) {
 			retryResult, err := client.Chat(ctx, remote.ChatRequest{
 				Model:           model,
 				Prompt:          hintPrompt,
+				System:          system,
 				Messages:        remoteMessagesForChat(req, hintPrompt, emulateTools),
 				Images:          remoteImagesFromRequest(req),
 				Stream:          false,
@@ -1085,18 +1268,25 @@ func (s *Service) generateRemoteWithModel(
 				ToolChoice:      req.ToolChoice,
 			}, nil)
 			if err != nil {
-				return "", 0, err
+				return "", 0, false, err
 			}
 			if len(retryResult.ToolCalls) > 0 {
 				result.Text = retryResult.Text
+				toolemulation.DecorateToolCallNamespaces(retryResult.ToolCalls, req.Tools)
 				result.ToolCalls = retryResult.ToolCalls
 				result.OutputTokens = retryResult.OutputTokens
-				return "", 0, nil
+				return "", 0, true, nil
 			}
-			return retryResult.Text, retryResult.OutputTokens, nil
-		})
+			return retryResult.Text, retryResult.OutputTokens, false, nil
+		}) {
+			hold.drop()
+		} else {
+			hold.release()
+		}
+	} else {
+		hold.release()
 	}
-	return result, emitted, nil
+	return result, hold.wrote, nil
 }
 
 func shouldEmulateRemoteTools(req ChatRequest) bool {
@@ -1491,12 +1681,36 @@ func cliModelFamily(model string) string {
 
 // cachedCLIModels returns one site's model list, discovering it on first use.
 // The names are bare, as the CLI wants them.
+//
+// Concurrency here is a gate rather than a lock, and that is deliberate. The
+// comment on listCLIMergedModels rules out a mutex around the probe itself: the
+// holder can sit in the child's wait for its whole budget, and every queued caller
+// then times out with it. This is the narrow version of that idea -- one
+// discovery at a time, no waiting -- because a miss is not cheap. Each listing is
+// a CLI subprocess, measured at 24-46s of cold start, so N callers missing at the
+// same instant otherwise become N runtimes competing for the same machine.
+//
+// The wait is a TryLock on purpose. Queuing instead would hand a client request
+// the warm-up's priming budget, which is the exact coupling the note above
+// exists to prevent; answering from whatever the previous run left is both faster
+// and no less truthful, and the caller that skipped the probe is the one that
+// already has a catalog in hand or has none either way.
 func (s *Service) cachedCLIModels(ctx context.Context, site qodercli.Site, probeBudget time.Duration) []string {
 	read := func() []string {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		return append([]string(nil), s.cliModels[site.Normalized()]...)
 	}
+	if cached := read(); len(cached) > 0 {
+		return cached
+	}
+	if !s.cliProbeGate.TryLock() {
+		return read()
+	}
+	defer s.cliProbeGate.Unlock()
+	// Re-read under the gate: whoever held it has very likely just filled the
+	// cache, and listing again would spend a whole cold start to learn what the
+	// previous run already wrote down.
 	if cached := read(); len(cached) > 0 {
 		return cached
 	}
@@ -1687,7 +1901,11 @@ func (s *Service) generateLocked(
 
 	images := extractLastUserImages(req.Messages)
 
-	runResult, err := s.runPromptLocked(requestCtx, ipcClient, sessionID, prompt, images, requestID, meta, onDelta)
+	// Same isolation as the remote path: the emulation retry below can rewrite
+	// this turn; the deferred release keeps an aborted turn's partial prose.
+	hold := newFirstAttemptStream(onDelta, req)
+	defer hold.release()
+	runResult, err := s.runPromptLocked(requestCtx, ipcClient, sessionID, prompt, images, requestID, meta, hold.event)
 	if err != nil {
 		abandonTurn()
 		return nil, err
@@ -1707,7 +1925,7 @@ func (s *Service) generateLocked(
 
 	result = s.buildChatResult(req, sessionID, requestID, prompt, runResult, effectiveMode)
 
-	s.applyToolEmulation(requestCtx, req, prompt, result, func(hintPrompt string) (string, int, error) {
+	if s.applyToolEmulation(requestCtx, req, prompt, result, func(hintPrompt string) (string, int, bool, error) {
 		retryRequestID := lingmaipc.CreateRequestID("serve-tool")
 		retryMeta := lingmaipc.CreateMeta(lingmaipc.MetaOptions{
 			RequestID:       retryRequestID,
@@ -1717,14 +1935,20 @@ func (s *Service) generateLocked(
 			CurrentFilePath: s.cfg.CurrentFilePath,
 			EnabledMCP:      []any{},
 		})
-		// nil onDelta: the client already streamed the first attempt, and result.Text
-		// is about to be replaced by this retry. The remote retry passes nil too.
+		// nil onDelta: the held first attempt is still awaiting its verdict, and
+		// result.Text is about to be replaced by this retry. The remote retry
+		// passes nil too. The IPC peer answers in action blocks, never native
+		// calls, so the replaced flag stays false and the parsed text decides.
 		retryRunResult, retryErr := s.runPromptLocked(requestCtx, ipcClient, sessionID, hintPrompt, images, retryRequestID, retryMeta, nil)
 		if retryErr != nil {
-			return "", 0, retryErr
+			return "", 0, false, retryErr
 		}
-		return retryRunResult.AssistantText, estimateTokens(retryRunResult.AssistantText), nil
-	})
+		return retryRunResult.AssistantText, estimateTokens(retryRunResult.AssistantText), false, nil
+	}) {
+		hold.drop()
+	} else {
+		hold.release()
+	}
 	return result, nil
 }
 
@@ -1768,13 +1992,19 @@ func (s *Service) remoteAPI() *remote.Client {
 	return s.remoteClient
 }
 
+// applyToolEmulation parses action blocks out of a finished attempt and, when
+// the turn still owes a tool call, retries with a forced-tooling prompt. It
+// reports whether the turn's prose ended up replaced by a retried attempt or
+// consumed into inferred calls: that is the signal streaming callers use to
+// drop the first attempt's held deltas, so the client only ever sees output
+// that belongs to the accepted attempt.
 func (s *Service) applyToolEmulation(
 	ctx context.Context,
 	req ChatRequest,
 	prompt string,
 	result *ChatResult,
-	retry func(string) (string, int, error),
-) {
+	retry func(string) (string, int, bool, error),
+) (replaced bool) {
 	// tool_choice:"none" is the client forbidding tool calls, so a block that
 	// arrives anyway (from an echoed example, or from history) stays prose:
 	// turning it into a tool call would hand back an action the client ruled out.
@@ -1782,13 +2012,23 @@ func (s *Service) applyToolEmulation(
 		calls, remaining, parseErr := toolemulation.ParseActionBlocks(result.Text, req.Tools, toolemulation.Config{})
 		if parseErr == nil && len(calls) > 0 {
 			result.Text = remaining
-			result.ToolCalls = calls
-		} else if shouldRetryTooling(req.ToolChoice, result.Text) {
+			// A turn that already carries calls -- native ones from the gateway,
+			// or dialect ones converted upstream of here -- keeps them: the
+			// parsed calls join behind, so a model echoing its own native call
+			// as text cannot make it execute twice.
+			result.ToolCalls = appendConvertedToolCalls(result.ToolCalls, calls)
+			return false
+		} else if len(result.ToolCalls) == 0 && shouldRetryTooling(req.ToolChoice, result.Text) {
 			hintPrompt := prompt + "\n\n" + toolemulation.ForceToolingPrompt(req.ToolChoice)
 			retryText := ""
 			if retry != nil {
-				text, outputTokens, retryErr := retry(hintPrompt)
+				// replaced means the retry already installed its own calls into
+				// result (a native-tool answer needs no action-block parsing).
+				text, outputTokens, replaced, retryErr := retry(hintPrompt)
 				if retryErr == nil {
+					if replaced {
+						return true
+					}
 					retryText = text
 					if outputTokens > 0 {
 						result.OutputTokens = outputTokens
@@ -1801,20 +2041,24 @@ func (s *Service) applyToolEmulation(
 					result.Text = retryRemaining
 					result.ToolCalls = retryCalls
 					result.OutputTokens = estimateTokens(retryText)
+					return true
 				} else if inferred := toolemulation.InferToolCallsFromText(retryText, req.Tools); len(inferred) > 0 {
 					result.Text = ""
 					result.ToolCalls = inferred
 					result.OutputTokens = estimateTokens(retryText)
+					return true
 				}
 			}
 			if len(result.ToolCalls) == 0 {
 				if inferred := toolemulation.InferToolCallsFromText(result.Text, req.Tools); len(inferred) > 0 {
 					result.Text = ""
 					result.ToolCalls = inferred
+					return true
 				}
 			}
 		}
 	}
+	return false
 }
 
 func shouldRetryTooling(choice toolemulation.ToolChoice, text string) bool {
@@ -1824,7 +2068,78 @@ func shouldRetryTooling(choice toolemulation.ToolChoice, text string) bool {
 	case "none":
 		return false
 	}
-	return toolemulation.LooksLikeRefusal(text) || toolemulation.LooksLikeMissedToolUse(text)
+	// auto, and the unset mode that means the same thing on the wire. Only an
+	// explicit refusal earns the extra round trip here. LooksLikeMissedToolUse is
+	// a needle list of narration words ("I will read ...", "让我尝试"), so an
+	// ordinary answer that describes what the model is about to do used to buy a
+	// second full upstream turn in the mode most clients send.
+	return toolemulation.LooksLikeRefusal(text)
+}
+
+// appendConvertedToolCalls appends dialect-converted calls after the ones the
+// turn already carries, dropping a converted call that repeats an existing one
+// by name and arguments: that is the model echoing a call it already made, not
+// a second invocation.
+func appendConvertedToolCalls(existing, converted []toolemulation.ToolCall) []toolemulation.ToolCall {
+	out := existing
+	for _, call := range converted {
+		duplicate := false
+		for _, have := range existing {
+			if have.Name == call.Name && toolArgumentsEqual(have.Arguments, call.Arguments) {
+				duplicate = true
+				break
+			}
+		}
+		if !duplicate {
+			out = append(out, call)
+		}
+	}
+	return out
+}
+
+// toolArgumentsEqual compares two argument maps by their canonical JSON:
+// encoding/json writes map keys sorted, so the bytes are stable.
+func toolArgumentsEqual(a, b map[string]any) bool {
+	ab, errA := json.Marshal(normalizeToolArguments(a))
+	bb, errB := json.Marshal(normalizeToolArguments(b))
+	if errA != nil || errB != nil {
+		// A map that does not marshal is not one this proxy can compare, and two
+		// undecidable maps are not an echo of each other. Answering "same" here
+		// would drop a call the client asked for.
+		return false
+	}
+	return string(ab) == string(bb)
+}
+
+// normalizeToolArguments gives a nil map and an empty one the same shape. A
+// native call with no parameters arrives as {}, a dialect block that omits
+// "parameters" arrives as nil, and encoding/json writes those as {} and null:
+// without this the same no-argument call read as two and the tool ran twice.
+func normalizeToolArguments(args map[string]any) map[string]any {
+	if args == nil {
+		return map[string]any{}
+	}
+	return args
+}
+
+// convertDialectToolCalls is the native channel's dialect fallback, applied to
+// one finished attempt: a native-tools request the model answered in the
+// action-block dialect comes back as a legal native call, with the block cut out
+// of the prose. The gate is the one applyToolEmulation uses, so anything this
+// accepts is a call the emulated channel would have accepted too.
+func convertDialectToolCalls(result *remote.ChatResult, req ChatRequest) {
+	if result == nil || len(result.ToolCalls) > 0 {
+		return
+	}
+	if len(req.Tools) == 0 || req.ToolChoice.Mode == "none" {
+		return
+	}
+	calls, remaining, err := toolemulation.ParseActionBlocks(result.Text, req.Tools, toolemulation.Config{})
+	if err != nil || len(calls) == 0 {
+		return
+	}
+	result.ToolCalls = calls
+	result.Text = remaining
 }
 
 func isRecoverableIPCError(err error) bool {
@@ -2228,6 +2543,11 @@ func (s *Service) runPromptLocked(
 	}
 }
 
+// writeImageTempFile spools one attachment. It is a var so a test can reproduce
+// the only way this branch can actually fail in production -- a full or
+// read-only temp directory -- which no fixture can otherwise provoke.
+var writeImageTempFile = os.WriteFile
+
 // imagePromptItem builds one session/prompt image item. Qoder CN reads the
 // inline data field and never resolves the agent/file URI, so only the legacy
 // Lingma host still gets a spooled file; writing the user's image to the temp
@@ -2246,17 +2566,7 @@ func imagePromptItem(imageScheme string, img Image) (map[string]any, bool) {
 		// This is the only branch that leaves a file behind, so it pays for the
 		// cleanup of the ones it and every earlier request left behind.
 		sweepImageTempsForWrites()
-		if tmpFile, err := os.CreateTemp("", "lingma-img-*"+imageExtension(mediaType)); err == nil {
-			tmpPath := tmpFile.Name()
-			_ = tmpFile.Close()
-			data, _ := base64.StdEncoding.DecodeString(img.Data)
-			if len(data) > 0 {
-				_ = os.WriteFile(tmpPath, data, 0600)
-				if absPath, err := filepath.Abs(tmpPath); err == nil {
-					imageURI = fmt.Sprintf("%s:///agent/file?path=%s", imageScheme, url.QueryEscape(absPath))
-				}
-			}
-		}
+		imageURI = spoolImageTempFile(imageScheme, mediaType, img.Data)
 	}
 	if img.URL != "" {
 		imageURI = img.URL
@@ -2270,6 +2580,45 @@ func imagePromptItem(imageScheme string, img Image) (map[string]any, bool) {
 		"data":     img.Data,
 		"uri":      imageURI,
 	}, true
+}
+
+// spoolImageTempFile writes the attachment for the one host that resolves
+// agent/file, and returns that host's uri. Every failure here used to be
+// swallowed: the empty file CreateTemp had just made was still referenced, the
+// reader came back with nothing, and the request looked like the picture had
+// been ignored. So a failure leaves no uri and says so once in the log; the
+// inline data field, which that host also reads, is untouched.
+func spoolImageTempFile(imageScheme, mediaType, encoded string) string {
+	tmpFile, err := os.CreateTemp("", "lingma-img-*"+imageExtension(mediaType))
+	if err != nil {
+		log.Printf("image: spooling an attachment for %s failed, sending the inline data only: %v", imageScheme, err)
+		return ""
+	}
+	tmpPath := tmpFile.Name()
+	_ = tmpFile.Close()
+
+	data, decodeErr := base64.StdEncoding.DecodeString(encoded)
+	if decodeErr != nil {
+		log.Printf("image: decoding an inline attachment failed, sending it without a file reference: %v", decodeErr)
+		_ = os.Remove(tmpPath)
+		return ""
+	}
+	if len(data) == 0 {
+		_ = os.Remove(tmpPath)
+		return ""
+	}
+	if writeErr := writeImageTempFile(tmpPath, data, 0600); writeErr != nil {
+		log.Printf("image: writing %s failed, sending the inline data only: %v", tmpPath, writeErr)
+		_ = os.Remove(tmpPath)
+		return ""
+	}
+	absPath, absErr := filepath.Abs(tmpPath)
+	if absErr != nil {
+		log.Printf("image: resolving %s failed, sending the inline data only: %v", tmpPath, absErr)
+		_ = os.Remove(tmpPath)
+		return ""
+	}
+	return fmt.Sprintf("%s:///agent/file?path=%s", imageScheme, url.QueryEscape(absPath))
 }
 
 func (s *Service) ipcImageURIScheme() string {
@@ -2407,7 +2756,7 @@ func buildLingmaPromptSections(req ChatRequest, mode SessionMode, emulateTools, 
 			if message.Role == "assistant" {
 				role = "Assistant"
 			}
-			parts = append(parts, fmt.Sprintf("%s: %s", role, message.Text))
+			parts = append(parts, fmt.Sprintf("%s: %s", role, transcriptText(message)))
 		}
 		if embedded != "" {
 			// Append tool prompt right before the final "Assistant:" so it
@@ -2428,7 +2777,7 @@ func buildLingmaPromptSections(req ChatRequest, mode SessionMode, emulateTools, 
 		if message.Role == "assistant" {
 			role = "Assistant"
 		}
-		parts = append(parts, fmt.Sprintf("%s: %s", role, message.Text))
+		parts = append(parts, fmt.Sprintf("%s: %s", role, transcriptText(message)))
 	}
 	parts = append(parts, "Reply as the assistant to the latest user message only. Follow the system instructions and prior transcript naturally.")
 	return section, strings.Join(parts, "\n\n"), nil
@@ -2451,19 +2800,75 @@ func filteredMessages(messages []ChatMessage) []ChatMessage {
 	for _, message := range messages {
 		role := strings.ToLower(strings.TrimSpace(message.Role))
 		text := strings.TrimSpace(message.Text)
-		if text == "" {
-			continue
-		}
 		if role == "tool" {
-			text = toolemulation.ActionOutputPrompt(message.ToolCallID, text)
+			// An empty tool result still belongs to the call that produced it:
+			// dropping it breaks the pairing and the model re-reads the file.
+			body := strings.TrimSpace(message.Text)
+			if body == "" {
+				body = "(empty tool output)"
+			}
+			text = toolemulation.ActionOutputPrompt(message.ToolCallID, body)
 			role = "user"
+		}
+		// A completed assistant tool call usually has no Text at all, so the
+		// call list alone keeps the message alive.
+		if text == "" && len(message.ToolCalls) == 0 {
+			continue
 		}
 		if role != "user" && role != "assistant" {
 			continue
 		}
-		out = append(out, ChatMessage{Role: role, Text: text})
+		out = append(out, ChatMessage{Role: role, Text: text, ToolCalls: message.ToolCalls, ToolCallID: message.ToolCallID})
 	}
 	return out
+}
+
+// renderHistoryActionBlock replays one completed assistant tool call in the
+// action-block dialect the tooling prompt itself teaches, so the model sees
+// its own past turns the way it produced them. The call id and the
+// already-executed marker sit outside the fenced JSON: the parser's dialect
+// stays {tool, parameters} only, so an echoed block can never smuggle the id
+// into tool arguments. History replay only: arguments are serialized
+// verbatim, never re-derived or deduplicated -- a client's intentional repeat
+// call keeps its own block and id.
+func renderHistoryActionBlock(call toolemulation.ToolCall) string {
+	args := call.Arguments
+	if args == nil {
+		args = map[string]any{}
+	}
+	block := map[string]any{
+		"tool":       call.Name,
+		"parameters": args,
+	}
+	b, err := json.Marshal(block)
+	if err != nil {
+		return ""
+	}
+	header := ""
+	if id := strings.TrimSpace(call.ID); id != "" {
+		header = "Completed tool call " + id + " (already executed, its result follows below; do not repeat or re-run it):\n"
+	}
+	return header + "```json action\n" + string(b) + "\n```"
+}
+
+// transcriptText renders one history message for the Lingma prompt: an
+// assistant turn that made calls carries them as action blocks after any
+// prose, mirroring what the model itself would have emitted.
+func transcriptText(message ChatMessage) string {
+	if len(message.ToolCalls) == 0 {
+		return message.Text
+	}
+	blocks := make([]string, 0, len(message.ToolCalls))
+	for _, call := range message.ToolCalls {
+		if block := renderHistoryActionBlock(call); block != "" {
+			blocks = append(blocks, block)
+		}
+	}
+	joined := strings.Join(blocks, "\n")
+	if message.Text == "" {
+		return joined
+	}
+	return message.Text + "\n\n" + joined
 }
 
 func reasoningSystemHint(effort string) string {

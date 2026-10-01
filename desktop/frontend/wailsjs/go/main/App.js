@@ -14,6 +14,10 @@ export function ClearRequests() {
   return window['go']['main']['App']['ClearRequests']();
 }
 
+export function ConsoleInfo() {
+  return window['go']['main']['App']['ConsoleInfo']();
+}
+
 export function ExportFeedbackBundle(arg1) {
   return window['go']['main']['App']['ExportFeedbackBundle'](arg1);
 }

@@ -1,8 +1,10 @@
 # Lingma Proxy
 
-[English](./README.md) | [简体中文](./README.zh-CN.md)
+[English](./README.md) | [简体中文](./README.zh-CN.md) | [📘 使用教程 USAGE.md](./USAGE.md)
 
 **Lingma Proxy** 是一个通义灵码 / QoderCN API 适配层。它可以通过默认推荐的远端 API 模式直接调用远端接口，也可以把 Lingma / QoderCN 本地私有 IPC / WebSocket 能力转换成标准 **OpenAI 兼容接口** 和 **Anthropic 兼容接口**，让 Claude Code、Hermes、CodeBuddy、Codex CLI、OpenCode、自研 Agent 等第三方客户端可以直接调用后端模型。
+
+> **新来的先看这里**：请从 **[USAGE.md](./USAGE.md)** 开始——它是照抄即用的完整教程，覆盖安装、Claude Code / Codex CLI / CodeBuddy / Hermes 及任意 OpenAI/Anthropic 兼容客户端的接入配置、端点与配置全表、工具调用、图片输入，以及排障症状表。本 README 是参考手册：架构、能力矩阵、模型元数据与发布流程。
 
 ## 模型可用性说明
 
@@ -321,8 +323,8 @@ Web console: http://127.0.0.1:10096/#token=<每台机器一次的令牌>
 | Anthropic Messages base64 image block | 已验证 | 通过 `/v1/messages` 实测，模型可以正确描述图片内容。 |
 | Claude Code 粘贴图片 | 已验证 | 已用 Claude Code 风格的 Anthropic 请求实测：长上下文、tools、base64 图片块和 Claude image-cache 路径标记同时存在时可用。 |
 | Claude Code 粘贴图片 + tools | 已验证 | 远端模式会先用 IPC 提取最新图片轮次的上下文，再回到 Remote API 原生工具调用。 |
-| QoderCN IPC 图片请求 | 已验证 | 代理现在会使用 QoderCN 原生的 `qodercn:///agent/file?path=...` 图片 URI，不再误用旧 Lingma URI；已用 `/Users/tiancheng/Pictures/ik2.jpg` 实测。 |
-| Hermes CLI `hermes chat --image` | 已验证 | 使用 `--provider custom --model kmodel --image /Users/tiancheng/Pictures/ik2.jpg` 实测；Hermes 会向 `/v1/chat/completions` 发送 OpenAI `image_url`，模型可以正确描述图片内容。 |
+| QoderCN IPC 图片请求 | 已验证 | 代理现在会使用 QoderCN 原生的 `qodercn:///agent/file?path=...` 图片 URI，不再误用旧 Lingma URI；已用 `/Users/yourname/Pictures/ik2.jpg` 实测。 |
+| Hermes CLI `hermes chat --image` | 已验证 | 使用 `--provider custom --model kmodel --image /Users/yourname/Pictures/ik2.jpg` 实测；Hermes 会向 `/v1/chat/completions` 发送 OpenAI `image_url`，模型可以正确描述图片内容。 |
 | OpenClaw `infer image describe --file` | 已验证 | 配置 `lingma-proxy/kmodel` 为 `text+image` 后实测；OpenClaw 会发送 OpenAI `image_url`，模型可以正确描述图片内容。 |
 | OpenClaw `agent` 图片标记 | 部分验证 | 图片文件进入 OpenClaw 每个 session 的 sandbox 后可用；直接引用 `/Users/.../Pictures/ik2.jpg` 会先被 OpenClaw 自己的沙盒拒绝，尚未作为图片请求进入代理。 |
 | 自研 Agent 使用标准 OpenAI 或 Anthropic 图片请求 | 预期兼容 | 只要它们发出的请求是 OpenAI `image_url` 或 Anthropic base64 image block，就走同一条已验证链路；它们自己的微信网关、截图发送、文件投递属于客户端侧能力，不属于代理图片输入能力。 |
@@ -869,7 +871,7 @@ Codex CLI 在 **IPC 模式** 下的 thinking 展示结论，需要和“协议�
 ```bash
 export OPENAI_API_KEY="any"
 codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --json \
-  --image /Users/tiancheng/Pictures/ik2.jpg \
+  --image /Users/yourname/Pictures/ik2.jpg \
   -- '先用一句话描述这张图片的氛围，再运行 pwd，并只返回命令结果。'
 ```
 
@@ -944,7 +946,7 @@ codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox --js
     "dashscope_qwen_max_latest",
     "dashscope_qwen_plus_20250428_thinking"
   ],
-  "cwd": "/Users/tiancheng/project",
+  "cwd": "/Users/yourname/project",
   "current_file_path": ""
 }
 ```
@@ -1161,7 +1163,7 @@ Release workflow 会执行：
 可以直接作为下一个主线 tag 的 GitHub Release 正文草稿使用：
 
 - 修复 QoderCN IPC 图片输入：连接 QoderCN 时使用原生 `qodercn:///agent/file?path=...` URI，同时保留旧 Lingma 运行时的 `lingma:///...` 兼容。
-- 已用 `/Users/tiancheng/Pictures/ik2.jpg` 验证 QoderCN IPC 图片链路；模型可以正确描述海边礁石和海浪，QoderCN 日志显示 `image detect success` / `upload image success`，不再出现 `invalid uri`。
+- 已用 `/Users/yourname/Pictures/ik2.jpg` 验证 QoderCN IPC 图片链路；模型可以正确描述海边礁石和海浪，QoderCN 日志显示 `image detect success` / `upload image success`，不再出现 `invalid uri`。
 - 正式 Release 桌面包和本地构建包都保留 WebView Inspector，右键 `Inspect Element` 可用于排查安装包里的 UI 样式和运行时问题。
 - 继续保留标准发版闸门：版本同步、release notes 检查、Go 测试、前端构建和本地桌面重建后再打 tag。
 

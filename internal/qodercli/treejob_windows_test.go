@@ -3,7 +3,11 @@
 package qodercli
 
 import (
+	"log"
+	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -11,21 +15,24 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// stillActive is Win32 STILL_ACTIVE, what GetExitCodeProcess reports for a
-// process that has not exited; x/sys/windows does not export it.
-const stillActive = 259
-
+// pidAlive reports whether a process is still running. It asks the kernel for a
+// signalled handle rather than trusting the exit code: per the TerminateProcess
+// documentation a process that has been asked to die can still report
+// STILL_ACTIVE for a while, and the observation this file exists to make is
+// "the tree is gone", which only a signalled handle proves. The same reasoning,
+// and the same API, as assertProcessTreeExited in cancel_tree_windows_test.go.
 func pidAlive(pid uint32) bool {
-	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.SYNCHRONIZE, false, pid)
 	if err != nil {
 		return false
 	}
 	defer windows.CloseHandle(h)
-	var code uint32
-	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+	// Zero timeout: the question is the state right now, not whether it changes.
+	event, err := windows.WaitForSingleObject(h, 0)
+	if err != nil {
 		return false
 	}
-	return code == stillActive
+	return event != uint32(windows.WAIT_OBJECT_0)
 }
 
 // childPIDs lists live processes whose parent is pid, so an escaped grandchild is
@@ -100,4 +107,35 @@ func anyAlive(pids []uint32) bool {
 		}
 	}
 	return false
+}
+
+// TestTreeGuardCreationFailureIsReported is the only signal a guard that does not
+// exist leaves behind. A job object that cannot be created means every turn from
+// here on kills the direct child only -- the exact wedge this guard exists to
+// prevent -- and assign swallows its errors on purpose, so nothing else says so.
+// The Windows code is in the line because a quota exhaustion and a permission
+// denial are different problems on different boxes.
+func TestTreeGuardCreationFailureIsReported(t *testing.T) {
+	prev := createTreeJob
+	createTreeJob = func() (windows.Handle, error) { return 0, windows.ERROR_NOT_ENOUGH_QUOTA }
+	t.Cleanup(func() { createTreeJob = prev })
+
+	logged := &syncedLogBuffer{}
+	log.SetOutput(logged)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	guard := newTreeGuard()
+	if guard != nil {
+		t.Fatal("a guard without a job handle must not be handed back")
+	}
+	msg := logged.String()
+	if !strings.Contains(msg, "tree guard") || !strings.Contains(msg, "create") {
+		t.Fatalf("the failure was not reported: %q", msg)
+	}
+	if !strings.Contains(msg, strconv.FormatUint(uint64(windows.ERROR_NOT_ENOUGH_QUOTA), 10)) {
+		t.Fatalf("the log carries no Windows error code, so the cause is guesswork: %q", msg)
+	}
+	if !strings.Contains(msg, "direct child") {
+		t.Fatalf("the log does not say what the degradation costs: %q", msg)
+	}
 }

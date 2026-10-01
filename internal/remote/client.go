@@ -33,6 +33,18 @@ const (
 
 var remoteBaseURLPattern = regexp.MustCompile(`https?://[^\s"'<>),\]}]+`)
 
+// maxModelListResponseBytes caps one model-list response. The endpoint is a probed
+// candidate (see listModelsWithAutoBaseURLFallback), so its body is untrusted input:
+// a misbehaving or spoofed host must not be able to grow the heap without limit.
+// 4 MB is orders of magnitude above any real catalog (a few hundred models of
+// id/name pairs) and matches the ceiling the image path already applies.
+const maxModelListResponseBytes = 4 << 20
+
+// maxChatErrorResponseBytes caps the error body read off a failed chat turn. Only
+// the first 1000 runes of it ever reach a message, so 64 KB is far more than the
+// diagnostic can use; the rest was previously buffered only to be dropped.
+const maxChatErrorResponseBytes = 64 << 10
+
 type Config struct {
 	BaseURL     string
 	AuthFile    string
@@ -421,9 +433,21 @@ func (c *Client) listModelsFrom(ctx context.Context, baseURL string) ([]Model, e
 		return nil, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, maxModelListResponseBytes+1))
+	if readErr != nil {
+		return nil, readErr
+	}
+	// The cap is checked after the status branch on purpose. A 4xx/5xx body only
+	// ever contributes 500 characters of message plus a NoSuchKey substring scan,
+	// and it is the status that decides whether this is retryable; rejecting an
+	// over-cap error body outright would downgrade a retryable gateway overload
+	// into a permanent failure.
 	if resp.StatusCode >= 400 {
 		return nil, c.modelListStatusError(baseURL, resp.StatusCode, string(body))
+	}
+	if len(body) > maxModelListResponseBytes {
+		return nil, fmt.Errorf("remote model list from %s is over the %d byte cap; refusing to buffer it",
+			baseURL, maxModelListResponseBytes)
 	}
 	var payload struct {
 		Chat   []Model `json:"chat"`
@@ -505,7 +529,10 @@ func (c *Client) Chat(ctx context.Context, request ChatRequest, onDelta func(str
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		respBody, _ := io.ReadAll(resp.Body)
+		// The read error is deliberately dropped, as before: only the first 1000
+		// runes of this body reach the message, and a read that dies mid-body still
+		// has to report the status rather than the transport hiccup.
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, maxChatErrorResponseBytes+1))
 		message := fmt.Sprintf("remote chat status %d: %s", resp.StatusCode, truncate(string(respBody), 1000))
 		// 401/403 deliberately stay hard failures: retrying a rejected credential
 		// cannot clear it, and answering 503 would make clients hammer a dead login.

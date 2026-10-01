@@ -66,7 +66,7 @@ type Client struct {
 	nextSubID  atomic.Int64
 	closeOnce  sync.Once
 	closed     chan struct{}
-	closeErr   atomic.Value
+	closeErr   atomic.Value // holds a closeErrBox, never a bare error
 	responseMu sync.Mutex
 	// dropped counts notification frames no subscriber could take, see broadcast.
 	dropped atomic.Int64
@@ -219,13 +219,13 @@ func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.closed)
 		if err := c.transport.Close(); err != nil {
-			c.closeErr.Store(err)
+			c.recordCloseError(err)
 		}
 		c.failPending(io.EOF)
 		c.closeAllSubs()
 	})
-	if v := c.closeErr.Load(); v != nil {
-		return v.(error)
+	if err := c.loadCloseError(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -256,14 +256,14 @@ func (c *Client) readLoop() {
 		body, err := c.transport.ReadFrame()
 		if err != nil {
 			if !errors.Is(err, io.EOF) {
-				c.closeErr.Store(err)
+				c.recordCloseError(err)
 			}
 			return
 		}
 
 		var envelope responseEnvelope
 		if err := json.Unmarshal(body, &envelope); err != nil {
-			c.closeErr.Store(fmt.Errorf("decode IPC frame: %w", err))
+			c.recordCloseError(fmt.Errorf("decode IPC frame: %w", err))
 			return
 		}
 
@@ -347,10 +347,44 @@ func (c *Client) closeAllSubs() {
 }
 
 func (c *Client) closeError() error {
-	if v := c.closeErr.Load(); v != nil {
-		return v.(error)
+	if err := c.loadCloseError(); err != nil {
+		return err
 	}
 	return io.EOF
+}
+
+// closeErrBox is the single concrete type stored in Client.closeErr.
+//
+// The three write paths hand over errors from three unrelated chains: a
+// transport read error (*errors.errorString, *net.OpError, *os.SyscallError,
+// *websocket.CloseError ...), a decode wrapper (*fmt.wrapError) and the
+// transport's own close error. atomic.Value panics outright when a later Store
+// carries a different concrete type than the first, and one dropped connection
+// produces two writes -- readLoop records the read error, then its deferred
+// Close records the transport's -- so a single IPC fault could panic the
+// readLoop goroutine and take the whole proxy with it. Boxing keeps one type in
+// the value while the error it carries stays untouched for errors.Is/As.
+type closeErrBox struct{ err error }
+
+// recordCloseError stores the most recent non-nil close error, keeping the
+// last-store-wins behaviour the field had before it was boxed.
+func (c *Client) recordCloseError(err error) {
+	if err == nil {
+		return
+	}
+	c.closeErr.Store(closeErrBox{err: err})
+}
+
+func (c *Client) loadCloseError() error {
+	v := c.closeErr.Load()
+	if v == nil {
+		return nil
+	}
+	box, ok := v.(closeErrBox)
+	if !ok {
+		return nil
+	}
+	return box.err
 }
 
 func valueOr(value string, fallback string) string {
