@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -253,8 +254,8 @@ func TestReuseTurnTimeoutReclaimsTheSession(t *testing.T) {
 	if err == nil {
 		t.Fatal("a stalled reuse turn must not answer")
 	}
-	if text := err.Error(); !strings.Contains(text, "timed out") && !strings.Contains(text, "remained incomplete") {
-		t.Fatalf("unexpected error: %v", err)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want the turn deadline (response incomplete before finish)", err)
 	}
 	if got := peer.deletedSessions(); len(got) != 1 || got[0] != peer.session {
 		t.Fatalf("orphaned turn left %v on the plug-in, want exactly [%s]", got, peer.session)
@@ -336,17 +337,20 @@ func TestToolEmulationRetryDoesNotRestreamTheFirstAttempt(t *testing.T) {
 	}
 }
 
-// A retry that answers without a tool call leaves the first attempt as the
-// turn's answer; holding it was only ever temporary, so the held prose must be
-// released verbatim once the verdict is in.
-func TestToolEmulationFailedRetryReleasesFirstAttemptProse(t *testing.T) {
+// 1005 B-1: tool_choice "any"/"required" that survives the forced-tooling
+// retry with zero calls is an explicit error, not a successful call-free turn.
+// The refused retry never streams (it is called with a nil onDelta), while the
+// hold's deferred release still hands the first attempt's prose to the client
+// exactly once on this error path.
+func TestToolEmulationFailedRetryRefusesCallFreeTurn(t *testing.T) {
 	peer := startPeer(t)
 	const prose = "我先看看项目结构。"
+	const retryProse = "抱歉，当前环境没有可用的工具。"
 	peer.onPrompt = func(p *ipcPeer, requestID string, attempt int) {
 		if attempt == 1 {
 			p.chunk(requestID, prose)
 		} else {
-			p.chunk(requestID, "抱歉，当前环境没有可用的工具。")
+			p.chunk(requestID, retryProse)
 		}
 		p.finish(requestID)
 	}
@@ -363,22 +367,25 @@ func TestToolEmulationFailedRetryReleasesFirstAttemptProse(t *testing.T) {
 	req.ToolChoice = toolemulation.ToolChoice{Mode: "any"}
 
 	var streamed strings.Builder
-	result, err := svc.generateWithReconnect(context.Background(), req, func(event StreamEvent) {
+	_, err := svc.generateWithReconnect(context.Background(), req, func(event StreamEvent) {
 		if event.Type == StreamEventText {
 			streamed.WriteString(event.Delta)
 		}
 	})
-	if err != nil {
-		t.Fatalf("generate failed: %v", err)
+	if err == nil {
+		t.Fatal("a call-free turn under tool_choice=any must fail, not answer")
+	}
+	if !strings.Contains(err.Error(), "no tool call was returned") {
+		t.Fatalf("error = %v, want the forced-tooling contract refusal", err)
 	}
 	if len(peer.promptTexts()) != 2 {
 		t.Fatalf("prompts = %d, want the answer plus the forced-tooling retry", len(peer.promptTexts()))
 	}
-	if len(result.ToolCalls) != 0 {
-		t.Fatalf("result calls = %+v, want none from a retry that produced none", result.ToolCalls)
-	}
 	if got := streamed.String(); got != prose {
-		t.Fatalf("streamed %q, want the surviving first attempt released verbatim", got)
+		t.Fatalf("streamed %q, want the released first attempt verbatim exactly once", got)
+	}
+	if strings.Contains(streamed.String(), retryProse) {
+		t.Fatalf("streamed the refused retry's prose: %q", streamed.String())
 	}
 }
 

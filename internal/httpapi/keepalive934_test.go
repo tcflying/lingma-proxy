@@ -224,19 +224,23 @@ func TestKeepalive934AnthropicPingEventDuringSilence(t *testing.T) {
 		t.Fatalf("terminal frame never arrived: %s", streamed)
 	}
 
-	// Silent-free reference turn: same request, hang released, no heartbeat.
+	// Reference turn: same request, hang released. It can still beat under load
+	// before its first frame, so pings are stripped from both sides; the
+	// fast-turn no-heartbeat contract is pinned separately at the production
+	// interval (TestKeepalive933FastStreamsSendNoComments).
 	ref := keepalive934Post(t, proxy.URL+"/v1/messages", keepalive933AnthropicBody(t))
-	if strings.Contains(ref, "event: ping") {
-		t.Fatalf("silent-free turn pinged: %s", ref)
-	}
 	stripped := strings.ReplaceAll(streamed, keepalive934PingFrame, "")
-	if got, want := keepalive933Normalize(stripped), keepalive933Normalize(ref); got != want {
+	refStripped := strings.ReplaceAll(ref, keepalive934PingFrame, "")
+	if got, want := keepalive933Normalize(stripped), keepalive933Normalize(refStripped); got != want {
 		t.Fatalf("beat turn drifted from the silent-free turn:\ngot:  %q\nwant: %q", got, want)
 	}
 
-	// Official accumulator shape: pings in the stream change no snapshot.
+	// Official accumulator shape: the heartbeat turn's snapshot is accumulated
+	// from the UNSTRIPPED stream, so the ping frames must leave it unchanged --
+	// the assertion stripping both sides would delete. Only the reference turn
+	// is stripped, because it may beat under load before its first frame.
 	withSnap := keepalive934AccumulateAnthropic(keepalive934ParseFrames(streamed))
-	refSnap := keepalive934AccumulateAnthropic(keepalive934ParseFrames(ref))
+	refSnap := keepalive934AccumulateAnthropic(keepalive934ParseFrames(refStripped))
 	if !reflect.DeepEqual(withSnap, refSnap) {
 		t.Fatalf("accumulator snapshot with pings %+v != without %+v", withSnap, refSnap)
 	}
@@ -320,17 +324,18 @@ func TestKeepalive934ResponsesResendsInProgressDuringSilence(t *testing.T) {
 		t.Fatalf("no in_progress beats counted: %s", streamed)
 	}
 
+	// Reference turn: same request, hang released. Under load it can still emit
+	// a beat before its first frame, so beats are stripped from both sides; the
+	// silent reference is compared on what a client would parse without them.
 	ref := keepalive934Post(t, proxy.URL+"/v1/responses", keepalive933ResponsesBody(t))
-	if strings.Contains(ref, "event: response.in_progress") {
-		t.Fatalf("silent-free turn re-sent in_progress: %s", ref)
-	}
 	stripped := keepalive934InProgressFrame.ReplaceAllString(streamed, "")
-	if got, want := keepalive933Normalize(stripped), keepalive933Normalize(ref); got != want {
+	refStripped := keepalive934InProgressFrame.ReplaceAllString(ref, "")
+	if got, want := keepalive933Normalize(stripped), keepalive933Normalize(refStripped); got != want {
 		t.Fatalf("beat turn drifted from the silent-free turn:\ngot:  %q\nwant: %q", got, want)
 	}
 
 	withSnap := keepalive934AccumulateResponses(frames)
-	refSnap := keepalive934AccumulateResponses(keepalive934ParseFrames(ref))
+	refSnap := keepalive934AccumulateResponses(keepalive934ParseFrames(refStripped))
 	if !reflect.DeepEqual(withSnap, refSnap) {
 		t.Fatalf("accumulator snapshot with beats %+v != without %+v", withSnap, refSnap)
 	}

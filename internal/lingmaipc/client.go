@@ -190,6 +190,13 @@ func (c *Client) Subscribe() (<-chan Notification, func()) {
 	id := int(c.nextSubID.Add(1))
 	ch := make(chan Notification, 2048)
 	c.subsMu.Lock()
+	select {
+	case <-c.closed:
+		close(ch)
+		c.subsMu.Unlock()
+		return ch, func() {}
+	default:
+	}
 	c.subs[id] = ch
 	c.subsMu.Unlock()
 

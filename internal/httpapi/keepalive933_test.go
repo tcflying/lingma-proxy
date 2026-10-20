@@ -215,9 +215,10 @@ func keepalive933RunHeartbeatTurn(t *testing.T, path string, requestBody []byte,
 	}
 
 	// Reference turn with the hang long released: identical request, no
-	// silence, so no heartbeat. Stripping the beat frames from the heartbeat
-	// turn must leave the two byte-identical — nothing reordered, duplicated
-	// or torn by the concurrent heartbeat writes.
+	// silence. Under load even this turn can outrun the 40ms interval before
+	// its first frame, so beats are stripped from both sides; what the
+	// comparison pins is that nothing was reordered, duplicated or torn by
+	// the concurrent heartbeat writes.
 	refResp, err := http.Post(proxy.URL+path, "application/json", bytes.NewReader(requestBody))
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +229,8 @@ func keepalive933RunHeartbeatTurn(t *testing.T, path string, requestBody []byte,
 		t.Fatal(err)
 	}
 	stripped := beat.strip(streamed)
-	if got, want := keepalive933Normalize(stripped), keepalive933Normalize(string(refRaw)); got != want {
+	refStripped := beat.strip(string(refRaw))
+	if got, want := keepalive933Normalize(stripped), keepalive933Normalize(refStripped); got != want {
 		t.Fatalf("heartbeat turn drifted from the silence-free turn:\ngot:  %q\nwant: %q", got, want)
 	}
 	if n := upstreamCalls.Load(); n != 2 {

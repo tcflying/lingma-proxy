@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -58,6 +59,22 @@ const cliResultTeardownGrace = 5 * time.Second
 // wedge diagnostics, nothing more: a kill that reached the child is over before
 // this threshold, so a wait past it means the kill did not reach.
 const cliReaperSlowLogDelay = 10 * time.Second
+
+// cliListingIdleGrace is how long --list-models may stay silent after a line
+// before its output is taken as complete. The CLI prints the whole listing up
+// front and then only lingers in shutdown, so silence this long after the last
+// line means there is nothing more to read.
+const cliListingIdleGrace = 2 * time.Second
+
+// cliWaitAbandonDelay bounds cmd.Wait for a turn that never answered: an orphan
+// descendant holding stdout can park it forever, and the caller needs an error
+// it can act on rather than a request that never returns.
+const cliWaitAbandonDelay = 10 * time.Second
+
+// errWaitAbandoned marks a cmd.Wait that outlived cliWaitAbandonDelay. The wait
+// goroutine cannot be stopped, so the caller kills the child and lets the
+// deferred guard release end it.
+var errWaitAbandoned = errors.New("cmd.Wait did not return")
 
 // maxCLIOutputLineBytes caps a single JSONL frame: the terminal result frame
 // carries the whole answer, and 8 MB is far above any measured turn. A var so the
@@ -138,7 +155,7 @@ func (c *Client) credential(ctx context.Context) (string, error) {
 // ListModels returns the models the signed-in account can use. The CLI prints
 // display names, which are also what --model accepts.
 func (c *Client) ListModels(ctx context.Context) ([]remote.Model, error) {
-	stdout, err := c.run(ctx, "--list-models")
+	stdout, err := c.runWithStdinData(ctx, nil, nil, cliListingIdleGrace, "--list-models")
 	if err != nil {
 		// A discovery that dies mid-probe is the failure this file keeps chasing,
 		// and whatever the child did manage to print is the only clue about why.
@@ -176,7 +193,10 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
 		"--permission-mode", "bypass_permissions",
-		"--max-turns", "1",
+		// Lazy MCP loading is stripped from the child env, but the CLI's own
+		// settings can still surface the mcp_* meta-tools under --tools ""; turn 1
+		// may be spent discovering them, so turn 2 is the answering safety net.
+		"--max-turns", "2",
 		"--strict-mcp-config",
 		"--mcp-config", `{"mcpServers":{}}`,
 	}
@@ -227,7 +247,10 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 		}
 	}
 
-	stdout, runErr := c.runWithStdinData(ctx, frame, onLine, args...)
+	stdout, runErr := c.runWithStdinData(ctx, frame, onLine, 0, args...)
+	// flagFallback marks the one rerun the partial-stream refusal already spent:
+	// the max-turns retry below must not stack a second one on that path.
+	flagFallback := false
 	if runErr != nil && partial && !streamed && strings.Contains(runErr.Error(), "include-partial-messages") {
 		if c.partialStreamUnsupported.CompareAndSwap(false, true) {
 			// One line, naming the site: without it a degraded stream looks like a
@@ -237,9 +260,20 @@ func (c *Client) Chat(ctx context.Context, request remote.ChatRequest, onDelta f
 		// args ends with "--tools", "" so dropping the last element would orphan
 		// --tools and keep the flag the CLI just rejected.
 		args = withoutArg(args, "--include-partial-messages")
-		stdout, runErr = c.runWithStdinData(ctx, frame, nil, args...)
+		flagFallback = true
+		stdout, runErr = c.runWithStdinData(ctx, frame, nil, 0, args...)
 	}
 	result, sawResult, parseErr := parseResult(stdout, request.Model, c.label(), c.loc.Site.Normalized())
+	// The intl gateway intermittently ends a max-turns turn with the CLI's
+	// own max-turns result error before producing any answer (measured 1/6 on
+	// intl/DeepSeek-Flash tool turns, 15-50s each; the next identical run
+	// succeeded). That shape has no text on the wire, so one identical rerun is
+	// safe. Never retried when a delta already streamed, or more than once.
+	if !flagFallback && maxTurnsFlake(parseErr) && !streamed && ctx.Err() == nil {
+		log.Printf("qodercli: %s CLI reported its max-turns limit before answering; retrying the same turn once", c.label())
+		stdout, runErr = c.runWithStdinData(ctx, frame, onLine, 0, args...)
+		result, sawResult, parseErr = parseResult(stdout, request.Model, c.label(), c.loc.Site.Normalized())
+	}
 	if !streamed && result != nil && onDelta != nil && parseErr == nil {
 		onDelta(result.Text)
 	}
@@ -267,7 +301,7 @@ func (c *Client) Warmup(ctx context.Context) error {
 }
 
 func (c *Client) run(ctx context.Context, args ...string) (string, error) {
-	return c.runWithStdinData(ctx, nil, nil, args...)
+	return c.runWithStdinData(ctx, nil, nil, 0, args...)
 }
 
 // userFrame builds the stream-json user turn. Images ride along as Anthropic
@@ -352,12 +386,18 @@ func partialTextDelta(line string) (string, bool) {
 // tailWriter keeps the newest limit bytes and drops the rest. The cause of a CLI
 // failure is in what it printed last, and the volume that pushed it past a cap is
 // the volume nobody reads, so a head cut is the wrong one to make.
+//
+// The mutex matters on the abandoned-wait path: exec's stderr copy goroutine can
+// still be writing when the error message reads the tail.
 type tailWriter struct {
+	mu    sync.Mutex
 	limit int
 	buf   []byte
 }
 
 func (w *tailWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	w.buf = append(w.buf, p...)
 	// Trim on a band rather than on every write past the cap: dropping the head
 	// copies the retained window, and a loop writing 4 KB at a time would pay
@@ -368,7 +408,11 @@ func (w *tailWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (w *tailWriter) String() string { return string(w.buf) }
+func (w *tailWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(w.buf)
+}
 
 // capturedOutput is one turn's stdout. The scan loop appends whole lines to it;
 // in the rare StdoutPipe fallback the process writes into it directly, and then
@@ -379,6 +423,9 @@ func (w *tailWriter) String() string { return string(w.buf) }
 // io.Copy prefers over Write, and the fallback capture would fill the buffer it
 // was built to avoid while reporting itself empty.
 type capturedOutput struct {
+	// mu guards buf/tail: after an abandoned cmd.Wait, exec's copy goroutine can
+	// still be writing into the fallback capture while the result is read.
+	mu   sync.Mutex
 	buf  bytes.Buffer
 	tail *tailWriter
 }
@@ -386,6 +433,8 @@ type capturedOutput struct {
 func (o *capturedOutput) capAt(limit int) { o.tail = &tailWriter{limit: limit} }
 
 func (o *capturedOutput) Write(p []byte) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.tail != nil {
 		return o.tail.Write(p)
 	}
@@ -393,6 +442,8 @@ func (o *capturedOutput) Write(p []byte) (int, error) {
 }
 
 func (o *capturedOutput) WriteString(s string) (int, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.tail != nil {
 		return o.tail.Write([]byte(s))
 	}
@@ -400,6 +451,8 @@ func (o *capturedOutput) WriteString(s string) (int, error) {
 }
 
 func (o *capturedOutput) WriteByte(b byte) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.tail != nil {
 		_, err := o.tail.Write([]byte{b})
 		return err
@@ -407,9 +460,15 @@ func (o *capturedOutput) WriteByte(b byte) error {
 	return o.buf.WriteByte(b)
 }
 
-func (o *capturedOutput) Len() int { return o.buf.Len() }
+func (o *capturedOutput) Len() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.buf.Len()
+}
 
 func (o *capturedOutput) String() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	if o.tail != nil {
 		return o.tail.String()
 	}
@@ -420,7 +479,37 @@ func (o *capturedOutput) String() string {
 // fails when the OS refuses one more pipe, which a test cannot ask this box for.
 var openStdoutPipe = func(cmd *exec.Cmd) (io.ReadCloser, error) { return cmd.StdoutPipe() }
 
-func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func(string), args ...string) (string, error) {
+// killDirectProcess kills the direct child and makes a failure visible: the error
+// used to be discarded, which is how a kill Windows refused stayed invisible while
+// the turn sat in cmd.Wait.
+func killDirectProcess(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	err := cmd.Process.Kill()
+	if err != nil && !errors.Is(err, os.ErrProcessDone) {
+		log.Printf("qodercli: CLI process %d could not be killed: %v", cmd.Process.Pid, err)
+	}
+	return err
+}
+
+// waitWithTimeout bounds a blocking wait. A timed-out goroutine cannot be stopped;
+// the caller kills the child right after, which is what lets it finish.
+func waitWithTimeout(timeout time.Duration, wait func() error) error {
+	done := make(chan error, 1)
+	go func() { done <- wait() }()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("%w within %s", errWaitAbandoned, timeout)
+	}
+}
+
+// runWithStdinData runs one CLI invocation. idle > 0 ends a call whose output has
+// stopped growing even though the process (or a descendant holding its stdout)
+// is still alive; 0 disables it.
+func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func(string), idle time.Duration, args ...string) (string, error) {
 	credential, err := c.credential(ctx)
 	if err != nil {
 		return "", fmt.Errorf("%s 登录态不可用：%w", c.label(), err)
@@ -453,9 +542,11 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	cmd.Cancel = func() error {
 		// Kill the tree, not just the child: exec only reaps the process it started,
 		// and a descendant that inherited the stdout write end is exactly what keeps
-		// the scan below parked past its deadline.
+		// the scan below parked past its deadline. The child goes first so its kill
+		// cannot fail just because the guard already terminated it.
+		killErr := killDirectProcess(cmd)
 		guard.release()
-		return cmd.Process.Kill()
+		return killErr
 	}
 	// The guard covers descendants that were alive when it was released, not ones
 	// the CLI forks on its way out: measured on 192.168.50.239 the CN CLI logged
@@ -474,6 +565,28 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 	var teardown *time.Timer
 	// answered marks that the scan stopped because the CLI's terminal frame arrived.
 	var answered bool
+	// The idle path ends a call whose output stopped growing: the process (or an
+	// orphan descendant holding stdout) may linger long after the last line. The
+	// counters keep a timer that fired against a line that had just arrived from
+	// killing a CLI that was still talking.
+	var (
+		idleDone  atomic.Bool
+		idleLines atomic.Uint64
+		idleArmed atomic.Uint64
+		idleTimer *time.Timer
+	)
+	idleFire := func() {
+		if idleLines.Load() != idleArmed.Load() {
+			return
+		}
+		if !idleDone.CompareAndSwap(false, true) {
+			return
+		}
+		// The child goes first so its kill cannot fail just because the guard
+		// already terminated it; release then takes the descendants.
+		_ = killDirectProcess(cmd)
+		guard.release()
+	}
 	if stdin == nil {
 		cmd.Stdin = strings.NewReader("")
 	} else {
@@ -528,6 +641,23 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 			if onLine != nil {
 				onLine(line)
 			}
+			if idle > 0 {
+				lines := idleLines.Add(1)
+				switch {
+				case idleTimer != nil:
+					// Reset before publishing the new count: a timer that fired
+					// against the previous line then sees the counter move and stays
+					// its hand, and Reset queues the next check regardless.
+					idleTimer.Reset(idle)
+					idleArmed.Store(lines)
+				case !strings.HasPrefix(strings.TrimSpace(line), "{"):
+					// Only plain listing text arms the shortcut. A JSON event frame
+					// means this child is streaming a turn, where silence is thinking,
+					// so the caller's deadline stays in charge.
+					idleArmed.Store(lines)
+					idleTimer = time.AfterFunc(idle, idleFire)
+				}
+			}
 			// The CLI's own terminal frame means the answer is complete. Keep reading
 			// and this loop parks on the *next* line forever: the write end is still
 			// held by whatever the install left behind, so neither cmd.Wait() nor its
@@ -547,15 +677,20 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 					// put in another job cannot be assigned here, so the guard may
 					// hold nothing and only the direct child dies.
 					guard.release()
-					_ = cmd.Process.Kill()
+					_ = killDirectProcess(cmd)
 				})
 				break
 			}
 		}
+		if idleTimer != nil {
+			idleTimer.Stop()
+		}
 		if err := scanner.Err(); err != nil && scanErr == nil {
 			scanErr = err
 		}
-		if scanErr != nil {
+		// A read error after an idle kill is the kill's own noise (a closed pipe),
+		// not a failed turn: the listing that was read is the answer.
+		if scanErr != nil && !idleDone.Load() {
 			// A single line past the buffer cap stops the scan while the CLI is
 			// still writing. Left unread, the 64 KB pipe fills and cmd.Wait parks
 			// until the deadline, turning an answer that already arrived into a
@@ -572,21 +707,22 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 			// answer arrived, then one huge line followed" into a failed turn.
 			if c.timeout == 0 {
 				guard.release()
-				_ = cmd.Process.Kill()
+				_ = killDirectProcess(cmd)
 			}
 			_, _ = io.Copy(io.Discard, pipe)
 		}
 	}
 	var waitErr error
 	if startErr == nil {
-		if answered {
+		if answered || idleDone.Load() {
 			// Stopping the read is not enough: cmd.Wait() would then block on the
-			// process leaving instead, and an answered CLI that lingers for minutes
-			// is exactly the shape this box has. Reap it in the background. What takes
-			// the process down is the deferred guard.release() on the way out of this
-			// function, not the teardown timer -- with a healthy job object the handle
-			// closes the moment this returns, and the timer only ever fires for a tree
-			// the guard could not cover. The timer is deliberately left to run out.
+			// process leaving instead, and an answered (or idle) CLI that lingers for
+			// minutes is exactly the shape this box has. Reap it in the background.
+			// What takes the process down is the deferred guard.release() on the way
+			// out of this function, not the teardown timer -- with a healthy job
+			// object the handle closes the moment this returns, and the timer only
+			// ever fires for a tree the guard could not cover. The timer is
+			// deliberately left to run out.
 			go func() {
 				// Diagnostics only, and quiet in the normal case: a kill already
 				// happened before this goroutine started, so a Wait that takes this
@@ -601,7 +737,14 @@ func (c *Client) runWithStdinData(ctx context.Context, stdin []byte, onLine func
 			}()
 			return stdout.String(), nil
 		}
-		waitErr = cmd.Wait()
+		waitErr = waitWithTimeout(cliWaitAbandonDelay, cmd.Wait)
+		if errors.Is(waitErr, errWaitAbandoned) {
+			// The child is still there; the deferred guard.release takes the tree down
+			// on the way out, which also lets the wait goroutine finish. The stderr
+			// copy goroutine may still be writing, hence tailWriter's lock.
+			return stdout.String(), fmt.Errorf("%s CLI was abandoned after %s of waiting for it to exit (%s)",
+				c.label(), cliWaitAbandonDelay, cancelledChildNote(stdout.Len(), stderr.String()))
+		}
 		if teardown != nil {
 			teardown.Stop()
 		}
@@ -696,6 +839,10 @@ func (c *Client) environment(credential string) []string {
 			strings.HasPrefix(entry, "QODER_WORKER_"),
 			strings.HasPrefix(entry, "ELECTRON_RUN_AS_NODE="),
 			strings.HasPrefix(entry, "NODE_OPTIONS="),
+			// Lazy MCP loading exposes mcp_list/mcp_get/mcp_call native meta-tools
+			// that derail the action-block protocol; the proxy config already
+			// pins MCP servers to none.
+			strings.HasPrefix(entry, "QODER_MCP_LAZY="),
 			strings.HasPrefix(entry, c.loc.EnvPrefix+"JOB_TOKEN="):
 			continue
 		default:
@@ -866,6 +1013,19 @@ func (e *cliError) Error() string {
 		label = SiteCN.Label()
 	}
 	return label + " CLI error: " + e.text
+}
+
+// maxTurnsFlake recognizes the CLI's own max-turns result error, which the intl
+// gateway occasionally returns in place of an answer for an ordinary
+// max-turns turn. The code is checked too: the CLI has phrased this error
+// differently across releases.
+func maxTurnsFlake(err error) bool {
+	var cliErr *cliError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	text := strings.ToLower(cliErr.text)
+	return strings.Contains(text, "maximum number of turns") || strings.Contains(text, "47902")
 }
 
 func firstNonEmpty(values ...string) string {

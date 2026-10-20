@@ -37,6 +37,9 @@ ITERATION.md
 # Security-scan hook accounting (160k+ files, carries session ids)
 .mimosa/
 
+# Qoder local credits/usage artifacts
+.qoder-credits/
+
 # Runtime pid file written by the launcher
 proxy.pid
 

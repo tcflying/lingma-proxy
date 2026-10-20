@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -171,6 +172,11 @@ type Service struct {
 	cliClients      map[qodercli.Site]*qodercli.Client
 	cliModels       map[qodercli.Site][]string
 	cliCatalog      map[qodercli.Site]cliCatalogEntry
+	// cliFlights dedupes catalog discovery per site: the first caller owns the
+	// probe, late callers wait on the answer it publishes. Kept apart from mu so
+	// a flight never delays /health or the other site's probe.
+	cliFlightsMu sync.Mutex
+	cliFlights   map[qodercli.Site]*cliCatalogFlight
 	// cliProbeGate lets one catalog discovery run at a time. It is a gate, not a
 	// queue: a caller that finds it held does not wait, because the holder may be
 	// the startup warm-up, which is allowed the priming budget rather than the
@@ -550,6 +556,53 @@ type cliSiteListing struct {
 	err   error
 }
 
+// cliCatalogFlight is one catalog discovery shared by every caller that asked
+// for the same site while it ran. The owner publishes names/err and then closes
+// done; waiters read those fields only after the close, so no lock is needed on
+// them.
+type cliCatalogFlight struct {
+	done  chan struct{}
+	names []string
+	err   error
+}
+
+// cliCatalogWaiterGrace is the window in which a waiter whose deadline fired
+// still prefers the owner's answer if it lands at the same moment. A var so the
+// race test can widen it; production only needs enough to cover the closing of
+// done against the waiter's own deadline.
+var cliCatalogWaiterGrace = 50 * time.Millisecond
+
+// joinCLICatalogFlight returns the flight for site, creating it for the caller
+// that must run the probe. owner is true only for that caller.
+func (s *Service) joinCLICatalogFlight(site qodercli.Site) (*cliCatalogFlight, bool) {
+	key := site.Normalized()
+	s.cliFlightsMu.Lock()
+	defer s.cliFlightsMu.Unlock()
+	if flight, ok := s.cliFlights[key]; ok {
+		return flight, false
+	}
+	if s.cliFlights == nil {
+		s.cliFlights = map[qodercli.Site]*cliCatalogFlight{}
+	}
+	flight := &cliCatalogFlight{done: make(chan struct{})}
+	s.cliFlights[key] = flight
+	return flight, true
+}
+
+// finishCLICatalogFlight publishes the owner's answer and retires the entry so
+// the next discovery starts fresh instead of joining a finished one.
+func (s *Service) finishCLICatalogFlight(site qodercli.Site, flight *cliCatalogFlight) {
+	s.cliFlightsMu.Lock()
+	defer s.cliFlightsMu.Unlock()
+	close(flight.done)
+	delete(s.cliFlights, site.Normalized())
+}
+
+// cliListModels is the seam tests use to stand in for a real CLI probe.
+var cliListModels = func(c *qodercli.Client, ctx context.Context) ([]remote.Model, error) {
+	return c.ListModels(ctx)
+}
+
 // A probe is a CLI subprocess spawn: measured 3-17s per site. Listing every
 // site on every request therefore put /v1/models behind that variance, which is
 // what clients time out on. The catalogs change on the order of days, so the
@@ -753,11 +806,15 @@ func (s *Service) markCLIProbeFailed(site qodercli.Site) {
 // have an answer in hand to fall back on, so a held gate costs them nothing, while
 // a listing has nothing but the probe. Queueing it behind the warm-up's priming
 // budget would turn "a second discovery" into "no answer at all", which is worse
-// than the overlap. So the tradeoff is stated rather than papered over: a cold
-// catalog under N concurrent listings still starts N discoveries, one per site
-// each, and what bounds them is the per-site budget and the catalog TTL. A client
-// that needs this deduplicated needs a shared result, not a lock -- single-flight
-// keyed on the site, where a late caller reads the answer the first one published.
+// than the overlap.
+//
+// What stops the overlap is a shared result, not a lock: one cliCatalogFlight per
+// site, where the first caller owns the probe and a late caller waits on the
+// answer the owner publishes. The wait is bounded by the waiter's own budget, so
+// a client never inherits the warm-up's priming budget, and only the owner writes
+// the catalog or records a failure. The owner's probe is detached from its
+// caller's context (context.WithoutCancel), so a client that hangs up cannot fail
+// the callers still waiting on it.
 //
 // probeBudget raises the per-site bound above the client-facing ones; that is what
 // the warm-up pass passes so priming can win on a box where one probe costs more
@@ -797,13 +854,43 @@ func (s *Service) listCLIMergedModels(ctx context.Context, probeBudget time.Dura
 			if probeBudget > timeout {
 				timeout = probeBudget
 			}
-			probeCtx, cancel := context.WithTimeout(ctx, timeout)
+			flight, owner := s.joinCLICatalogFlight(site)
+			if !owner {
+				waitCtx, cancel := context.WithTimeout(ctx, timeout)
+				defer cancel()
+				accepted := func() {
+					names := flight.names
+					if flight.err != nil {
+						names = stale
+					}
+					listings[i] = cliSiteListing{names: names, err: flight.err}
+				}
+				select {
+				case <-flight.done:
+					accepted()
+				case <-waitCtx.Done():
+					// done and the deadline can become ready together, and the
+					// timeout branch then reported a stale error over an answer
+					// the owner had already published. Re-check it, bounded by
+					// the grace: the owner either lands right now or it did not.
+					select {
+					case <-flight.done:
+						accepted()
+					case <-time.After(cliCatalogWaiterGrace):
+						// No probe of this caller's own ran, so no failure mark and no
+						// duplicate log: the owner alone records those.
+						listings[i] = cliSiteListing{names: stale, err: waitCtx.Err()}
+					}
+				}
+				return
+			}
+			probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 			defer cancel()
 			client, err := s.cliClientFor(site)
 			var names []string
 			if err == nil {
 				var models []remote.Model
-				if models, err = client.ListModels(probeCtx); err == nil {
+				if models, err = cliListModels(client, probeCtx); err == nil {
 					for _, model := range models {
 						if name := strings.TrimSpace(model.Key); name != "" {
 							names = append(names, name)
@@ -814,11 +901,18 @@ func (s *Service) listCLIMergedModels(ctx context.Context, probeBudget time.Dura
 			if err != nil {
 				log.Printf("backend: %s CLI model discovery failed: %v", site.Label(), err)
 				s.markCLIProbeFailed(site)
-				listings[i] = cliSiteListing{names: stale, err: err}
-				return
+				flight.names = stale
+			} else {
+				s.setCLICatalog(site, names, time.Now().Add(cliCatalogTTL))
+				flight.names = names
 			}
-			s.setCLICatalog(site, names, time.Now().Add(cliCatalogTTL))
-			listings[i].names = names
+			flight.err = err
+			s.finishCLICatalogFlight(site, flight)
+			listings[i].names = flight.names
+			// Without the error a failed owner reads to mergeCLICatalogs as a
+			// site that legitimately listed nothing, so a cold failure silently
+			// shrinks the merged catalog instead of being reported.
+			listings[i].err = err
 		}(i, sites[i])
 	}
 	wg.Wait()
@@ -988,13 +1082,24 @@ func (s *Service) generateWithReconnect(
 	req ChatRequest,
 	onDelta func(StreamEvent),
 ) (*ChatResult, error) {
-	result, err := s.generateLocked(ctx, req, onDelta)
-	if err == nil || !isRecoverableIPCError(err) {
+	// Count callbacks at the outer boundary, including deferred held output.
+	emitted := false
+	deliver := onDelta
+	if onDelta != nil {
+		deliver = func(event StreamEvent) {
+			if event.Delta != "" {
+				emitted = true
+			}
+			onDelta(event)
+		}
+	}
+	result, err := s.generateLocked(ctx, req, deliver)
+	if err == nil || emitted || ctx.Err() != nil || isTurnNoReplayError(err) || !isRecoverableIPCError(err) {
 		return result, err
 	}
 
 	s.resetConnection()
-	return s.generateLocked(ctx, req, onDelta)
+	return s.generateLocked(ctx, req, deliver)
 }
 
 func (s *Service) generateRemote(
@@ -1083,13 +1188,14 @@ func (s *Service) generateRemoteInternal(
 		cancel()
 		if err == nil {
 			if result != nil && namedSite {
-				// Echo the id the client asked for, not the bare name --model took.
-				result.Model = cliGlobalPrefix + result.Model
+				// Echo the id the client asked for, not the bare name --model took,
+				// prefixed by the site that actually served the turn (D05).
+				result.Model = cliSiteEchoPrefix(site) + result.Model
 			}
 			return result, nil
 		}
 		lastErr = err
-		if i == len(models)-1 || emitted || !isRemoteFallbackError(err) {
+		if i == len(models)-1 || emitted || isTurnNoReplayError(err) || !isRemoteFallbackError(err) {
 			return nil, err
 		}
 	}
@@ -1117,18 +1223,48 @@ func (s *Service) generateRemoteWithImageContext(
 // resolutions are idempotent, so a deferred release after an explicit drop is
 // a no-op. Turns with no tools, or tool_choice:"none", never retry and keep
 // the direct low-latency stream.
+//
+// The hold is bounded by cliFirstAttemptHoldMax: a tool turn can stay
+// unresolved for many minutes (forced retries, emulation), and holding every
+// delta for the whole turn measured as 19m47s of client silence while the CLI
+// had already finished its answer. Once the timer fires the attempt is treated
+// as released and later deltas stream directly.
 type firstAttemptStream struct {
 	onDelta func(StreamEvent)
+	// mu covers every field below: the hold timer races the CLI delta goroutine
+	// and the caller's post-turn reads.
+	mu      sync.Mutex
 	held    []StreamEvent
 	holding bool
 	wrote   bool
+	// forwarded retains only the text the hold flush put on the wire -- at most
+	// one hold bound of it -- while forwardedLen counts every text byte handed
+	// out, so a stream that outgrows the hold is still sliced without keeping a
+	// copy of the whole turn.
+	forwarded    strings.Builder
+	forwardedLen int
+	timer        *time.Timer
+	// carry is the text tail held back only to catch a DSML marker split
+	// across deltas. suppressed latches once a marker is seen: everything after
+	// it belongs to the native call the final parse will turn into a tool call,
+	// so streaming it would show the user the tag flood the parse hides.
+	carry      string
+	suppressed bool
 }
 
+// cliFirstAttemptHoldMax bounds how long a tool-bearing first attempt may be
+// held off the wire. A package var so tests can lower it.
+var cliFirstAttemptHoldMax = 2500 * time.Millisecond
+
 func newFirstAttemptStream(onDelta func(StreamEvent), req ChatRequest) *firstAttemptStream {
-	return &firstAttemptStream{
+	h := &firstAttemptStream{
 		onDelta: onDelta,
 		holding: onDelta != nil && len(req.Tools) > 0 && req.ToolChoice.Mode != "none",
 	}
+	if h.holding {
+		h.timer = time.AfterFunc(cliFirstAttemptHoldMax, h.flushHeld)
+	}
+	return h
 }
 
 func (h *firstAttemptStream) delta(text string) {
@@ -1139,29 +1275,206 @@ func (h *firstAttemptStream) event(event StreamEvent) {
 	if event.Delta == "" || h.onDelta == nil {
 		return
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if !h.holding {
-		h.wrote = true
-		h.onDelta(event)
+		h.forwardLocked(event)
 		return
 	}
 	h.held = append(h.held, event)
 }
 
-func (h *firstAttemptStream) release() {
+// flushHeld is the timer callback: forward what the attempt has produced so far
+// and stop holding, releasing the turn instead of keeping it silent.
+func (h *firstAttemptStream) flushHeld() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.timer = nil
 	if !h.holding {
 		return
 	}
-	h.holding = false
+	h.releaseLocked()
+}
+
+// releaseLocked forwards the held events and stops holding. The forwarding runs
+// before holding drops so the flushed bytes stay in the tail emitter's prefix:
+// a rewritten turn can still resolve after this flush. Callers hold mu.
+func (h *firstAttemptStream) releaseLocked() {
 	for _, event := range h.held {
-		h.wrote = true
-		h.onDelta(event)
+		h.forwardLocked(event)
 	}
+	h.holding = false
 	h.held = nil
 }
 
+// forwardLocked hands one delta to the client and records it for the tail
+// emitter. Callers hold mu: event, releaseLocked and emit all call onDelta with
+// the mutex held, and the tail emitter keeps that same pattern.
+func (h *firstAttemptStream) forwardLocked(event StreamEvent) {
+	// Only text deltas belong to the accepted text; thinking chunks are stream
+	// output but never part of result.Text, so they would break prefix matching.
+	if event.Type != StreamEventText {
+		h.wrote = true
+		h.onDelta(event)
+		return
+	}
+	if h.suppressed {
+		return
+	}
+	pending := h.carry + event.Delta
+	h.carry = ""
+	if idx := strings.Index(pending, toolemulation.DSMLMarker); idx >= 0 {
+		// The client renders streamed deltas even when the final parse turns
+		// this markup into a call, so nothing from the marker on may reach it.
+		h.forwardTextLocked(pending[:idx])
+		h.suppressed = true
+		return
+	}
+	// Hold only the suffix that could still become the marker: that is what a
+	// delta boundary can split, and nothing else stays behind. The carried
+	// bytes are a byte prefix of the marker, so merging completes it whole;
+	// release flushes an incomplete prefix as the prose it is.
+	hold := len(pending) - longestMarkerPrefixSuffix(pending)
+	h.carry = pending[hold:]
+	h.forwardTextLocked(pending[:hold])
+}
+
+// longestMarkerPrefixSuffix returns the length of the longest proper prefix of
+// the marker that ends text, or 0 when the next delta cannot complete one.
+func longestMarkerPrefixSuffix(text string) int {
+	for k := len(toolemulation.DSMLMarker) - 1; k > 0; k-- {
+		if k <= len(text) && strings.HasSuffix(text, toolemulation.DSMLMarker[:k]) {
+			return k
+		}
+	}
+	return 0
+}
+
+// forwardTextLocked is the text half of forwardLocked. Every byte is counted,
+// but only the held window is retained: once the hold is off the wire a long
+// answer must not stay copied here until the turn ends (P2).
+func (h *firstAttemptStream) forwardTextLocked(text string) {
+	if text == "" {
+		return
+	}
+	h.wrote = true
+	h.forwardedLen += len(text)
+	if h.holding {
+		h.forwarded.WriteString(text)
+	}
+	h.onDelta(StreamEvent{Type: StreamEventText, Delta: text})
+}
+
+// stopTimerLocked disarms the hold timer. Callers hold mu.
+func (h *firstAttemptStream) stopTimerLocked() {
+	if h.timer != nil {
+		h.timer.Stop()
+		h.timer = nil
+	}
+}
+
+func (h *firstAttemptStream) release() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopTimerLocked()
+	if h.holding {
+		h.releaseLocked()
+	}
+	h.flushCarryLocked()
+}
+
+// flushCarryLocked sends the marker peek's tail as prose. Called only where the
+// attempt stops waiting for more deltas; a suppressed tail belongs to the call
+// and is dropped.
+func (h *firstAttemptStream) flushCarryLocked() {
+	if h.carry != "" && !h.suppressed {
+		h.forwardTextLocked(h.carry)
+	}
+	h.carry = ""
+}
+
 func (h *firstAttemptStream) drop() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopTimerLocked()
 	h.holding = false
 	h.held = nil
+	h.carry, h.suppressed = "", false
+}
+
+// streamed reports whether a delta of this attempt has reached the client. It
+// is read under the mutex because the hold timer may still be about to flush.
+func (h *firstAttemptStream) streamed() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.wrote
+}
+
+// emitFinal hands the surviving attempt's final prose to the client once the
+// held first attempt has been dropped: the attempt whose calls were accepted is
+// the one the client must see, never the superseded one. An empty final text
+// emits nothing, which keeps an all-blocks answer stream-silent on purpose.
+func (h *firstAttemptStream) emitFinal(text string) {
+	h.emit(text, false)
+}
+
+// emitFinalAccepted replays the accepted attempt's prose even when the hold
+// bound already flushed the superseded attempt. The flushed preamble cannot be
+// unsent; dropping the retry's text too left the client with only the wrong
+// attempt (HTTP-07).
+func (h *firstAttemptStream) emitFinalAccepted(text string) {
+	h.emit(text, true)
+}
+
+// emitFinalTail hands the accepted text's unstreamed suffix to the client. A
+// rewritten turn (the serial-tooling notice) keeps the same first attempt, so
+// its prose may already be on the wire; only the suffix is owed, and emitFinal's
+// all-or-nothing rule would drop that suffix once the hold bound flushed the
+// preamble. A prefix that does not match means the wire text came from another
+// attempt, so nothing is emitted, the same no-duplicate rule emitFinal keeps.
+func (h *firstAttemptStream) emitFinalTail(text string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopTimerLocked()
+	h.holding = false
+	h.held = nil
+	h.carry = ""
+	if text == "" || h.onDelta == nil {
+		return
+	}
+	tail := text
+	if h.wrote {
+		sent := h.forwarded.String()
+		if !strings.HasPrefix(text, sent) {
+			// The mismatch means the text was rewritten after forwarding, so the
+			// notice is accepted copy loss.
+			return
+		}
+		if h.forwardedLen > len(text) {
+			return
+		}
+		tail = text[h.forwardedLen:]
+	}
+	if tail == "" {
+		return
+	}
+	h.forwardTextLocked(tail)
+}
+
+func (h *firstAttemptStream) emit(text string, force bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopTimerLocked()
+	h.holding = false
+	h.held = nil
+	h.carry = ""
+	// shortcut: a non-forced emit after the hold timer released this attempt
+	// would duplicate text already on the wire, which is right only for a
+	// rewritten first-attempt result; an accepted retry sets force.
+	if text == "" || h.onDelta == nil || (h.wrote && !force) {
+		return
+	}
+	h.forwardTextLocked(text)
 }
 
 func (s *Service) generateRemoteWithModel(
@@ -1180,7 +1493,7 @@ func (s *Service) generateRemoteWithModel(
 	// after that release, not before.
 	defer func() {
 		hold.release()
-		emitted = hold.wrote
+		emitted = hold.streamed()
 	}()
 	remoteResult, err := client.Chat(ctx, remote.ChatRequest{
 		Model:           model,
@@ -1195,7 +1508,7 @@ func (s *Service) generateRemoteWithModel(
 		ToolChoice:      req.ToolChoice,
 	}, hold.delta)
 	if err != nil {
-		return nil, hold.wrote, err
+		return nil, hold.streamed(), err
 	}
 	// Dialect fallback for the native channel: the model answered a
 	// native-tools request in the action-block dialect instead. The attempt is
@@ -1204,6 +1517,7 @@ func (s *Service) generateRemoteWithModel(
 	// accepts is already a legal native call and must not cost another round
 	// trip, least of all the forced-tooling ones below.
 	convertDialectToolCalls(remoteResult, req)
+	superseded := false
 	if len(remoteResult.ToolCalls) == 0 && shouldRetryRemoteNativeTool(req, remoteResult.Text) {
 		retryResult, retryErr := client.Chat(ctx, remote.ChatRequest{
 			Model:           model,
@@ -1228,6 +1542,10 @@ func (s *Service) generateRemoteWithModel(
 		if retryErr == nil && len(retryResult.ToolCalls) > 0 {
 			remoteResult = retryResult
 			hold.drop()
+			// The forced retry superseded the first attempt; its own prose is the
+			// turn's accepted text and must reach the stream at the resolution
+			// below, exactly like an emulation retry's (HTTP-07).
+			superseded = true
 		}
 	}
 
@@ -1236,6 +1554,12 @@ func (s *Service) generateRemoteWithModel(
 	// their namespace; stamp it here so Responses emitters can split them
 	// back into leaf plus namespace.
 	toolemulation.DecorateToolCallNamespaces(remoteResult.ToolCalls, req.Tools)
+	// The CLI backend serves no endpoint, so resolving the (empty) configured
+	// base URL there would pay for a cold IDE config/log scan and discard it.
+	endpoint := ""
+	if s.backend() != BackendQoderCLI {
+		endpoint = remote.ResolveBaseURL(s.cfg.RemoteBaseURL)
+	}
 	result = &ChatResult{
 		Text:             remoteResult.Text,
 		Model:            valueOr(strings.TrimSpace(model), "lingma"),
@@ -1245,16 +1569,13 @@ func (s *Service) generateRemoteWithModel(
 		RequestID:        remoteResult.RequestID,
 		FinishReason:     finishReason,
 		StopReason:       stopReason,
-		Endpoint:         remote.ResolveBaseURL(s.cfg.RemoteBaseURL),
+		Endpoint:         endpoint,
 		Transport:        string(s.backend()),
 		EffectiveSession: SessionModeFresh,
 		ToolCalls:        remoteResult.ToolCalls,
 	}
-	if s.backend() == BackendQoderCLI {
-		result.Endpoint = ""
-	}
 	if emulateTools {
-		if s.applyToolEmulation(ctx, req, prompt, result, func(hintPrompt string) (string, int, bool, error) {
+		replaced, retryErr := s.applyToolEmulation(ctx, req, prompt, result, func(hintPrompt string) (string, int, bool, error) {
 			retryResult, err := client.Chat(ctx, remote.ChatRequest{
 				Model:           model,
 				Prompt:          hintPrompt,
@@ -1278,15 +1599,44 @@ func (s *Service) generateRemoteWithModel(
 				return "", 0, true, nil
 			}
 			return retryResult.Text, retryResult.OutputTokens, false, nil
-		}) {
-			hold.drop()
+		})
+		if retryErr != nil {
+			return nil, hold.streamed(), retryErr
+		}
+		// The contract runs before the hold resolves: a turn the serial-tooling
+		// rule rewrites must not first stream the shape it no longer has.
+		rewritten, cerr := acceptToolContract(req, result)
+		if cerr != nil {
+			return nil, hold.streamed(), cerr
+		}
+		if replaced || superseded {
+			// A retry owns the turn: its prose must follow the superseded
+			// attempt's held deltas, and also its already-flushed preamble --
+			// emitFinal's no-duplicate rule would drop the retry's text there
+			// (HTTP-07).
+			hold.emitFinalAccepted(result.Text)
+		} else if rewritten {
+			// Same attempt, so only the notice acceptToolContract appended can
+			// still be owed after the bound flushed the preamble.
+			hold.emitFinalTail(result.Text)
 		} else {
 			hold.release()
 		}
 	} else {
-		hold.release()
+		// The non-emulated channel (no tools, or tool_choice=none) never runs the
+		// emulation gate above, but its native result still owes the contract: a
+		// gateway that answers a none turn with a native call must be refused here.
+		rewritten, cerr := acceptToolContract(req, result)
+		if cerr != nil {
+			return nil, hold.streamed(), cerr
+		}
+		if rewritten {
+			hold.emitFinalTail(result.Text)
+		} else {
+			hold.release()
+		}
 	}
-	return result, hold.wrote, nil
+	return result, hold.streamed(), nil
 }
 
 func shouldEmulateRemoteTools(req ChatRequest) bool {
@@ -1313,7 +1663,9 @@ func remoteMessagesFromRequest(req ChatRequest) []remote.Message {
 			continue
 		}
 		content := strings.TrimSpace(message.Text)
-		if content == "" && len(message.Images) == 0 && len(message.ToolCalls) == 0 {
+		// A legal empty result is identified by its tool role and paired call ID.
+		pairedToolResult := role == "tool" && strings.TrimSpace(message.ToolCallID) != ""
+		if content == "" && len(message.Images) == 0 && len(message.ToolCalls) == 0 && !pairedToolResult {
 			continue
 		}
 		out = append(out, remote.Message{
@@ -1386,20 +1738,31 @@ func requestHasImages(req ChatRequest) bool {
 
 // currentTurnHasImages reports whether the turn being answered now carries an
 // attachment. History replay means an older attachment shows up in nearly every
-// later request, so scanning all messages would blame the wrong turn.
+// later request, so scanning all messages would blame the wrong turn. The
+// current turn is the last user message plus the tool results that follow it:
+// a tool_result attachment (HIST-05) is the turn's own screenshot, not history.
 func currentTurnHasImages(req ChatRequest) bool {
+	toolImages := false
 	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if !strings.EqualFold(strings.TrimSpace(req.Messages[i].Role), "user") {
+		role := strings.ToLower(strings.TrimSpace(req.Messages[i].Role))
+		if role == "tool" {
+			if len(remoteImagesFromChatMessage(req.Messages[i])) > 0 {
+				toolImages = true
+			}
 			continue
 		}
-		return len(remoteImagesFromChatMessage(req.Messages[i])) > 0
+		if role == "user" {
+			return toolImages || len(remoteImagesFromChatMessage(req.Messages[i])) > 0
+		}
 	}
-	return false
+	return toolImages
 }
 
 // requestWithCurrentTurnImagesOnly keeps the attachment on the turn being
 // answered and strips the ones replayed from history. currentTurnHasImages names
-// the same message: the last user turn, which is what the CLI receives.
+// the same turn: the last user message, plus the tool results that trail it
+// (their attachments are the current turn's, HIST-05), which is what the CLI
+// receives.
 func requestWithCurrentTurnImagesOnly(req ChatRequest) ChatRequest {
 	keep := -1
 	for i := len(req.Messages) - 1; i >= 0; i-- {
@@ -1411,7 +1774,7 @@ func requestWithCurrentTurnImagesOnly(req ChatRequest) ChatRequest {
 	out := req
 	out.Messages = make([]ChatMessage, len(req.Messages))
 	for i, message := range req.Messages {
-		if i != keep {
+		if i != keep && !(i > keep && strings.EqualFold(strings.TrimSpace(message.Role), "tool")) {
 			message.Images = nil
 		}
 		out.Messages[i] = message
@@ -1614,12 +1977,19 @@ func splitCLIModelEffort(model string) (string, string) {
 
 // splitCLISite reads the site marker out of a model id. Clients namespace the id
 // with their own provider key ("lingma-proxy/intl/Qwen3.8-Flash"), so the marker
-// is looked for in every path segment rather than only the first.
+// is looked for in every path segment rather than only the first. The published
+// `cn/` marker pins the CN site (D05): a marked request never cross-falls back
+// to the other site, and the marker is consumed out of the id --model takes.
 func splitCLISite(model string) (qodercli.Site, string, bool) {
 	trimmed := strings.TrimSpace(model)
 	segments := strings.Split(trimmed, "/")
 	for i, segment := range segments {
 		switch strings.ToLower(strings.TrimSpace(segment)) {
+		case "cn", "china", "中国", "国内":
+			rest := strings.TrimSpace(strings.Join(segments[i+1:], "/"))
+			if rest != "" {
+				return qodercli.SiteCN, rest, true
+			}
 		case "intl", "global", "国际", "国际版":
 			rest := strings.TrimSpace(strings.Join(segments[i+1:], "/"))
 			if rest != "" {
@@ -1628,6 +1998,15 @@ func splitCLISite(model string) (qodercli.Site, string, bool) {
 		}
 	}
 	return qodercli.SiteCN, trimmed, false
+}
+
+// cliSiteEchoPrefix is the marker a named-site request's result model is echoed
+// with, by the site that actually served it -- not a single global prefix.
+func cliSiteEchoPrefix(site qodercli.Site) string {
+	if site.Normalized() == qodercli.SiteGlobal.Normalized() {
+		return cliGlobalPrefix
+	}
+	return "cn/"
 }
 
 // resolveCLIModel maps whatever the client asked for onto a model the signed-in
@@ -1830,6 +2209,13 @@ func (s *Service) generateLocked(
 	}
 
 	effectiveMode := resolveSessionMode(req, s.cfg.SessionMode)
+	if effectiveMode == SessionModeReuse && requestCarriesToolTraffic(req) {
+		// E-1 (HIST-03): the reuse shortcut sends only the last converted user
+		// message, which cannot carry parallel tool results or the current tool
+		// constraints. Tool-carrying turns route through the existing fresh full
+		// replay instead; pure-text single-message continuation keeps reuse.
+		effectiveMode = SessionModeFresh
+	}
 	prompt, err := buildLingmaPrompt(req, effectiveMode, true)
 	if err != nil {
 		return nil, err
@@ -1925,7 +2311,7 @@ func (s *Service) generateLocked(
 
 	result = s.buildChatResult(req, sessionID, requestID, prompt, runResult, effectiveMode)
 
-	if s.applyToolEmulation(requestCtx, req, prompt, result, func(hintPrompt string) (string, int, bool, error) {
+	replaced, retryErr := s.applyToolEmulation(requestCtx, req, prompt, result, func(hintPrompt string) (string, int, bool, error) {
 		retryRequestID := lingmaipc.CreateRequestID("serve-tool")
 		retryMeta := lingmaipc.CreateMeta(lingmaipc.MetaOptions{
 			RequestID:       retryRequestID,
@@ -1938,14 +2324,33 @@ func (s *Service) generateLocked(
 		// nil onDelta: the held first attempt is still awaiting its verdict, and
 		// result.Text is about to be replaced by this retry. The remote retry
 		// passes nil too. The IPC peer answers in action blocks, never native
-		// calls, so the replaced flag stays false and the parsed text decides.
+		// calls, so this callback never reports a native replacement; parsed
+		// retry text still sets the caller's replaced.
 		retryRunResult, retryErr := s.runPromptLocked(requestCtx, ipcClient, sessionID, hintPrompt, images, retryRequestID, retryMeta, nil)
 		if retryErr != nil {
 			return "", 0, false, retryErr
 		}
 		return retryRunResult.AssistantText, estimateTokens(retryRunResult.AssistantText), false, nil
-	}) {
-		hold.drop()
+	})
+	if retryErr != nil {
+		abandonTurn()
+		return nil, retryErr
+	}
+	// Same acceptance gate the remote channel pays, before the hold resolves so
+	// a rewritten turn never streams the shape it no longer has.
+	rewritten, cerr := acceptToolContract(req, result)
+	if cerr != nil {
+		abandonTurn()
+		return nil, cerr
+	}
+	if replaced {
+		// HTTP-07 parity with the remote channel: the accepted retry's prose
+		// replaces the dropped first attempt on the stream.
+		hold.emitFinalAccepted(result.Text)
+	} else if rewritten {
+		// The same IPC attempt, rewritten by acceptToolContract: only its notice
+		// tail is still owed once the bound flushed the preamble.
+		hold.emitFinalTail(result.Text)
 	} else {
 		hold.release()
 	}
@@ -1997,42 +2402,53 @@ func (s *Service) remoteAPI() *remote.Client {
 // reports whether the turn's prose ended up replaced by a retried attempt or
 // consumed into inferred calls: that is the signal streaming callers use to
 // drop the first attempt's held deltas, so the client only ever sees output
-// that belongs to the accepted attempt.
+// that belongs to the accepted attempt. The tool_choice contract itself is
+// enforced one level up, at acceptToolContract, so every channel pays the same
+// acceptance gate whether or not it ran an emulation here.
 func (s *Service) applyToolEmulation(
 	ctx context.Context,
 	req ChatRequest,
 	prompt string,
 	result *ChatResult,
 	retry func(string) (string, int, bool, error),
-) (replaced bool) {
+) (replaced bool, err error) {
 	// tool_choice:"none" is the client forbidding tool calls, so a block that
 	// arrives anyway (from an echoed example, or from history) stays prose:
 	// turning it into a tool call would hand back an action the client ruled out.
 	if len(req.Tools) > 0 && req.ToolChoice.Mode != "none" {
-		calls, remaining, parseErr := toolemulation.ParseActionBlocks(result.Text, req.Tools, toolemulation.Config{})
-		if parseErr == nil && len(calls) > 0 {
-			result.Text = remaining
-			// A turn that already carries calls -- native ones from the gateway,
-			// or dialect ones converted upstream of here -- keeps them: the
-			// parsed calls join behind, so a model echoing its own native call
-			// as text cannot make it execute twice.
-			result.ToolCalls = appendConvertedToolCalls(result.ToolCalls, calls)
-			return false
-		} else if len(result.ToolCalls) == 0 && shouldRetryTooling(req.ToolChoice, result.Text) {
+		// The merge gate: a turn that already carries calls -- native ones from
+		// the gateway, or dialect ones converted upstream of here -- counts them
+		// against the same per-turn ceiling the parser enforces, so the residual
+		// text of an already-converted attempt cannot buy a second, reset
+		// budget: what the first parse suppressed stays prose (HTTP-08).
+		merged := false
+		if budget := turnToolCallCap() - len(result.ToolCalls); budget > 0 {
+			calls, remaining, parseErr := toolemulation.ParseActionBlocks(result.Text, req.Tools, toolemulation.Config{MaxToolCalls: budget})
+			if parseErr == nil && len(calls) > 0 {
+				result.Text = remaining
+				// The parsed calls join behind the ones already carried, so a
+				// model echoing its own native call as text cannot make it
+				// execute twice.
+				result.ToolCalls = appendConvertedToolCalls(result.ToolCalls, calls)
+				merged = true
+			}
+		}
+		if !merged && len(result.ToolCalls) == 0 && shouldRetryTooling(req.ToolChoice, result.Text) {
 			hintPrompt := prompt + "\n\n" + toolemulation.ForceToolingPrompt(req.ToolChoice)
 			retryText := ""
 			if retry != nil {
 				// replaced means the retry already installed its own calls into
 				// result (a native-tool answer needs no action-block parsing).
 				text, outputTokens, replaced, retryErr := retry(hintPrompt)
-				if retryErr == nil {
-					if replaced {
-						return true
-					}
-					retryText = text
-					if outputTokens > 0 {
-						result.OutputTokens = outputTokens
-					}
+				if retryErr != nil {
+					return false, &turnNoReplayError{cause: fmt.Errorf("tool emulation retry failed: %w", retryErr)}
+				}
+				if replaced {
+					return true, nil
+				}
+				retryText = text
+				if outputTokens > 0 {
+					result.OutputTokens = outputTokens
 				}
 			}
 			if retryText != "" {
@@ -2041,24 +2457,85 @@ func (s *Service) applyToolEmulation(
 					result.Text = retryRemaining
 					result.ToolCalls = retryCalls
 					result.OutputTokens = estimateTokens(retryText)
-					return true
+					return true, nil
 				} else if inferred := toolemulation.InferToolCallsFromText(retryText, req.Tools); len(inferred) > 0 {
 					result.Text = ""
 					result.ToolCalls = inferred
 					result.OutputTokens = estimateTokens(retryText)
-					return true
+					return true, nil
 				}
 			}
 			if len(result.ToolCalls) == 0 {
 				if inferred := toolemulation.InferToolCallsFromText(result.Text, req.Tools); len(inferred) > 0 {
 					result.Text = ""
 					result.ToolCalls = inferred
-					return true
+					return true, nil
 				}
 			}
 		}
 	}
-	return false
+	return false, nil
+}
+
+// acceptToolContract is the common acceptance gate a finished turn passes
+// through before Generate hands it to the API layer: the client's tool_choice
+// and parallel_tool_calls selections constrain the ACCEPTED result, not only
+// the prompt. A named choice must be matched by every accepted call, a
+// required choice owes at least one, and none owes none -- native remote calls
+// included. The existing forced-tooling retry stays the one retry layer; when
+// it has not restored the contract the turn fails loudly here instead of
+// silently succeeding with something the client never asked for. A turn that
+// forbids parallel calls keeps only the first; the dropped ones become visible
+// prose (rewritten=true) so the client can still see what was held back.
+func acceptToolContract(req ChatRequest, result *ChatResult) (rewritten bool, err error) {
+	if len(req.Tools) == 0 {
+		return false, nil
+	}
+	switch req.ToolChoice.Mode {
+	case "none":
+		if len(result.ToolCalls) > 0 {
+			return false, fmt.Errorf("tool_choice=none forbids tool calls this turn, but the backend returned %d; refusing to accept the turn", len(result.ToolCalls))
+		}
+	case "tool":
+		if len(result.ToolCalls) == 0 {
+			return false, fmt.Errorf("tool_choice requires %q but no tool call was returned after the forced-tooling retry; refusing a call-free turn", strings.TrimSpace(req.ToolChoice.Name))
+		}
+		if name := strings.TrimSpace(req.ToolChoice.Name); name != "" {
+			for _, call := range result.ToolCalls {
+				if !strings.EqualFold(toolemulation.NormalizeDeclaredName(req.Tools, call.Name), toolemulation.NormalizeDeclaredName(req.Tools, name)) {
+					return false, fmt.Errorf("tool_choice requires %q but the model returned %q; refusing a different tool", name, call.Name)
+				}
+			}
+		}
+	case "any":
+		if len(result.ToolCalls) == 0 {
+			return false, errors.New("tool_choice=required but no tool call was returned after the forced-tooling retry; refusing a call-free turn")
+		}
+	}
+	if req.ParallelToolCalls != nil && !*req.ParallelToolCalls && len(result.ToolCalls) > 1 {
+		dropped := append([]toolemulation.ToolCall(nil), result.ToolCalls[1:]...)
+		result.ToolCalls = result.ToolCalls[:1]
+		note := toolemulation.SingleCallNotice(dropped)
+		if strings.TrimSpace(result.Text) == "" {
+			result.Text = note
+		} else {
+			result.Text = result.Text + "\n" + note
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// turnToolCallCap mirrors the parser's per-turn call ceiling for the merge
+// gate in applyToolEmulation: the calls a turn already carries count against
+// the same budget the parser itself enforces, environment knob included.
+func turnToolCallCap() int {
+	if raw := strings.TrimSpace(os.Getenv("LINGMA_MAX_TOOL_CALLS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 5
 }
 
 func shouldRetryTooling(choice toolemulation.ToolChoice, text string) bool {
@@ -2140,6 +2617,16 @@ func convertDialectToolCalls(result *remote.ChatResult, req ChatRequest) {
 	}
 	result.ToolCalls = calls
 	result.Text = remaining
+}
+
+// Failed retries or interrupted partial execution cannot replay the whole turn.
+type turnNoReplayError struct{ cause error }
+
+func (e *turnNoReplayError) Error() string { return e.cause.Error() }
+func (e *turnNoReplayError) Unwrap() error { return e.cause }
+func isTurnNoReplayError(err error) bool {
+	var failure *turnNoReplayError
+	return errors.As(err, &failure)
 }
 
 func isRecoverableIPCError(err error) bool {
@@ -2489,15 +2976,17 @@ func (s *Service) runPromptLocked(
 				// incomplete". The count is the only evidence either way.
 				log.Printf("lingma IPC: turn %s hit its deadline with %d notification frame(s) dropped, %d bytes of answer held", requestID, dropped, len(result.AssistantText))
 			}
-			return result, nil
+			return result, &turnNoReplayError{cause: fmt.Errorf("Lingma IPC response incomplete before finish: %w; partial reply: %s", ctx.Err(), truncate(result.AssistantText, 120))}
 		case notification, ok := <-notifications:
 			if !ok {
 				result.AssistantText = builder.String()
 				result.ThoughtText = thoughtBuilder.String()
-				if result.AssistantText == "" {
-					return nil, errors.New("Lingma IPC notification stream closed")
+				err := fmt.Errorf("Lingma IPC notification stream closed before finish; partial reply: %s", truncate(result.AssistantText, 120))
+				// Partial execution cannot be replayed, including aggregate/nonstream callers.
+				if builder.Len() > 0 || thoughtBuilder.Len() > 0 {
+					return result, &turnNoReplayError{cause: err}
 				}
-				return result, nil
+				return result, err
 			}
 			if notification.Method != "session/update" {
 				continue
@@ -2666,9 +3155,31 @@ func resolveSessionMode(req ChatRequest, configured SessionMode) SessionMode {
 	return SessionModeFresh
 }
 
+// requestCarriesToolTraffic reports whether the turn carries tool results or
+// tool constraints that the IPC reuse shortcut (single last converted user
+// message) cannot express. 1005 E-1 COORD ruling: such requests always replay
+// the full conversation through the fresh path, even when reuse is configured.
+func requestCarriesToolTraffic(req ChatRequest) bool {
+	if len(req.Tools) > 0 {
+		return true
+	}
+	for _, message := range req.Messages {
+		role := strings.ToLower(strings.TrimSpace(message.Role))
+		if role == "tool" || len(message.ToolCalls) > 0 || strings.TrimSpace(message.ToolCallID) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// extractLastUserImages returns the attachment set for the turn being answered.
+// Trailing tool results participate (HIST-05): a screenshot tool's continuation
+// turn carries its image on the tool message, and skipping role "tool" here
+// made the IPC prompt items lose exactly those attachments.
 func extractLastUserImages(messages []ChatMessage) []Image {
 	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" && len(messages[i].Images) > 0 {
+		role := strings.ToLower(strings.TrimSpace(messages[i].Role))
+		if (role == "user" || role == "tool") && len(messages[i].Images) > 0 {
 			return messages[i].Images
 		}
 	}

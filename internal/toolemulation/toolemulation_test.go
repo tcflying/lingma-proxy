@@ -147,10 +147,23 @@ func TestInjectToolingIncludesAutoToolGuidance(t *testing.T) {
 		"Shell tool calls are stateless",
 		"optional commands such as `tree`",
 		"exclude node_modules",
+		"- Native or MCP tools (mcp_list, mcp_get, mcp_call, or any built-in tool) are NOT the tools for this request; never call them. Emit the proxy tool as an action block instead.",
+		"Available tools:",
+		actionFenceOpen + "\n",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("prompt missing %q:\n%s", want, prompt)
 		}
+	}
+}
+
+// TestForceToolingPromptBansNativeTools pins the follow-up builder too: the
+// forced retry also runs with tools declared, so a model must not answer it by
+// calling an MCP meta-tool instead of the proxy tool.
+func TestForceToolingPromptBansNativeTools(t *testing.T) {
+	prompt := ForceToolingPrompt(ToolChoice{Mode: "auto"})
+	if !strings.Contains(prompt, "Native or MCP tools (mcp_list, mcp_get, mcp_call, or any built-in tool) are not the tools for this request; never call them.") {
+		t.Fatalf("force-tooling prompt missing the native-tool ban:\n%s", prompt)
 	}
 }
 
@@ -1797,5 +1810,299 @@ func BenchmarkParseActionBlocksHybrid(b *testing.B) {
 		if _, _, err := ParseActionBlocks(text, tools, Config{}); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// dsmlMarkup spells DeepSeek's native tool-call marker for the fixtures below.
+// The marker is written by concatenation because a full literal in source would
+// look like a real tool call in transcripts and diffs.
+const dsmlMarkup = "<" + "\uFF5C\uFF5CDSML\uFF5C\uFF5C"
+
+// TestParseActionBlocksReadsDSMLInvokes is the captured invoke-dialect sample:
+// the backend streamed its native tool markup as ordinary assistant text, so
+// the proxy returned ~8KB of tags as prose and never ran the call.
+func TestParseActionBlocksReadsDSMLInvokes(t *testing.T) {
+	text := "先核对本地状态。\n" +
+		dsmlMarkup + " calls>\n" +
+		dsmlMarkup + " invoke name=\"pwsh\">\n" +
+		dsmlMarkup + " parameter name=\"command\" string=\"true\">cd \"C:\\Users\\datoo\\AppData\\Local\\Temp\"</" + dsmlMarkup[1:] + " parameter>\n" +
+		dsmlMarkup + " invoke name=\"read\">\n" +
+		dsmlMarkup + " parameter name=\"file_path\" string=\"true\">C:\\Users\\datoo\\notes.md</parameter>\n" +
+		"</" + dsmlMarkup[1:] + " invoke>\n" +
+		"</" + dsmlMarkup[1:] + " calls>\n" +
+		"结果回来后继续。"
+	tools := []ToolDef{
+		{Name: "pwsh", InputSchema: map[string]any{
+			"properties": map[string]any{"command": map[string]any{"type": "string"}},
+			"required":   []any{"command"},
+		}},
+		{Name: "read", InputSchema: map[string]any{
+			"properties": map[string]any{"file_path": map[string]any{"type": "string"}},
+			"required":   []any{"file_path"},
+		}},
+	}
+
+	calls, clean, err := ParseActionBlocks(text, tools, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 2 {
+		t.Fatalf("native DSML calls were not parsed: %+v", calls)
+	}
+	if calls[0].Name != "pwsh" || calls[0].Arguments["command"] != `cd "C:\Users\datoo\AppData\Local\Temp"` {
+		t.Fatalf("calls[0] = %+v", calls[0])
+	}
+	if calls[1].Name != "read" || calls[1].Arguments["file_path"] != `C:\Users\datoo\notes.md` {
+		t.Fatalf("calls[1] = %+v", calls[1])
+	}
+	if strings.Contains(clean, "DSML") || strings.Contains(clean, "calls>") || strings.Contains(clean, "invoke") {
+		t.Fatalf("clean text still carries the native markup: %q", clean)
+	}
+	if !strings.Contains(clean, "先核对本地状态") || !strings.Contains(clean, "结果回来后继续") {
+		t.Fatalf("clean text lost the prose around the markup: %q", clean)
+	}
+}
+
+// TestParseActionBlocksReadsDSMLActionJSON is the second captured variant: the
+// marker wraps an action word and the whole call is a bare JSON object.
+func TestParseActionBlocksReadsDSMLActionJSON(t *testing.T) {
+	text := dsmlMarkup + "action" + dsmlMarkup + ">" +
+		`{"tool":"read","parameters":{"file_path":"C:/Users/datoo/AppData/Local/Temp/x.txt"}}`
+	tools := []ToolDef{{Name: "read", InputSchema: map[string]any{
+		"properties": map[string]any{"file_path": map[string]any{"type": "string"}},
+		"required":   []any{"file_path"},
+	}}}
+
+	calls, clean, err := ParseActionBlocks(text, tools, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || calls[0].Name != "read" || calls[0].Arguments["file_path"] != `C:/Users/datoo/AppData/Local/Temp/x.txt` {
+		t.Fatalf("action-dialect call not parsed: calls=%+v clean=%q", calls, clean)
+	}
+	if clean != "" {
+		t.Fatalf("the action block is the whole reply, clean text = %q", clean)
+	}
+}
+
+// TestParseActionBlocksKeepsRejectedDSMLAsProse: without one valid call nothing
+// may be stripped, or the user loses the explanation that asked for a tool.
+func TestParseActionBlocksKeepsRejectedDSMLAsProse(t *testing.T) {
+	text := "示例：\n" +
+		dsmlMarkup + " calls>\n" +
+		dsmlMarkup + " invoke name=\"not_a_tool\">\n" +
+		dsmlMarkup + " parameter name=\"command\">ls</parameter>\n" +
+		"</invoke>\n</calls>"
+	calls, clean, err := ParseActionBlocks(text, []ToolDef{{Name: "pwsh"}}, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("an undeclared tool must not produce a call: %+v", calls)
+	}
+	if clean != strings.TrimSpace(text) {
+		t.Fatalf("rejected native markup must stay verbatim, got %q", clean)
+	}
+}
+
+// TestToolPromptsBanNativeMarkup pins the prompt half: the model must be told
+// the provider's own tool markup is prose, not an execution path.
+func TestToolPromptsBanNativeMarkup(t *testing.T) {
+	const ban = "- Never wrap a tool call in a provider's native markup (DSML, XML tags, or bare tool_call JSON outside the fence): it reaches the user as text and never runs. The fenced action block above is the only format that executes.\n"
+	tools := []ToolDef{{Name: "pwsh", InputSchema: map[string]any{"properties": map[string]any{"command": map[string]any{"type": "string"}}}}}
+	if prompt := InjectTooling("", tools, ToolChoice{Mode: "auto"}, nil); !strings.Contains(prompt, ban) {
+		t.Fatalf("tool prompt missing the native-markup ban:\n%s", prompt)
+	}
+	const forceBan = " Never wrap a tool call in a provider's native markup (DSML, XML tags, or bare tool_call JSON outside the fence): it reaches the user as text and never runs. The fenced action block above is the only format that executes."
+	if prompt := ForceToolingPrompt(ToolChoice{Mode: "auto"}); !strings.Contains(prompt, forceBan) {
+		t.Fatalf("force-tooling prompt missing the native-markup ban:\n%s", prompt)
+	}
+}
+
+// inferTools1006 mirrors the live tool set of a CN DeepSeek-Flash session: the
+// model fenced an action block carrying only "parameters", so the reader
+// treated it as a note fragment and the edit never ran.
+func inferTools1006() []ToolDef {
+	return []ToolDef{
+		xmlSchemaTool("read", map[string]any{
+			"file_path": map[string]any{"type": "string"},
+			"limit":     map[string]any{"type": "integer"},
+		}, "file_path"),
+		xmlSchemaTool("pwsh", map[string]any{
+			"command": map[string]any{"type": "string"},
+		}, "command"),
+		xmlSchemaTool("write", map[string]any{
+			"file_path": map[string]any{"type": "string"},
+			"content":   map[string]any{"type": "string"},
+		}, "file_path", "content"),
+		xmlSchemaTool("edit", map[string]any{
+			"file_path":  map[string]any{"type": "string"},
+			"old_string": map[string]any{"type": "string"},
+			"new_string": map[string]any{"type": "string"},
+		}, "file_path", "old_string", "new_string"),
+	}
+}
+
+// TestInferArgsOnlyBody1006LiveFailure replays the production block: no "tool",
+// only "parameters" whose keys exactly fit the declared edit tool. The call must
+// come out as edit with its arguments intact, through the one-shot parse, the
+// streaming span reader, and the delta feed alike.
+func TestInferArgsOnlyBody1006LiveFailure(t *testing.T) {
+	tools := inferTools1006()
+	const body = `{"parameters":{"file_path":"C:\\work\\mathx.py","old_string":"def sub(a, b): return a - b","new_string":"def sub(a, b): return safe_div(a, b)"}}`
+	text := "head\n```json action\n" + body + "\n```\ntail"
+
+	calls, clean, err := ParseActionBlocks(text, tools, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || calls[0].Name != "edit" {
+		t.Fatalf("an args-only body must infer edit, calls = %+v", calls)
+	}
+	want := map[string]string{
+		"file_path":  `C:\work\mathx.py`,
+		"old_string": "def sub(a, b): return a - b",
+		"new_string": "def sub(a, b): return safe_div(a, b)",
+	}
+	for key, value := range want {
+		if calls[0].Arguments[key] != value {
+			t.Fatalf("argument %q = %#v, want %q", key, calls[0].Arguments[key], value)
+		}
+	}
+	if clean != "head\ntail" {
+		t.Fatalf("the call must not leak as prose, clean = %q", clean)
+	}
+
+	// Streaming: inference is decidable only on final text, so the span reader
+	// holds the block and Flush's parser recovers the call from it.
+	if start, end, pending := FindActionBlockSpan(text, tools); !pending || end != 0 {
+		t.Fatalf("the args-only block must stay held until final text, start=%d end=%d pending=%v", start, end, pending)
+	}
+	emitted, held := streamFeed(tools, splitEvery(text, 7))
+	if strings.Contains(emitted, "parameters") {
+		t.Fatalf("the inferred call leaked before Flush: emitted=%q", emitted)
+	}
+	calls, clean, err = ParseActionBlocks(emitted+held, tools, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || calls[0].Name != "edit" {
+		t.Fatalf("the Flush parse must recover the inferred edit, calls = %+v", calls)
+	}
+	if got := strings.TrimSpace(clean); got != "head\ntail" {
+		t.Fatalf("delta feed replay = %q, want %q", got, "head\ntail")
+	}
+
+	// arguments and input are the same carrier by the documented protocol.
+	for _, key := range []string{"arguments", "input"} {
+		alt := "```json action\n{\"" + key + `":{"file_path":"a.py","old_string":"x","new_string":"y"}}` + "\n```"
+		calls, _, err := ParseActionBlocks(alt, tools, Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 1 || calls[0].Name != "edit" {
+			t.Fatalf("%q carrier must infer edit, calls = %+v", key, calls)
+		}
+	}
+}
+
+// TestInferArgsOnlyBody1006RefusesAmbiguity: two tools that accept the same
+// argument object are no evidence for either, so the block stays prose.
+func TestInferArgsOnlyBody1006RefusesAmbiguity(t *testing.T) {
+	props := map[string]any{"path": map[string]any{"type": "string"}}
+	tools := []ToolDef{xmlSchemaTool("alpha", props, "path"), xmlSchemaTool("beta", props, "path")}
+	text := "```json action\n" + `{"parameters":{"path":"a.txt"}}` + "\n```"
+	calls, clean, err := ParseActionBlocks(text, tools, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 0 {
+		t.Fatalf("two matching tools must not be guessed between: %+v", calls)
+	}
+	if !strings.Contains(clean, `"parameters"`) {
+		t.Fatalf("an undecided block must stay visible, clean = %q", clean)
+	}
+}
+
+// TestInferArgsOnlyBody1006RequiresFullAcceptance: missing required arguments
+// and undeclared keys both refuse inference, and a tool with no declared
+// properties never participates -- otherwise it would accept every body.
+func TestInferArgsOnlyBody1006RequiresFullAcceptance(t *testing.T) {
+	tools := []ToolDef{
+		xmlSchemaTool("write", map[string]any{
+			"file_path": map[string]any{"type": "string"},
+			"content":   map[string]any{"type": "string"},
+		}, "file_path", "content"),
+		xmlSchemaTool("edit", map[string]any{
+			"file_path":  map[string]any{"type": "string"},
+			"old_string": map[string]any{"type": "string"},
+			"new_string": map[string]any{"type": "string"},
+		}, "file_path", "old_string", "new_string"),
+		{Name: "freeform"},
+	}
+	for name, body := range map[string]string{
+		"missing required": `{"parameters":{"file_path":"a.py"}}`,
+		"undeclared key":   `{"parameters":{"file_path":"a.py","old_string":"x","new_string":"y","extra":1}}`,
+	} {
+		text := "```json action\n" + body + "\n```"
+		calls, clean, err := ParseActionBlocks(text, tools, Config{})
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(calls) != 0 {
+			t.Fatalf("%s must not produce a call: %+v", name, calls)
+		}
+		if !strings.Contains(clean, `"parameters"`) {
+			t.Fatalf("%s: the block must stay visible, clean = %q", name, clean)
+		}
+	}
+}
+
+// TestInferArgsOnlyBody1006LeavesExplicitPathsAlone: the inference must not move
+// the explicit-name path, must not turn a plain note into a call, and must not
+// relax the explicit path's acceptance gate.
+func TestInferArgsOnlyBody1006LeavesExplicitPathsAlone(t *testing.T) {
+	tools := inferTools1006()
+	full := `{"file_path":"a.py","old_string":"x","new_string":"y"}`
+
+	for _, key := range []string{"tool", "name"} {
+		text := "```json action\n{\"" + key + `":"edit","parameters":` + full + "}\n```"
+		calls, clean, err := ParseActionBlocks(text, tools, Config{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(calls) != 1 || calls[0].Name != "edit" || clean != "" {
+			t.Fatalf("explicit %q path regressed: calls=%+v clean=%q", key, calls, clean)
+		}
+	}
+
+	note := "```json action\n" + `{"note":"nothing to run"}` + "\n```"
+	calls, clean, err := ParseActionBlocks(note, tools, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 0 || !strings.Contains(clean, "nothing to run") {
+		t.Fatalf("a plain note must stay prose, calls=%+v clean=%q", calls, clean)
+	}
+
+	explicit := "```json action\n" + `{"tool":"edit","parameters":{"file_path":"a.py"}}` + "\n```"
+	calls, clean, err = ParseActionBlocks(explicit, tools, Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 0 || !strings.Contains(clean, `"file_path"`) {
+		t.Fatalf("the explicit path must keep rejecting missing required args, calls=%+v clean=%q", calls, clean)
+	}
+}
+
+// TestToolPromptsRequireToolField1006 pins the prompt half of the fix: both the
+// injected rules and the retry prompt must say a block without "tool" is dead.
+func TestToolPromptsRequireToolField1006(t *testing.T) {
+	const rule = `Every action block must include a "tool" field naming the tool; a block without "tool" will not run.`
+	if prompt := InjectTooling("", inferTools1006(), ToolChoice{Mode: "auto"}, nil); !strings.Contains(prompt, rule) {
+		t.Fatalf("tool prompt missing the required-tool-field rule:\n%s", prompt)
+	}
+	if prompt := ForceToolingPrompt(ToolChoice{Mode: "auto"}); !strings.Contains(prompt, rule) {
+		t.Fatalf("force-tooling prompt missing the required-tool-field rule:\n%s", prompt)
 	}
 }

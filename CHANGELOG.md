@@ -2,6 +2,10 @@
 
 ## Unreleased (target: v1.6.12)
 
+- DeepSeek's native DSML tool markup is no longer leaked as assistant prose: the parser recovers both the invoke-style and action-JSON variants through the same acceptance gate, and the stream suppresses the marker before it reaches the client. The prompts also ban native markup and action blocks without a `tool` field.
+- An action block that omits `tool`/`name` is inferred only on final text and only when no later object can be a named call; empty argument carriers are rejected. This closes the P2 where an args-only object could preempt a real named call. Covered by one-shot/streaming mutation tests and CN ZCode/DSH six-turn runs.
+- DeepSeek 原生 DSML 工具标记不再作为正文泄漏：解析器同时识别 invoke 与 action-JSON 变体，走同一校验门；流式层在标记到达客户端前抑制；prompt 也禁止原生标记和无 `tool` 的 action block。
+- 缺 `tool`/`name` 的 action block 只在最终文本、且后面没有可能是 named call 的对象时才推断；空参数载体直接拒绝。堵住 args-only 对象抢先于真正 named call 的 P2；已用 one-shot/流式变异测试和 CN ZCode/DSH 6 轮覆盖。
 - The desktop app stopped resolving the backend before it binds, too: `startup()` ran it inside `defaultConfig()` ahead of `StartProxy()` and the console, and `UpdateConfig()` ran it on the UI thread, so saving a setting froze the window for as long as the credential and `PATH` scans take. The status and detection panels now report the backend the running service actually chose, so a config that still says `remote` no longer mislabels a proxy being served by the CLI.
 - `cacheSuccessfulBaseURL` no longer drops the candidate memo on every model list. A default install re-caches the domain it just used on each successful list, which invalidated the five-minute memo and put the multi-second disk scan straight back onto the request path; it now invalidates only when the domain actually changes.
 - `-export-server-bundle` records the configured default model rather than one rewritten by the exporting machine's login state (`"kmodel"` instead of `"Auto"`). The exported bundle pins `backend: remote` with its own credentials file, so the target machine decides for itself -- the old value leaked the exporter's environment into the bundle.

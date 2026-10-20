@@ -114,6 +114,9 @@ type openAIResponsesRequest struct {
 	User              string   `json:"user,omitempty"`
 	Reasoning         any      `json:"reasoning,omitempty"`
 	Text              any      `json:"text,omitempty"`
+
+	// Only omitted/null is supported: this proxy does not store response history.
+	PreviousResponseID any `json:"previous_response_id,omitempty"`
 }
 
 type rawMessage struct {
@@ -802,14 +805,18 @@ func (s *Server) handleAnthropicMessages(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	if call, ok := anthropicHostedWebSearchCall(req); ok {
-		if req.Stream {
-			s.writeAnthropicHostedToolStream(w, req.Model, call)
+	if _, ok := anthropicHostedWebSearchCall(req); ok {
+		// D-4 (HTTP-09): a hosted web_search tool asks the server to run the
+		// search itself. This proxy has no server-side search implementation,
+		// and answering with a client-side tool_use fabricated here would hand
+		// clients an executor that does not exist. tool_choice=none is honoured
+		// first: with none the model may not call any tool, hosted included, so
+		// the request keeps flowing to the model instead of being rejected.
+		if toolemulation.ExtractAnthropicToolChoice(req.ToolChoice).Mode != "none" {
+			writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error",
+				"the hosted web_search tool type (\"web_search_20xxxxxx\") is executed server-side by Anthropic; this proxy has no server-side search implementation and refuses to fake a client-side tool_use for it. Declare web_search as a regular client tool (no hosted type) or run the search yourself and send the result back as a tool_result.")
 			return
 		}
-
-		s.writeAnthropicHostedToolResponse(w, req.Model, call)
-		return
 	}
 
 	normalized, err := normalizeAnthropicRequest(req)
@@ -1493,96 +1500,6 @@ func (s *Server) handleAnthropicStream(w http.ResponseWriter, r *http.Request, r
 	})
 }
 
-func (s *Server) writeAnthropicHostedToolResponse(w http.ResponseWriter, model string, call toolemulation.ToolCall) {
-	model = strings.TrimSpace(model)
-	if model == "" {
-		model = "lingma"
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"id":   fmt.Sprintf("msg_%d", time.Now().UnixNano()),
-		"type": "message",
-		"role": "assistant",
-		"content": []map[string]any{{
-			"type":  "tool_use",
-			"id":    call.ID,
-			"name":  call.Name,
-			"input": call.Arguments,
-		}},
-		"model":         model,
-		"stop_reason":   "tool_use",
-		"stop_sequence": nil,
-		"usage": map[string]any{
-			"input_tokens":  0,
-			"output_tokens": 0,
-		},
-	})
-}
-
-func (s *Server) writeAnthropicHostedToolStream(w http.ResponseWriter, model string, call toolemulation.ToolCall) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeAnthropicError(w, http.StatusInternalServerError, "api_error", "streaming is not supported by this server")
-		return
-	}
-
-	model = strings.TrimSpace(model)
-	if model == "" {
-		model = "lingma"
-	}
-	streamingHeaders(w)
-	msgID := fmt.Sprintf("msg_%d", time.Now().UnixNano())
-	if err := writeSSEEvent(w, flusher, "message_start", map[string]any{
-		"type": "message_start",
-		"message": map[string]any{
-			"id":            msgID,
-			"type":          "message",
-			"role":          "assistant",
-			"content":       []any{},
-			"model":         model,
-			"stop_reason":   nil,
-			"stop_sequence": nil,
-			"usage": map[string]any{
-				"input_tokens":  0,
-				"output_tokens": 0,
-			},
-		},
-	}); err != nil {
-		return
-	}
-	if err := writeSSEEvent(w, flusher, "content_block_start", map[string]any{
-		"type":          "content_block_start",
-		"index":         0,
-		"content_block": map[string]any{"type": "tool_use", "id": call.ID, "name": call.Name, "input": map[string]any{}},
-	}); err != nil {
-		return
-	}
-	argsJSON, _ := json.Marshal(call.Arguments)
-	if err := writeSSEEvent(w, flusher, "content_block_delta", map[string]any{
-		"type":  "content_block_delta",
-		"index": 0,
-		"delta": map[string]any{"type": "input_json_delta", "partial_json": string(argsJSON)},
-	}); err != nil {
-		return
-	}
-	if err := writeSSEEvent(w, flusher, "content_block_stop", map[string]any{
-		"type":  "content_block_stop",
-		"index": 0,
-	}); err != nil {
-		return
-	}
-	_ = writeSSEEvent(w, flusher, "message_delta", map[string]any{
-		"type": "message_delta",
-		"delta": map[string]any{
-			"stop_reason":   "tool_use",
-			"stop_sequence": nil,
-		},
-		"usage": map[string]any{
-			"output_tokens": 0,
-		},
-	})
-	_ = writeSSEEvent(w, flusher, "message_stop", map[string]any{"type": "message_stop"})
-}
-
 func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req service.ChatRequest) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -1705,6 +1622,11 @@ func (s *Server) handleOpenAIStream(w http.ResponseWriter, r *http.Request, req 
 		case event, ok := <-eventsCh:
 			if !ok {
 				eventsCh = nil
+				continue
+			}
+			if !openAIChatStreamCarriesText(event) {
+				// D-5 (HTTP-04): a thought chunk has no legal slot on the Chat
+				// SSE surface; dropping it here is what keeps it out of content.
 				continue
 			}
 			for _, delta := range filter.Push(event.Delta) {
@@ -2037,11 +1959,38 @@ func shouldAggregateToolStream(req service.ChatRequest) bool {
 // letting the prose around it through. It decides with toolemulation's own
 // acceptance test, so the client never sees a block the parser is going to
 // consume, and never loses text the parser is going to keep.
+// openAIChatStreamCarriesText reports whether a service stream event belongs
+// in the OpenAI Chat completion delta.content. D-5 (HTTP-04): the Chat SSE
+// surface this proxy serves declares no reasoning extension, so an IPC thought
+// chunk has no legal slot there and is dropped outright -- under
+// reasoning_effort=none as well as the default -- never folded into prose. The
+// Anthropic and Responses streams keep their own reasoning surfaces (thinking
+// blocks, response.reasoning items) and gate them on thinkingRequested.
+func openAIChatStreamCarriesText(event service.StreamEvent) bool {
+	return event.Type != service.StreamEventThinking
+}
+
+// streamToolCallCap mirrors the whole-turn tool call ceiling the final
+// acceptance budgets against (the parser's default, LINGMA_MAX_TOOL_CALLS
+// override) -- the same value the service-side merge gate reads, so the delta
+// stream and the accepted result agree on how many blocks become calls.
+func streamToolCallCap() int {
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv("LINGMA_MAX_TOOL_CALLS"))); err == nil && n > 0 {
+		return n
+	}
+	return 5
+}
+
 type toolStreamFilter struct {
 	enabled bool
 	scan    *toolemulation.ActionBlockScanner
 	tools   []toolemulation.ToolDef
 	pending string
+	// swallowed counts complete action blocks this filter has suppressed. The
+	// whole-turn ceiling bounds how many of them the final acceptance can turn
+	// into calls; the surplus stays prose in the accepted text, so it must stay
+	// visible in the delta stream too (TOOLS-05).
+	swallowed int
 }
 
 func newToolStreamFilter(req service.ChatRequest) *toolStreamFilter {
@@ -2077,8 +2026,19 @@ func (f *toolStreamFilter) Push(delta string) []string {
 			}
 			return out
 		case end > 0:
-			if start > 0 {
-				out = append(out, f.pending[:start])
+			if f.swallowed < streamToolCallCap() {
+				// This block is still inside the call budget the final
+				// acceptance applies, so suppressing it here matches the calls
+				// the completed turn will carry.
+				f.swallowed++
+				if start > 0 {
+					out = append(out, f.pending[:start])
+				}
+			} else {
+				// TOOLS-05: over the ceiling the block is prose in the accepted
+				// text; emit it verbatim, fences included, so the delta stream
+				// does not silently delete what the final text keeps.
+				out = append(out, f.pending[:end])
 			}
 			f.scan.Discard(end)
 			f.pending = f.pending[end:]
@@ -2287,7 +2247,7 @@ func normalizeAnthropicRequest(req anthropicRequest) (service.ChatRequest, error
 				messages = append(messages, service.ChatMessage{Role: role, Text: text, Images: images})
 			}
 			for _, tr := range toolResults {
-				messages = append(messages, service.ChatMessage{Role: "tool", Text: tr.Content, ToolCallID: tr.ToolUseID})
+				messages = append(messages, service.ChatMessage{Role: "tool", Text: tr.Content, ToolCallID: tr.ToolUseID, Images: tr.Images})
 			}
 		case "assistant":
 			text, calls := extractAnthropicAssistantContent(message.Content)
@@ -2305,18 +2265,31 @@ func normalizeAnthropicRequest(req anthropicRequest) (service.ChatRequest, error
 		toolChoice = toolemulation.ExtractAnthropicToolChoice(req.ToolChoice)
 	}
 
+	// Anthropic carries the serial-tooling decision inside tool_choice as
+	// disable_parallel_tool_use. Map it onto the same ParallelToolCalls flag
+	// the OpenAI conversions set, or the prompt constraint and the acceptance
+	// gate never learn the client chose one call at a time.
+	var parallelToolCalls *bool
+	if choice, ok := req.ToolChoice.(map[string]any); ok {
+		if disable, _ := choice["disable_parallel_tool_use"].(bool); disable {
+			serial := false
+			parallelToolCalls = &serial
+		}
+	}
+
 	return service.ChatRequest{
-		Model:           strings.TrimSpace(req.Model),
-		System:          strings.TrimSpace(extractText(req.System)),
-		Messages:        messages,
-		Tools:           toolemulation.ExtractAnthropicTools(req.Tools),
-		ToolChoice:      toolChoice,
-		Temperature:     req.Temperature,
-		TopP:            req.TopP,
-		TopK:            req.TopK,
-		Stop:            req.StopSequences,
-		MaxTokens:       req.MaxTokens,
-		ReasoningEffort: anthropicReasoningEffort(req),
+		Model:             strings.TrimSpace(req.Model),
+		System:            strings.TrimSpace(extractText(req.System)),
+		Messages:          messages,
+		Tools:             toolemulation.ExtractAnthropicTools(req.Tools),
+		ToolChoice:        toolChoice,
+		ParallelToolCalls: parallelToolCalls,
+		Temperature:       req.Temperature,
+		TopP:              req.TopP,
+		TopK:              req.TopK,
+		Stop:              req.StopSequences,
+		MaxTokens:         req.MaxTokens,
+		ReasoningEffort:   anthropicReasoningEffort(req),
 	}, nil
 }
 
@@ -2422,6 +2395,9 @@ func extractResponseFormat(rf any) string {
 }
 
 func responsesRequestToChatRequest(ctx context.Context, req openAIResponsesRequest) (openAIChatRequest, error) {
+	if req.PreviousResponseID != nil {
+		return openAIChatRequest{}, errors.New("previous_response_id is not supported; resend the full conversation history in input")
+	}
 	messages, err := responsesInputToMessages(ctx, req.Input)
 	if err != nil {
 		return openAIChatRequest{}, err
@@ -2470,7 +2446,11 @@ func responsesInputToMessages(ctx context.Context, input any) ([]rawMessage, err
 				}
 				continue
 			case "function_call_output":
-				if toolResult := responsesFunctionCallOutputToRawMessage(m); toolResult != nil {
+				toolResult, err := responsesFunctionCallOutputToRawMessage(m)
+				if err != nil {
+					return nil, err
+				}
+				if toolResult != nil {
 					messages = append(messages, *toolResult)
 				}
 				continue
@@ -2496,7 +2476,11 @@ func responsesInputToMessages(ctx context.Context, input any) ([]rawMessage, err
 				return []rawMessage{*toolCall}, nil
 			}
 		case "function_call_output":
-			if toolResult := responsesFunctionCallOutputToRawMessage(typed); toolResult != nil {
+			toolResult, err := responsesFunctionCallOutputToRawMessage(typed)
+			if err != nil {
+				return nil, err
+			}
+			if toolResult != nil {
 				return []rawMessage{*toolResult}, nil
 			}
 		}
@@ -2545,28 +2529,45 @@ func responsesFunctionCallToRawMessage(item map[string]any) *rawMessage {
 	}
 }
 
-func responsesFunctionCallOutputToRawMessage(item map[string]any) *rawMessage {
+func responsesFunctionCallOutputToRawMessage(item map[string]any) (*rawMessage, error) {
 	callID := strings.TrimSpace(stringFromAny(item["call_id"]))
 	if callID == "" {
-		return nil
+		return nil, nil
 	}
-	// An empty-but-present output is a legal result (a tool that produced no
-	// text); dropping it broke the call/result pairing. A missing output, or
-	// one of the wrong JSON type, is not a result at all and must not be
-	// fabricated into one.
 	raw, present := item["output"]
 	if !present {
-		return nil
+		return nil, nil
 	}
-	output, isString := raw.(string)
-	if !isString {
-		return nil
+	var output string
+	switch value := raw.(type) {
+	case string:
+		output = strings.TrimSpace(value)
+	case []any:
+		// Validate the entire array: unsupported data must never become partial text.
+		parts := make([]string, 0, len(value))
+		for _, item := range value {
+			block, ok := item.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf("function_call_output output requires text blocks")
+			}
+			kind, ok := block["type"].(string)
+			if !ok || (kind != "text" && kind != "input_text" && kind != "output_text") {
+				return nil, fmt.Errorf("function_call_output output block type is unsupported; only text blocks are supported")
+			}
+			text, ok := block["text"].(string)
+			if !ok {
+				return nil, fmt.Errorf("function_call_output output text must be a string")
+			}
+			if text = strings.TrimSpace(text); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		output = strings.Join(parts, "\n")
+	default:
+		// Preserve the legacy treatment of missing and wrong scalar output shapes.
+		return nil, nil
 	}
-	return &rawMessage{
-		Role:       "tool",
-		Content:    strings.TrimSpace(output),
-		ToolCallID: callID,
-	}
+	return &rawMessage{Role: "tool", Content: output, ToolCallID: callID}, nil
 }
 
 func normalizeResponsesContent(content any) any {
@@ -2814,10 +2815,29 @@ type errorReadCloser struct{ err error }
 func (e errorReadCloser) Read([]byte) (int, error) { return 0, e.err }
 func (e errorReadCloser) Close() error             { return nil }
 
+// writeJSON serializes before committing the status: an unencodable payload
+// (a non-finite number that slipped through, an unmarshalable type) must
+// surface as an explicit error response, never as a committed 2xx whose body
+// stopped at zero bytes -- a success-shaped answer the client cannot
+// distinguish from the real one.
 func writeJSON(w http.ResponseWriter, status int, data any) {
+	payload, err := json.Marshal(data)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": map[string]any{
+				"message": "response encoding failed: " + err.Error(),
+				"type":    "api_error",
+				"code":    nil,
+				"param":   nil,
+			},
+		})
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(data)
+	_, _ = w.Write(append(payload, '\n'))
 }
 
 func writeAnthropicError(w http.ResponseWriter, status int, kind string, message string) {
@@ -2978,10 +2998,19 @@ func responsesFunctionCallItem(tc toolemulation.ToolCall, arguments string, stat
 	return item
 }
 
+// responsesTerminalStatus preserves legal tool handoffs over budget signals.
+func responsesTerminalStatus(result *service.ChatResult) string {
+	if result != nil && len(result.ToolCalls) == 0 && (result.FinishReason == "length" || result.StopReason == "max_tokens") {
+		return "incomplete"
+	}
+	return "completed"
+}
+
 // buildOpenAIResponseBodyWithText lets the streaming path pin the message text
 // to the bytes the client already saw, so response.completed reconciles with
 // the output_item.done events instead of re-deriving a divergent answer.
 func buildOpenAIResponseBodyWithText(responseID string, created int64, model string, result *service.ChatResult, messageID string, includeReasoning bool, text string) map[string]any {
+	status := responsesTerminalStatus(result)
 	output := make([]map[string]any, 0, 1+len(result.ToolCalls))
 	if includeReasoning && strings.TrimSpace(result.ThoughtText) != "" {
 		output = append(output, buildOpenAIResponseReasoningItem("rs_"+responseID, result.ThoughtText, "completed"))
@@ -2990,7 +3019,7 @@ func buildOpenAIResponseBodyWithText(responseID string, created int64, model str
 		if strings.TrimSpace(messageID) == "" {
 			messageID = fmt.Sprintf("msg_%d", time.Now().UnixNano())
 		}
-		output = append(output, buildOpenAIResponseMessageItem(messageID, text, "completed"))
+		output = append(output, buildOpenAIResponseMessageItem(messageID, text, status))
 	}
 	for _, tc := range result.ToolCalls {
 		argsJSON, _ := json.Marshal(tc.Arguments)
@@ -2999,11 +3028,11 @@ func buildOpenAIResponseBodyWithText(responseID string, created int64, model str
 	if strings.TrimSpace(model) == "" {
 		model = result.Model
 	}
-	return map[string]any{
+	response := map[string]any{
 		"id":          responseID,
 		"object":      "response",
 		"created_at":  created,
-		"status":      "completed",
+		"status":      status,
 		"model":       model,
 		"output":      output,
 		"output_text": text,
@@ -3013,6 +3042,11 @@ func buildOpenAIResponseBodyWithText(responseID string, created int64, model str
 			"total_tokens":  result.InputTokens + result.OutputTokens,
 		},
 	}
+	if status == "incomplete" {
+		response["incomplete_details"] = map[string]any{"reason": "max_output_tokens"}
+	}
+	return response
+
 }
 
 type openAIResponseStreamEmitter struct {
@@ -3073,7 +3107,7 @@ func (e *openAIResponseStreamEmitter) markEventLocked(name string, payload map[s
 				e.createdResponse = resp
 			}
 			e.started = true
-		case "response.completed", "error":
+		case "response.completed", "response.incomplete", "error":
 			e.terminal = true
 		}
 	}
@@ -3318,7 +3352,7 @@ func writeOpenAIResponseStreamCompleted(emitter *openAIResponseStreamEmitter, re
 		_ = emitter.Event("response.output_item.done", map[string]any{
 			"type":         "response.output_item.done",
 			"output_index": outputIndex,
-			"item":         buildOpenAIResponseMessageItem(messageID, text, "completed"),
+			"item":         buildOpenAIResponseMessageItem(messageID, text, responsesTerminalStatus(result)),
 		})
 		outputIndex++
 	}
@@ -3354,8 +3388,9 @@ func writeOpenAIResponseStreamCompleted(emitter *openAIResponseStreamEmitter, re
 		})
 		outputIndex++
 	}
-	_ = emitter.Event("response.completed", map[string]any{
-		"type":     "response.completed",
+	terminalEvent := "response." + responsesTerminalStatus(result)
+	_ = emitter.Event(terminalEvent, map[string]any{
+		"type":     terminalEvent,
 		"response": buildOpenAIResponseBodyWithText(responseID, created, model, result, messageID, includeReasoning, text),
 	})
 	_, _ = fmt.Fprint(emitter.w, "data: [DONE]\n\n")
@@ -3725,7 +3760,7 @@ func generationPath(r *http.Request) bool {
 		return false
 	}
 	switch r.URL.Path {
-	case "/v1/messages", "/v1/chat/completions", "/api/v1/chat/completions",
+	case "/v1/messages", "/anthropic/v1/messages", "/v1/chat/completions", "/api/v1/chat/completions",
 		"/v1/responses", "/api/v1/responses":
 		return true
 	default:
@@ -4176,7 +4211,18 @@ func extractOpenAIToolCalls(raw []any) []toolemulation.ToolCall {
 type anthropicToolResult struct {
 	ToolUseID string
 	Content   string
+	// Images carries the attachments a tool_result's content blocks declared
+	// (HIST-05): a screenshot tool's continuation turn needs the picture, and
+	// downgrading it to an empty text output hides the very thing the client
+	// asked the model to look at.
+	Images []service.Image
 }
+
+// anthropicToolResultErrorPrefix marks a tool_result the client flagged with
+// is_error=true (HIST-06). Minimal fidelity scheme: the failure is stated in
+// the result text itself, so every downstream projection (prompt replay,
+// native tool message) keeps success and failure distinguishable.
+const anthropicToolResultErrorPrefix = "[Tool execution FAILED]"
 
 func extractAnthropicUserContent(content any) (string, []anthropicToolResult) {
 	items, ok := content.([]any)
@@ -4207,9 +4253,14 @@ func extractAnthropicUserContent(content any) (string, []anthropicToolResult) {
 			if !present || !validToolResultContent(content) {
 				continue
 			}
+			text := extractText(content)
+			if failed, _ := m["is_error"].(bool); failed {
+				text = anthropicToolResultErrorPrefix + "\n" + text
+			}
 			results = append(results, anthropicToolResult{
 				ToolUseID: toolUseID,
-				Content:   extractText(content),
+				Content:   text,
+				Images:    anthropicImageBlocks(content),
 			})
 		}
 	}
@@ -4306,6 +4357,24 @@ func extractAnthropicImages(content any) []service.Image {
 	if !ok {
 		return nil
 	}
+	return anthropicImageBlockList(items)
+}
+
+// anthropicImageBlocks extracts the image attachments from a content value:
+// either a block array or a single block map. A tool_result's content reuses
+// the same block shapes a user message does.
+func anthropicImageBlocks(content any) []service.Image {
+	switch typed := content.(type) {
+	case []any:
+		return anthropicImageBlockList(typed)
+	case map[string]any:
+		return anthropicImageBlockList([]any{typed})
+	default:
+		return nil
+	}
+}
+
+func anthropicImageBlockList(items []any) []service.Image {
 	var images []service.Image
 	for _, item := range items {
 		m, ok := item.(map[string]any)

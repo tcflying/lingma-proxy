@@ -506,6 +506,20 @@ lingma-proxy \
 - 当前本机实测：`/health`、`/v1/models`、OpenAI 流式 / 非流式、Claude Code Anthropic + Bash 工具调用均可用；Claude Code 完整工具链耗时明显高于简单 OpenAI 请求。
 - 该模式参考了 [ZipperCode/lingma2api](https://github.com/ZipperCode/lingma2api) 对 Lingma 远端接口、签名和登录态结构的探索，本仓库将其作为可切换后端集成到现有 OpenAI / Anthropic / 桌面 App 架构中。
 
+### Qoder CLI 模式（CN + 国际版）
+
+当远端登录缓存不可用，或希望直接复用已登录 Qoder 桌面端的凭据链时：
+
+```bash
+lingma-proxy --backend qodercli --port 10095
+```
+
+- 代理驱动桌面端自带的 CLI，继承其 device token → job token，不需要手填凭据。
+- 默认同时服务 CN 与国际版；国际版模型加 `intl/` 前缀（如 `intl/DeepSeek-Flash`），也可用 `--qodercli-sites cn` 或 `global` 收窄。
+- 国际版 CLI 使用独立 config-dir，避免与桌面端共享 `~/.qoder` 时出现 `token is not active`。
+- 更细的路由、模型目录、独立实例与复测方法见 [docs/qoder-international-handoff.md](docs/qoder-international-handoff.md)。
+- 模型可用性和日配额由 Qoder 账号决定；`code 110` 表示账号日配额耗尽，需等后端恢复。
+
 ### IPC 插件模式
 
 IPC 模式通过本机 Lingma IDE 插件通信：
@@ -628,7 +642,7 @@ Linux CLI 适合终端、服务器、SSH 和无头环境。Linux Desktop 适合�
 
 ### 使用桌面 App
 
-1. 前往 [Releases](https://github.com/Lutiancheng1/lingma-proxy/releases) 下载桌面版。
+1. 前往 [Releases](https://github.com/tcflying/lingma-proxy/releases) 下载桌面版。
 2. macOS 解压后打开 `Lingma Proxy.app`。
 3. Windows 解压后运行桌面版 exe。
 4. 点击启动代理。
@@ -640,7 +654,7 @@ Linux CLI 适合终端、服务器、SSH 和无头环境。Linux Desktop 适合�
 macOS：
 
 ```bash
-git clone https://github.com/Lutiancheng1/lingma-proxy.git
+git clone https://github.com/tcflying/lingma-proxy.git
 cd lingma-proxy
 go build -o ./dist/lingma-proxy ./cmd/lingma-ipc-proxy
 ./dist/lingma-proxy --host 127.0.0.1 --port 8095 --session-mode auto
@@ -649,7 +663,7 @@ go build -o ./dist/lingma-proxy ./cmd/lingma-ipc-proxy
 Windows：
 
 ```powershell
-git clone https://github.com/Lutiancheng1/lingma-proxy.git
+git clone https://github.com/tcflying/lingma-proxy.git
 cd lingma-proxy
 .\scripts\build.ps1
 .\dist\lingma-proxy.exe --host 127.0.0.1 --port 8095 --session-mode auto

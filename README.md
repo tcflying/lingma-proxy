@@ -578,7 +578,7 @@ Use Linux CLI for terminal, server, SSH, and headless scenarios. Use Linux Deskt
 
 1. Install VS Code and the Tongyi Lingma extension.
 2. Log in to Tongyi Lingma and verify the Lingma panel can chat normally.
-3. Download the desktop asset from [Releases](https://github.com/Lutiancheng1/lingma-proxy/releases).
+3. Download the desktop asset from [Releases](https://github.com/tcflying/lingma-proxy/releases).
 4. Start `Lingma Proxy`.
 5. Click `探测模型` after the proxy is running.
 6. Configure clients to use `http://127.0.0.1:8095`.
@@ -586,7 +586,7 @@ Use Linux CLI for terminal, server, SSH, and headless scenarios. Use Linux Deskt
 ### CLI
 
 ```bash
-git clone https://github.com/Lutiancheng1/lingma-proxy.git
+git clone https://github.com/tcflying/lingma-proxy.git
 cd lingma-proxy
 go build -o ./dist/lingma-proxy ./cmd/lingma-ipc-proxy
 ./dist/lingma-proxy --host 127.0.0.1 --port 8095 --session-mode auto

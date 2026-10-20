@@ -56,7 +56,7 @@ Lingma Proxy 把通义灵码 / Qoder 的私有协议转换成 **OpenAI 与 Anthr
 
 ### 方式 A：桌面版（推荐，无需 Go）
 
-1. 前往 [Releases](https://github.com/Lutiancheng1/lingma-proxy/releases) 下载对应平台的压缩包。
+1. 前往 [Releases](https://github.com/tcflying/lingma-proxy/releases) 下载对应平台的压缩包。
 2. 解压后目录里有一个 `LingmaProxy.exe`（macOS 为 `.app`）和一个 `lingma-proxy.json`（端口/站点/预热配置）。
 3. 双击启动。默认监听 `127.0.0.1:8095`，Web 控制台在 `8096`。
 4. 启动日志里会打印带令牌的完整控制台 URL，形如 `http://127.0.0.1:8096/#token=<token>`。
@@ -73,7 +73,7 @@ Lingma Proxy 把通义灵码 / Qoder 的私有协议转换成 **OpenAI 与 Anthr
 ### 方式 B：源码构建 CLI
 
 ```bash
-git clone https://github.com/Lutiancheng1/lingma-proxy.git
+git clone https://github.com/tcflying/lingma-proxy.git
 cd lingma-proxy
 go build -o ./dist/lingma-proxy ./cmd/lingma-ipc-proxy
 ./dist/lingma-proxy --host 127.0.0.1 --port 8095 --session-mode auto
@@ -207,14 +207,70 @@ OPENAI_API_KEY=any
 
 ### 5.6 ZCode
 
-ZCode 的 provider 真实注册表在 `~/.zcode/v2/provider_config.json`（可用 `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` 指定）。加一个指向本代理的 Anthropic provider 即可。**注意：ZCode 的 headless `--prompt` 会被运行中的宿主接管，只有 GUI 才会真正走本地代理。**
+ZCode 0.17 的 provider 真实注册表在 `~/.zcode/v2/provider_config.json`（旧的 `~/.zcode/cli/config.json` 仍会被读取）。推荐用 `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` 指向一份隔离副本，避免实验配置污染日常会话。
 
-### 5.7 任意 OpenAI 兼容客户端
+- provider 协议选 **Anthropic Messages**，Base URL 填 `http://127.0.0.1:10095`（按你的监听端口），API key 填 `any` 或 `PROXY_MANAGED`。
+- 模型 ID 用 `/v1/models` 的实际返回值：CN 裸名（`DeepSeek-Flash`），国际版带前缀（`intl/DeepSeek-Flash`）。
+- headless 也能走本地代理：
+
+```bash
+set ZCODE_PERSONAL_PROVIDER_CONFIG_FILE=C:\path\to\zcode-provider-cn.json
+node C:\ZCode\resources\glm\zcode.cjs -p "任务" --json --cwd . --mode yolo
+```
+
+- 本机实测（ZCode 0.17）：headless 取 provider `modelOrder` 的第一项，`defaultModelSelection` 不生效；做国际版时把 `intl/DeepSeek-Flash` 放在首位。
+- 代理请求日志里应能看到 `model=DeepSeek-Flash` 或 `intl/DeepSeek-Flash`，且 `metadata.user_id.session_id` 与 CLI 的 `sess_...` 对应；对不上说明 CLI 还在读旧配置。
+
+### 5.7 DeepSeek Harness (DSH)
+
+DSH 0.2.x 的 headless 通过 OpenAI 兼容的 `/v1/chat/completions` 接入。写一份 overlay（示例）：
+
+```yaml
+- id: llm-pi-ai
+  name: '@deepseek-ai/dsh-llm-pi-ai'
+  config:
+    providers:
+      lingma-proxy:
+        displayName: Lingma Proxy
+        apiKeyEnv: LINGMA_PROXY_API_KEY
+        api: openai-completions
+        baseURL: http://127.0.0.1:10095/v1
+        transport: sse
+        timeoutMs: 300000
+        streamIdleTimeoutMs: 300000
+        models:
+          - id: DeepSeek-Flash
+            name: DeepSeek-Flash (CN)
+            contextWindow: 200000
+            maxTokens: 32768
+            input: [text]
+          - id: intl/DeepSeek-Flash
+            name: DeepSeek-Flash (Intl)
+            contextWindow: 200000
+            maxTokens: 32768
+            input: [text]
+- id: agent-default-model
+  config:
+    provider: lingma-proxy
+    model: DeepSeek-Flash
+```
+
+```powershell
+$env:LINGMA_PROXY_API_KEY = "any"
+$env:DSH_PERMISSION_MODE = "danger-full-access"
+dsh --profile headless --patch .\dsh-lingma-overlay.yml --json "任务"
+```
+
+- `agent-default-model` 的 `model` 决定走 CN 还是国际版；换成 `intl/DeepSeek-Flash` 即可。
+- 需要工具执行时设 `DSH_PERMISSION_MODE=danger-full-access`；否则 DSH 会在权限层拒绝。
+- 收到 `code 110 / daily usage limit` 是 Qoder 账号配额，不是 DSH 或代理故障。
+
+### 5.8 任意 OpenAI 兼容客户端
 
 Base URL = `http://127.0.0.1:8095/v1`，API key = `any`。
 适用：Cline、Continue、OpenCode、LobeChat、Chatbox 等一切支持 `openai-compatible` 的客户端。
 
-### 5.8 任意 Anthropic 兼容客户端
+### 5.9 任意 Anthropic 兼容客户端
 
 Base URL = `http://127.0.0.1:8095`，API key = `any`（或 `x-api-key` 头）。
 

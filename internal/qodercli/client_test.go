@@ -286,6 +286,24 @@ func TestWorkerLocationRunsTheRuntimeBeforeTheFlags(t *testing.T) {
 	}
 }
 
+// TestEnvironmentDropsLazyMCPLoading: the host sets QODER_MCP_LAZY=1, and the
+// CLI then registers the mcp_list/mcp_get/mcp_call meta-tools; measured as a
+// whole tool turn spent on mcp_list returning {"tools":[],"total":0} before the
+// answer. Config dirs are the CLI's own and must still pass through.
+func TestEnvironmentDropsLazyMCPLoading(t *testing.T) {
+	t.Setenv("QODER_MCP_LAZY", "1")
+	t.Setenv("QODER_CONFIG_DIR", `C:\qoder-config`)
+
+	c := NewClient(Location{HostExe: "qodercli"}, 0)
+	env := strings.Join(c.environment("credential"), "\n")
+	if strings.Contains(env, "QODER_MCP_LAZY=") {
+		t.Fatal("QODER_MCP_LAZY leaked into the child env and would enable lazy MCP loading")
+	}
+	if !strings.Contains(env, "QODER_CONFIG_DIR=") {
+		t.Fatal("an unrelated QODER_* variable must keep passing through")
+	}
+}
+
 // TestTurnCeilingReadsTheOperatorOverride covers the switch itself: empty means
 // the default, 0 means off, and a value that is not a duration must not silently
 // become "no ceiling at all" -- the default is the safe answer to a typo.

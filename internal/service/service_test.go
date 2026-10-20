@@ -856,6 +856,10 @@ type scriptedChatClient struct {
 	// wire, when set, marks the span of each Chat call so the collector can
 	// tell deltas that arrived during the call from ones released after it.
 	wire *wireCollector
+	// delayFirst holds the first Chat open after its delta so the first-attempt
+	// hold bound expires mid-call: the superseded attempt is on the wire by the
+	// time the retry verdict arrives.
+	delayFirst time.Duration
 }
 
 func (c *scriptedChatClient) Chat(ctx context.Context, request remote.ChatRequest, onDelta func(string)) (*remote.ChatResult, error) {
@@ -868,6 +872,9 @@ func (c *scriptedChatClient) Chat(ctx context.Context, request remote.ChatReques
 		}
 		if onDelta != nil && result.Text != "" {
 			onDelta(result.Text)
+		}
+		if c.delayFirst > 0 && len(c.requests) == 1 {
+			time.Sleep(c.delayFirst)
 		}
 		return result, nil
 	}
@@ -1032,11 +1039,15 @@ func TestGenerateRemoteWithModelEmulationRetryHoldsFirstAttemptDeltas(t *testing
 
 // The emulation retry can also come back with native tool calls instead of an
 // action block; the retry closure installs them into result directly, and the
-// hold must hear about that replacement too -- otherwise the refused first
-// attempt is released onto the wire next to the retry's calls, which is the
-// same two-attempt mix the 931 acceptance caught on the wire.
+// hold must hear about that replacement too. HTTP-07: the accepted retry owns
+// the turn, so its prose is replayed to the stream while the superseded first
+// attempt's text stays off it -- the 931 acceptance caught the opposite mix
+// (refused attempt on the wire, accepted one missing).
 func TestGenerateRemoteWithModelEmulationRetryNativeCallsHoldsFirstAttemptDeltas(t *testing.T) {
-	svc := New(Config{Model: "kmodel", Timeout: time.Second})
+	// Pin the backend and base URL: an empty base URL makes the result path scan
+	// IDE configs (~2.5s here), which would outlive cliFirstAttemptHoldMax and
+	// release the first attempt before the retry verdict could drop it.
+	svc := New(Config{Backend: BackendRemote, RemoteBaseURL: "http://hold.invalid", Model: "kmodel", Timeout: time.Second})
 	wire := &wireCollector{}
 	client := &scriptedChatClient{results: []*remote.ChatResult{
 		{Text: "i don't have tools"},
@@ -1062,11 +1073,15 @@ func TestGenerateRemoteWithModelEmulationRetryNativeCallsHoldsFirstAttemptDeltas
 	if len(result.ToolCalls) != 1 || result.ToolCalls[0].Name != "read_fixture" {
 		t.Fatalf("result = %#v, want the retry's native call kept", result)
 	}
-	if got := wire.streamed.String(); got != "" {
-		t.Fatalf("streamed %q, want nothing: the retry's native calls superseded the refused attempt", got)
+	streamed := wire.streamed.String()
+	if streamed != "accepted reply" {
+		t.Fatalf("streamed %q, want the accepted retry's prose replayed exactly once (HTTP-07)", streamed)
 	}
-	if emitted {
-		t.Fatal("emitted = true, want false: nothing from the superseded attempt reached the wire")
+	if strings.Contains(streamed, "i don't have tools") {
+		t.Fatalf("streamed the superseded first attempt: %q", streamed)
+	}
+	if !emitted {
+		t.Fatal("emitted = false, want true: the accepted retry's prose reached the wire")
 	}
 }
 

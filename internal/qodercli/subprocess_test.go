@@ -54,6 +54,17 @@ const (
 	fakeSpawnsTreeThenHang = "spawns-tree-then-hang"
 	// fakeGrandchildHang is the grandchild half of fakeSpawnsTreeThenHang.
 	fakeGrandchildHang = "grandchild-hang"
+	// fakeListModelsThenHang prints a complete model listing and then keeps the
+	// process alive, which is the --list-models shutdown shape: the listing is
+	// over long before the process is.
+	fakeListModelsThenHang = "list-models-then-hang"
+	// fakeMaxTurnsOnce is the measured intl flake: the first invocation ends in
+	// the CLI's max-turns result error and the next identical one answers. The
+	// argv file's line count is the invocation counter.
+	fakeMaxTurnsOnce = "max-turns-once"
+	// fakeMaxTurnsAfterDelta is the same error after a partial text delta, which
+	// must not be retried: the client already saw text.
+	fakeMaxTurnsAfterDelta = "max-turns-after-delta"
 )
 
 // fakeCLIPidFileEnv, when set for a fakeSpawnsTreeThenHang child, makes it
@@ -131,6 +142,23 @@ func runFakeCLI(mode string) {
 		time.Sleep(10 * time.Minute)
 	case fakeGrandchildHang:
 		time.Sleep(10 * time.Minute)
+	case fakeListModelsThenHang:
+		if path := os.Getenv(fakeCLIPidFileEnv); path != "" {
+			_ = os.WriteFile(path, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0o600)
+		}
+		fmt.Println("MODEL")
+		fmt.Println("Auto")
+		fmt.Println("Qwen3.8-Flash")
+		time.Sleep(10 * time.Minute)
+	case fakeMaxTurnsOnce:
+		if fakeInvocationCount() == 1 {
+			fmt.Println(`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Reached maximum number of turns (1) (code 47902)"}`)
+		} else {
+			fmt.Println(`{"type":"result","subtype":"success","result":"second answer"}`)
+		}
+	case fakeMaxTurnsAfterDelta:
+		fmt.Println(`{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"partial answer"}}}`)
+		fmt.Println(`{"type":"result","subtype":"error_max_turns","is_error":true,"result":"Reached maximum number of turns (1) (code 47902)"}`)
 	case fakeSilentExit:
 		os.Exit(7)
 	case fakeFlood, fakeFloodForever:
@@ -168,6 +196,22 @@ func hasArg(args []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// fakeInvocationCount counts how many times this fake has started, which the
+// max-turns fixture uses to fail once and then answer. It reads the argv file
+// runFakeCLI appends to before dispatching; a run without that seam reads as
+// the first one.
+func fakeInvocationCount() int {
+	path := os.Getenv(fakeCLIArgvEnv)
+	if path == "" {
+		return 1
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 1
+	}
+	return strings.Count(strings.TrimSpace(string(raw)), "\n") + 1
 }
 
 // fakeCLIClient points a Client at this test binary, including a private
@@ -232,7 +276,7 @@ func TestChatRetryKeepsValuelessToolsPair(t *testing.T) {
 		"--input-format", "stream-json",
 		"--output-format", "stream-json",
 		"--permission-mode", "bypass_permissions",
-		"--max-turns", "1",
+		"--max-turns", "2",
 		"--strict-mcp-config",
 		"--mcp-config", `{"mcpServers":{}}`,
 		"--model", "Qwen3.8-Flash",
@@ -241,6 +285,63 @@ func TestChatRetryKeepsValuelessToolsPair(t *testing.T) {
 	}
 	if strings.Join(runs[1], "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("retry argv drifted:\n got %q\nwant %q", runs[1], want)
+	}
+}
+
+// TestChatRetriesTheMaxTurnsFlakeOnce pins the measured intl flake: a tool turn
+// ended with the CLI's own max-turns result error before any answer, and the
+// next identical invocation answered. Chat must rerun exactly once.
+func TestChatRetriesTheMaxTurnsFlakeOnce(t *testing.T) {
+	argvPath := t.TempDir() + string(os.PathSeparator) + "argv.jsonl"
+	t.Setenv(fakeCLIArgvEnv, argvPath)
+	c := fakeCLIClient(t, fakeMaxTurnsOnce, 120*time.Second)
+
+	var streamed strings.Builder
+	result, err := c.Chat(context.Background(), remote.ChatRequest{
+		Prompt: "hi",
+		Model:  "Qwen3.8-Flash",
+	}, func(text string) { streamed.WriteString(text) })
+	if err != nil {
+		t.Fatalf("the max-turns flake was supposed to be retried: %v", err)
+	}
+	if result == nil || result.Text != "second answer" {
+		t.Fatalf("result = %#v, want the retried answer", result)
+	}
+	if streamed.String() != "second answer" {
+		t.Fatalf("streamed %q, want the retried answer once", streamed.String())
+	}
+	runs := readArgvRuns(t, argvPath)
+	if len(runs) != 2 {
+		t.Fatalf("expected the failed run plus one retry, got %d runs: %v", len(runs), runs)
+	}
+	if strings.Join(runs[0], "\x00") != strings.Join(runs[1], "\x00") {
+		t.Fatalf("the retry changed the invocation:\n got %q\nwant %q", runs[1], runs[0])
+	}
+}
+
+// TestChatDoesNotRetryMaxTurnsAfterTextStreamed is the control: a run that has
+// already put text on the wire must not be repeated, even for the same error.
+func TestChatDoesNotRetryMaxTurnsAfterTextStreamed(t *testing.T) {
+	argvPath := t.TempDir() + string(os.PathSeparator) + "argv.jsonl"
+	t.Setenv(fakeCLIArgvEnv, argvPath)
+	c := fakeCLIClient(t, fakeMaxTurnsAfterDelta, 120*time.Second)
+
+	var streamed strings.Builder
+	_, err := c.Chat(context.Background(), remote.ChatRequest{
+		Prompt: "hi",
+		Model:  "Qwen3.8-Flash",
+	}, func(text string) { streamed.WriteString(text) })
+	if err == nil {
+		t.Fatal("the CLI error was supposed to surface, not be retried")
+	}
+	if !strings.Contains(err.Error(), "maximum number of turns") {
+		t.Fatalf("error = %q, want the CLI's own max-turns error", err)
+	}
+	if streamed.String() != "partial answer" {
+		t.Fatalf("streamed %q, want the partial text before the error", streamed.String())
+	}
+	if runs := readArgvRuns(t, argvPath); len(runs) != 1 {
+		t.Fatalf("a turn that already streamed was retried: %d runs: %v", len(runs), runs)
 	}
 }
 
@@ -323,7 +424,7 @@ func TestCapturedOutputStopsAtTheCeiling(t *testing.T) {
 	t.Cleanup(func() { maxCLICapturedOutputBytes = prev })
 
 	c := fakeCLIClient(t, fakeFlood, 60*time.Second)
-	text, err := c.runWithStdinData(context.Background(), nil, func(string) {}, "--print")
+	text, err := c.runWithStdinData(context.Background(), nil, func(string) {}, 0, "--print")
 	if err != nil {
 		t.Fatalf("a capped stream must still finish cleanly: %v", err)
 	}
@@ -351,7 +452,7 @@ func TestCaptureCeilingHoldsToTheByte(t *testing.T) {
 	t.Cleanup(func() { maxCLICapturedOutputBytes = prev })
 
 	c := fakeCLIClient(t, fakeFlood, 60*time.Second)
-	text, err := c.runWithStdinData(context.Background(), nil, func(string) {}, "--print")
+	text, err := c.runWithStdinData(context.Background(), nil, func(string) {}, 0, "--print")
 	if err != nil {
 		t.Fatalf("a capped stream must still finish cleanly: %v", err)
 	}
@@ -407,7 +508,7 @@ func TestStdoutFallbackCaptureIsCapped(t *testing.T) {
 	t.Cleanup(func() { maxCLICapturedOutputBytes = prevCap })
 
 	c := fakeCLIClient(t, fakeFlood, 60*time.Second)
-	text, err := c.runWithStdinData(context.Background(), nil, func(string) {}, "--print")
+	text, err := c.runWithStdinData(context.Background(), nil, func(string) {}, 0, "--print")
 	if err != nil {
 		t.Fatalf("the fallback capture must still finish cleanly: %v", err)
 	}
